@@ -55,10 +55,12 @@ pub const TEMPLATE: &str = r#"# herdr-sidebar: per-filetype preview and editor p
 # Built-in defaults when no rule matches: Markdown through `glow` (internal),
 # images through `viu` (external, so pixels show on a Kitty-capable terminal).
 #
-# [[editor]] commands get a real terminal in their own tab. They are used by
-# the `m` menu ("Edit with …"), by `e` inside a preview, and by a click when
-# "Use editor on click" is on. Placeholders: {file} (appended when absent),
-# {line} (a search hit's line, else 1).
+# [[editor]] commands get a real terminal. `e` inside a preview runs the
+# editor IN the preview pane and reloads the document when it exits; the `m`
+# menu ("Edit with …") and a click while "Use editor on click" is on open it
+# in its own tab. Without a rule, `e` uses the global "Custom editor…".
+# Placeholders: {file} (appended when absent), {line} (a search hit's line,
+# else 1).
 #
 # [[preview]]
 # patterns = ["*.md", "*.markdown"]

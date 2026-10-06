@@ -685,8 +685,13 @@ HACKING.md — budget time for that before promising a patched build.
 - **Where each mapping is used.** A click, Enter, Quick Open or search hit previews (previewer
   rule → built-in default → source view). "Use editor on click" ON routes a tree/search click to
   the file's editor rule, else the global custom editor. The `m` menu offers "Edit with <name>"
-  for a resolved editor rule; `e` inside the preview opens that rule's tab when the request
-  carries one, else the in-pane editor. Keyboard Enter never opens an editor. A line-anchored
+  for a resolved editor rule; `e` inside the preview runs the editor (rule, else the global
+  `configured_editor()`) IN THE PREVIEW PANE through `run_external(.., preview = false)`:
+  whole screen, no chrome, `{line}` from the request, never killed under the user (a control
+  request arriving meanwhile is dropped and `restore_current_control` puts the document back),
+  `pin_own_tab` first so clicks elsewhere open a fresh preview, and the document reloads on
+  exit. `e` on HELD external previewer output (an image) does the same. Only with no editor
+  configured anywhere does `e` fall back to the in-pane editor. Keyboard Enter never opens an editor. A line-anchored
   preview (search hit) always uses the built-in SOURCE view — rendered output has no line mapping.
 - **`viewer::render_with` is the one spawn path** for user previewers AND the built-in defaults
   (`default_renderer_for`: Markdown → `glow -s {theme} -w {width} -`, images → `viu -b -w {width}

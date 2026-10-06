@@ -55,10 +55,13 @@ everything else is syntax-highlighted source. A failing rule falls back to that 
 one-line warning at the top. A search hit clicked at a line always shows the source view, since
 rendered output has no line numbers.
 
-An `[[editor]]` command opens the file in a `name · editor` tab with a real terminal. It is used
-by the `m` / ctrl+right-click menu ("Edit with …"), by `e` inside a preview, and by a tree or
-search click when "Use editor on click" is on (files without an editor rule then use the global
-"Custom editor…"). Keyboard Enter always previews.
+An `[[editor]]` command is a real terminal editor. Pressing `e` inside a preview runs it in the
+preview pane itself (the editor rule, else the global "Custom editor…") and reloads the document
+when it exits; the pane is pinned meanwhile so another click opens a fresh preview rather than
+interrupting the edit. The `m` / ctrl+right-click menu ("Edit with …") and a tree or search click
+while "Use editor on click" is on open the editor in its own `name · editor` tab instead. With
+no editor configured at all, `e` falls back to the built-in in-pane editor. Keyboard Enter always
+previews.
 
 Patterns without a `/` match the file name anywhere in the tree; patterns with a `/` match the
 root-relative path (`docs/**/*.rst`). Matching is case-insensitive and the first matching rule

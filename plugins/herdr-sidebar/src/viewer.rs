@@ -1227,18 +1227,13 @@ fn load_file(target: &Path, target_line: Option<usize>, renderer: Option<&str>) 
     }
 }
 
-/// `e` on a preview whose request carries an `[[editor]]` rule: open the
-/// file in its own tab, the way the sidebar's "Edit with …" does.
-fn open_rule_editor(path: &Path, command: &str) -> String {
-    let pane_id = std::env::var("HERDR_PANE_ID").unwrap_or_default();
-    let root = path
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("."));
-    let name = crate::programs::display_name(command);
-    match crate::actions::open_in_editor_tab_with(&pane_id, &root, path, command, None) {
-        Ok(()) => format!("opened with {name}"),
-        Err(error) => format!("{name} failed: {error}"),
+/// The editor `e` should run for `request`: the `[[editor]]` rule the
+/// sidebar resolved, else the global "Custom editor…" command. `None` means
+/// the built-in in-pane editor is the only option.
+fn editor_command_for(request: &Request) -> Option<String> {
+    match request {
+        Request::File { editor, .. } => editor.clone().or_else(crate::actions::configured_editor),
+        _ => None,
     }
 }
 
@@ -1253,6 +1248,10 @@ enum ExternalExit {
     /// The program could not run or exited non-zero: show the built-in
     /// preview with this reason.
     Failed(String),
+    /// An editor session ended cleanly; reload the document.
+    Finished,
+    /// The user pressed `e` on held previewer output.
+    Edit,
 }
 
 /// Pixel size from an image file header (PNG, GIF, BMP, JPEG, WebP), so the
@@ -1424,6 +1423,11 @@ fn control_moved_on(control: &Path, request: &Request) -> Option<Request> {
 /// until q/Esc, the next request, or a resize (which re-runs it). The
 /// heartbeat and the control file keep being serviced throughout, so the
 /// sidebar can still switch or close this pane.
+///
+/// With `preview` false the program is an EDITOR: it gets the whole screen
+/// (no chrome), is never killed under the user — a request that arrives
+/// meanwhile is dropped and the control file put back — and the call
+/// returns `Finished` as soon as it exits so the document can reload.
 fn run_external(
     terminal: &mut ratatui::DefaultTerminal,
     control: &Path,
@@ -1431,21 +1435,55 @@ fn run_external(
     command: &str,
     path: &Path,
     mode: &ViewMode,
+    preview: bool,
 ) -> std::io::Result<ExternalExit> {
     use std::io::Write as _;
     let name = crate::programs::display_name(command);
     let doc_key = request.doc_key();
+    let line = match request {
+        Request::File {
+            line: Some(line), ..
+        } => *line,
+        _ => 1,
+    };
     let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
+    // A hosted EDITOR is labelled like the in-pane editor for as long as it
+    // runs; `report_identity` would otherwise keep the `· preview` label the
+    // preview mode implies. The next identity report after exit restores it.
+    let hosted_label = (!preview).then(|| {
+        editor_pane_label(
+            &path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+        )
+    });
+    let relabel = || {
+        if let (Some(label), Ok(pane_id)) = (&hosted_label, std::env::var("HERDR_PANE_ID"))
+            && !pane_id.is_empty()
+        {
+            let _ = ipc::call_text(
+                "pane.rename",
+                serde_json::json!({ "pane_id": pane_id, "label": label }),
+            );
+        }
+    };
+    relabel();
     let mut last_heartbeat = Instant::now();
     let heartbeat = |mode: &ViewMode, last: &mut Instant| {
         if last.elapsed() >= Duration::from_secs(5) {
             report_identity(mode, Some(&doc_key), control);
+            relabel();
             *last = Instant::now();
         }
     };
     let outcome = 'rerun: loop {
         let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
-        let height = rows.saturating_sub(2).max(1);
+        let height = if preview {
+            rows.saturating_sub(2).max(1)
+        } else {
+            rows.max(1)
+        };
         let subs = [
             ("width", cols.to_string()),
             ("height", height.to_string()),
@@ -1458,7 +1496,7 @@ fn run_external(
                 }
                 .to_string(),
             ),
-            ("line", "1".to_string()),
+            ("line", line.to_string()),
         ];
         let argv = match crate::actions::command_argv(command, path, &subs) {
             Ok(argv) => argv,
@@ -1468,8 +1506,8 @@ fn run_external(
             break ExternalExit::Failed(format!("{name} is not on PATH"));
         };
         // Fresh canvas inside the alternate screen: delete any images a
-        // previous run placed, clear, a dim header line, then the program
-        // draws from row 2.
+        // previous run placed, clear, a dim header line (previews only),
+        // then the program draws.
         quiet_child_mode();
         let header = format!(
             "\x1b[2m ✕  {}  {}\x1b[0m",
@@ -1480,7 +1518,10 @@ fn run_external(
         );
         {
             let mut out = std::io::stdout();
-            let _ = write!(out, "\x1b_Ga=d,d=A\x1b\\\x1b[2J\x1b[H{header}\r\n");
+            let _ = write!(out, "\x1b_Ga=d,d=A\x1b\\\x1b[2J\x1b[H");
+            if preview {
+                let _ = write!(out, "{header}\r\n");
+            }
             let _ = out.flush();
         }
         let mut cmd = std::process::Command::new(program);
@@ -1497,6 +1538,7 @@ fn run_external(
         };
         // Phase 1: the program owns the terminal. Only the control file and
         // the heartbeat are serviced; keys go to the program.
+        let mut deferred = false;
         let status = loop {
             match child.try_wait() {
                 Ok(Some(status)) => break status,
@@ -1508,15 +1550,25 @@ fn run_external(
                 }
             }
             if let Some(next) = control_moved_on(control, request) {
-                let _ = child.kill();
-                let _ = child.wait();
-                break 'rerun ExternalExit::Request(next);
+                if preview {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break 'rerun ExternalExit::Request(next);
+                }
+                // An editor is never killed under the user.
+                deferred = true;
             }
             heartbeat(mode, &mut last_heartbeat);
             std::thread::sleep(Duration::from_millis(100));
         };
+        if deferred {
+            restore_current_control(control, &Some(request.clone()));
+        }
         if !status.success() {
             break ExternalExit::Failed(format!("{name} exited with {status}"));
+        }
+        if !preview {
+            break ExternalExit::Finished;
         }
         // Phase 2: hold the output. Raw mode so keys reach us without echo;
         // q/Esc close, a resize re-runs, anything else is ignored.
@@ -1536,6 +1588,7 @@ fn run_external(
                 match event::read()? {
                     Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
                         KeyCode::Char('q') | KeyCode::Esc => break 'rerun ExternalExit::Close,
+                        KeyCode::Char('e') => break 'rerun ExternalExit::Edit,
                         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                             break 'rerun ExternalExit::Close;
                         }
@@ -2035,7 +2088,36 @@ pub fn run(control: &Path) -> std::io::Result<()> {
     let mut diff_refresh: Option<(Request, std::sync::mpsc::Receiver<Doc>)> = None;
     let mut identity_pending = false;
     let mut external_failed: Option<Request> = None;
+    let mut pending_edit: Option<String> = None;
     let result = loop {
+        // `e`: the real editor takes over this pane; the document reloads
+        // when it exits. The tab is pinned first so a click elsewhere opens
+        // a fresh preview instead of hijacking an edit in progress.
+        if let Some(command) = pending_edit.take()
+            && let Some(request @ Request::File { .. }) = current.clone()
+            && let Request::File { path, .. } = &request
+        {
+            let path = path.clone();
+            pin_own_tab(&request.doc_key());
+            let name = crate::programs::display_name(&command);
+            notice = match run_external(
+                &mut terminal,
+                control,
+                &request,
+                &command,
+                &path,
+                &mode,
+                false,
+            )? {
+                ExternalExit::Failed(error) => Some(error),
+                _ => Some(format!("edited with {name}")),
+            };
+            mode = ViewMode::Preview(loading_doc(&request));
+            preview_load = Some(start_preview_load(request));
+            identity_pending = true;
+            external_failed = None;
+            continue;
+        }
         // An external previewer (mode = "external", or the built-in viu for
         // images) takes the pane's terminal until the next request.
         if prompt.is_none()
@@ -2047,7 +2129,23 @@ pub fn run(control: &Path) -> std::io::Result<()> {
         {
             preview_load = None;
             let path = path.clone();
-            match run_external(&mut terminal, control, &request, &command, &path, &mode)? {
+            match run_external(
+                &mut terminal,
+                control,
+                &request,
+                &command,
+                &path,
+                &mode,
+                true,
+            )? {
+                ExternalExit::Edit => {
+                    pending_edit = editor_command_for(&request);
+                    if pending_edit.is_none() {
+                        external_failed = Some(request);
+                        notice = Some("no editor configured (Settings → Custom editor…)".into());
+                    }
+                }
+                ExternalExit::Finished => {}
                 ExternalExit::Request(Request::Close) | ExternalExit::Close => {
                     if close_own_pane(control, &current, &mut notice) {
                         break Ok(());
@@ -2269,15 +2367,14 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                                             close_own_pane(control, &current, &mut notice);
                                     }
                                     KeyCode::Char('e') => {
-                                        if let Some(Request::File {
-                                            path,
-                                            editor: Some(command),
-                                            ..
-                                        }) = current.as_ref()
+                                        if let Some(request @ Request::File { .. }) =
+                                            current.as_ref()
+                                            && let Some(command) = editor_command_for(request)
                                         {
-                                            // An [[editor]] rule: its own tab
-                                            // through the editor-tab path.
-                                            notice = Some(open_rule_editor(path, command));
+                                            // The real editor replaces this
+                                            // pane (handled at the top of the
+                                            // loop, outside these borrows).
+                                            pending_edit = Some(command);
                                         } else if let Some(Request::File { path, .. }) =
                                             current.as_ref()
                                         {

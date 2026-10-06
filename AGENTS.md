@@ -663,6 +663,83 @@ HACKING.md — budget time for that before promising a patched build.
   again focuses the live pane through `focus_tab_for_client` instead of launching a duplicate. The
   token is cleared when the editor exits. The saved command wins over `HERDR_SIDEBAR_EDITOR`,
   `VISUAL`, and `EDITOR` fallbacks.
+- **Per-filetype previewers and editors** (`src/programs.rs`). Rules live in
+  `preview-programs.toml` in the plugin state dir (Settings → "Preview programs…" seeds a commented
+  template and opens it in the preview; `e` edits it) and optionally `.herdr-sidebar.toml` at the
+  Explorer root. The project layer is consulted FIRST but only while the persisted
+  `project_preview_rules` toggle is on (default off: a cloned repo must not run commands on a
+  click). Two tables: `[[preview]]` commands render the file to STDOUT and the built-in viewer
+  shows the result; `[[editor]]` commands get a real terminal in their own `<name> · editor` tab
+  through `open_in_editor_tab_with` (label, `hs-editor-path` token, heartbeat and reuse-by-file
+  unchanged). The phase-0 `[[rule]]` table loads as a rename error, never as a silent alias.
+  First matching rule wins; a pattern without `/` matches the file NAME, one with `/` the
+  root-relative slash path; matching is case-insensitive on every OS. `command` is a string or a
+  PREFERENCE-ORDERED list; each entry is tokenized with `split_editor_command` at load, rejected
+  for unknown `{placeholders}` (preview: file/width/height/theme/line; editor: file/line), and
+  resolved at use time with the shared `find_executable`/`resolve_program` in the SIDEBAR
+  process's PATH. **The sidebar resolves, the viewer only runs**: `open_preview_at` passes the
+  resolved previewer and editor commands as trailing fields of the `file\t<path>\t<line>`
+  control request (`Request::File { renderer, editor }`), so the viewer never reads rule files and
+  the document key stays the path (tab labels, pinning, ephemeral reuse untouched). A rule with no
+  resolvable candidate falls through with a "tried …" notice.
+- **Where each mapping is used.** A click, Enter, Quick Open or search hit previews (previewer
+  rule → built-in default → source view). "Use editor on click" ON routes a tree/search click to
+  the file's editor rule, else the global custom editor. The `m` menu offers "Edit with <name>"
+  for a resolved editor rule; `e` inside the preview opens that rule's tab when the request
+  carries one, else the in-pane editor. Keyboard Enter never opens an editor. A line-anchored
+  preview (search hit) always uses the built-in SOURCE view — rendered output has no line mapping.
+- **`viewer::render_with` is the one spawn path** for user previewers AND the built-in defaults
+  (`default_renderer_for`: Markdown → `glow -s {theme} -w {width} -`, images → `viu -b -w {width}
+  -s {file}`). argv[0] goes through `resolve_program_here` (absolute PATH entries only, cwd
+  excluded, exec bit, PATHEXT), the child gets `COLUMNS`/`LINES`/`CLICOLOR_FORCE`/`FORCE_COLOR`/
+  `COLORTERM=truecolor` with `NO_COLOR` removed and `CREATE_NO_WINDOW` on Windows, the file bytes
+  are piped on stdin (writer thread; EPIPE from a `{file}`-reading tool is expected) up to
+  `MAX_RENDER_INPUT` (32 MiB), stdout is capped at `MAX_RENDER_BYTES` (4 MiB) and stderr at 16 KiB
+  on reader threads, and `RENDER_TIMEOUT` (8 s) kills a stuck child. The old ffmpeg poster path
+  was the template for this (`run_captured`); glow previously had NO timeout or cap. A user
+  renderer's failure prepends a dim `⚠ … — showing built-in preview` line to the fallback; a
+  failed built-in image renderer shows `(image preview needs viu on PATH (cargo install viu))`.
+  `Doc.rendered_width` (ex `glow_width`) + `needs_rerender` re-run the renderer at the new body
+  width, scroll kept; `LAST_BODY_HEIGHT` joins `LAST_BODY_WIDTH` for `{height}`.
+- **No in-process image decoding and no ffmpeg anymore** (user decision): the `image` crate,
+  `MediaPreview`, the `▀` renderer and the video poster path are gone; a video file previews as
+  `(binary file …)`. Images use the EXTERNAL previewer mode below with viu, so they are real
+  Kitty graphics on Ghostty/Kitty/WezTerm (the handshake passes through herdr: a query from a
+  pane was answered `ESC_Gi=31;OK`) and half-blocks elsewhere. `viu` in a PIPE cannot do
+  graphics (no terminal answers its query; it emits the query `ESC_G…a=q…ESC\\` plus a DA1
+  probe `ESC[c` and falls back to blocks — the ANSI parser consumes both whole), which is why
+  the internal `viu -b` route is only the fallback after an external failure.
+- **External previewers (`mode = "external"`, `viewer::run_external`)** host the program on
+  the preview pane's own terminal: the viewer stays in its alternate screen but disables raw
+  mode and mouse capture, deletes prior Kitty images (`ESC_Ga=d,d=A`), clears, prints a dim
+  header line, and spawns the command with inherited stdio from row 2 (`{width}` = pane cols,
+  `{height}` = rows − 2, `COLUMNS`/`LINES` set). While the child runs only the control file and
+  the 5 s heartbeat are serviced (keys go to the child; a new request kills it). After a CLEAN
+  exit the output is HELD: raw mode back on, a dim ` q close (name)` footer on the last row,
+  q/Esc/Ctrl+C close the pane through `close_own_pane`, a crossterm `Resize` re-runs the
+  command, and a control-file change moves on. A non-zero exit or a missing program yields
+  `ExternalExit::Failed`; the loop then runs `start_fallback_load` (the plain request with the
+  reason prepended, tagged with the ORIGINAL request so the equality check accepts it) and
+  remembers `external_failed` so the same request is not re-hosted until a new request arrives.
+  On every exit path raw mode, mouse capture and `terminal.clear()` are restored. The built-in
+  image default is computed in the viewer (`external_command_for` → `viu_default_command`): viu
+  keeps the aspect ratio with ONE of `-w`/`-h` but stretches with both, so
+  `image_px_dimensions` reads the PNG/GIF/BMP/JPEG/WebP header (first 64 KiB) and
+  `viu_fit_args` picks the binding axis assuming cells are ~2× taller than wide; unknown
+  formats fit by height. Line-anchored previews never host. Not verified on Windows.
+- **`ansi::to_lines` contract** (arbitrary renderers hit all of these): SGR style carries ACROSS
+  lines until reset; CSI is parsed per ECMA-48 (parameter bytes `0x30–0x3F`, intermediates
+  `0x20–0x2F`, one final `0x40–0x7E`) and only a plain `…m` applies, so `ESC[?25l` no longer
+  leaks `25l`; `ESC(B`-style nF and single-byte `ESC7`/`ESC8`/`ESC=` sequences are consumed
+  whole; OSC/DCS/APC/PM/SOS payloads are skipped through BEL or ST; `9`/`29` strikethrough,
+  `21` underline, `58;2;r;g;b`/`58;5;n` underline-colour parameters are consumed, colon-form
+  `38:2::r:g:b` with the empty colour-space slot parses; backspace overstrike (`x\bx` bold,
+  `_\bx` underline) renders like man/less. Cursor-positioned output (direct Kitty placement,
+  Sixel) cannot map onto a scrollable document and is dropped, not rendered.
+- `MenuEntry` labels are `Cow<'static, str>` (no `Copy`) because "Edit with <name>" names the
+  resolved candidate. The phase-0 "preview tab" hack (`hs-editor-preview`/origin tokens, Esc
+  closing a program tab from its docked sidebar, wrapper auto-close) was REMOVED with this
+  redesign: previews live in the viewer again, so the viewer's own Esc/`q` apply.
 - **Title-bar action buttons** (`ui.rs` `TitleAction`/`title_action_spans`): VS Code-style
   hover buttons at the header's top-right (Explorer: New File / New Folder / Refresh /
   Collapse All; SCM: Refresh / Collapse All), left of the standalone ⚙. Terminals emit NO
@@ -1020,15 +1097,9 @@ It replaced the original pane-ID-keyed park/restore implementation; the optional
 - `glow` receives the actual preview-body width and the configured light/dark color mode. Its
   terminal-formatted output bypasses the generic text wrapper; first-load and resize mismatches
   schedule one background reload at the new width while preserving the reader's scroll offset.
-- Raster image previews are decoded in-process and rendered as true-color `▀` cells (foreground
-  = upper pixel, background = lower pixel), so they work through herdr's terminal compositor
-  without Kitty/Sixel passthrough. They preserve aspect ratio, center, and rebuild from the
-  decoded source when the pane width or height changes. Common video extensions ask `ffmpeg`
-  for a bounded first-frame PNG and render it through the same path; lookup resolves an absolute
-  executable from PATH while rejecting relative/project-local entries (Windows process lookup
-  otherwise searches cwd first), and extraction has a 4s timeout plus a 16 MiB output cap.
-  Images stop at 32 MiB encoded / 12 megapixels / 64 MiB decoder allocation. Without `ffmpeg`,
-  the pane shows a capability message rather than launching an external app. Media stays read-only.
+- Image previews are rendered by `viu -b` through the same previewer pipeline as everything
+  else (see "Per-filetype previewers" above); there is no in-process decoder, no `image` crate,
+  and no video preview. `is_image_file` keeps the extension list that selects the viu default.
 
 ### Syntax highlighting (file preview)
 

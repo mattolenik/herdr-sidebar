@@ -18,7 +18,7 @@ use crossterm::event::{
 };
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Color, Style, Stylize};
+use ratatui::style::{Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use unicode_width::UnicodeWidthChar;
@@ -47,6 +47,7 @@ const MAX_LINES: usize = 5000;
 /// a worker before layout is available, so glow uses this snapshot and the
 /// event loop reloads a glow document if its actual body width differs.
 static LAST_BODY_WIDTH: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(80);
+static LAST_BODY_HEIGHT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(24);
 
 /// Directory for the sidebar's private scratch files (viewer control files).
 /// Lives in the plugin's per-user state dir (see `rundir`) rather than the
@@ -284,6 +285,15 @@ enum Request {
         path: PathBuf,
         /// One-based source line to place at the top of the preview.
         line: Option<usize>,
+        /// A `[[preview]]` command the sidebar resolved for this file; its
+        /// stdout is what the pane shows (when `line` is `None`).
+        renderer: Option<String>,
+        /// An `[[editor]]` command the sidebar resolved for this file; `e`
+        /// opens it in its own tab instead of the in-pane editor.
+        editor: Option<String>,
+        /// `renderer` runs on the pane's real terminal (`mode = "external"`)
+        /// rather than rendering to stdout.
+        external: bool,
     },
     Diff {
         root: PathBuf,
@@ -300,14 +310,32 @@ enum Request {
     },
 }
 
-/// Control-file payload for a file preview.
-pub fn file_request(path: &Path) -> String {
-    format!("file\t{}", path.display())
-}
-
-/// Control-file payload for a file preview anchored to a one-based source line.
-pub fn file_request_at(path: &Path, line: usize) -> String {
-    format!("file\t{}\t{line}", path.display())
+/// Control-file payload for a file preview, optionally anchored to a
+/// one-based source line and carrying the resolved per-filetype previewer
+/// and editor commands (`file\t<path>\t<line>\t<renderer>\t<editor>`, each
+/// trailing field empty when absent).
+pub fn file_request(
+    path: &Path,
+    line: Option<usize>,
+    renderer: Option<&str>,
+    editor: Option<&str>,
+    external: bool,
+) -> String {
+    let mut payload = format!(
+        "file\t{}\t{}",
+        path.display(),
+        line.map(|line| line.to_string()).unwrap_or_default()
+    );
+    if renderer.is_some() || editor.is_some() {
+        payload.push('\t');
+        payload.push_str(renderer.unwrap_or(""));
+        payload.push('\t');
+        payload.push_str(editor.unwrap_or(""));
+        if external {
+            payload.push_str("\t1");
+        }
+    }
+    payload
 }
 
 /// Control-file payload for a git diff (`kind`: staged | worktree | untracked).
@@ -341,17 +369,36 @@ fn parse_request(raw: &str) -> Option<Request> {
             let path = parts.next().filter(|p| !p.is_empty()).map(str::to_string);
             Some(Request::Show { root, spec, path })
         }
-        Some("file") => Some(Request::File {
-            path: PathBuf::from(parts.next()?),
-            line: parts
+        Some("file") => {
+            let path = PathBuf::from(parts.next()?);
+            let line = parts
                 .next()
                 .and_then(|line| line.parse().ok())
-                .filter(|line| *line > 0),
-        }),
+                .filter(|line| *line > 0);
+            let optional = |field: Option<&str>| {
+                field
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string)
+            };
+            let renderer = optional(parts.next());
+            let editor = optional(parts.next());
+            let external = parts.next().map(str::trim) == Some("1");
+            Some(Request::File {
+                path,
+                line,
+                renderer,
+                editor,
+                external,
+            })
+        }
         // Legacy: a bare path.
         _ => Some(Request::File {
             path: PathBuf::from(raw),
             line: None,
+            renderer: None,
+            editor: None,
+            external: false,
         }),
     }
 }
@@ -359,9 +406,19 @@ fn parse_request(raw: &str) -> Option<Request> {
 fn request_payload(request: &Request) -> String {
     match request {
         Request::Close => "close".into(),
-        Request::File { path, line } => line
-            .map(|line| file_request_at(path, line))
-            .unwrap_or_else(|| file_request(path)),
+        Request::File {
+            path,
+            line,
+            renderer,
+            editor,
+            external,
+        } => file_request(
+            path,
+            *line,
+            renderer.as_deref(),
+            editor.as_deref(),
+            *external,
+        ),
         Request::Diff { root, rel, kind } => diff_request(root, rel, kind),
         Request::Show { root, spec, path } => show_request(root, spec, path.as_deref()),
     }
@@ -373,18 +430,16 @@ struct Doc {
     lines: Vec<Line<'static>>,
     /// File previews get a line-number gutter; diffs carry their own +/-.
     numbered: bool,
-    /// Decoded raster media, rendered portably with true-color half blocks.
-    /// Video files carry the poster frame extracted by ffmpeg.
-    media: Option<MediaPreview>,
     /// Offset into [`Doc::rows`] — RENDERED rows, not source lines, so a
     /// wrapped line's continuations are scrolled to like anything else.
     scroll: usize,
     /// Long lines wrap unless the user toggles them off (`w`). Per document:
     /// a newly loaded one starts wrapped again.
     wrap: bool,
-    /// Width glow formatted this markdown document for. A mismatch with the
-    /// live body triggers one background reload instead of generic rewrap.
-    glow_width: Option<u16>,
+    /// Width an external renderer (glow, viu, a `[[preview]]` rule) laid this
+    /// document out for. A mismatch with the live body triggers one
+    /// background re-render instead of generic rewrap.
+    rendered_width: Option<u16>,
     /// `lines` laid out for the pane, rebuilt only when the width or the
     /// wrap toggle changes (see [`Doc::relayout`]).
     rows: Vec<Row>,
@@ -395,13 +450,6 @@ struct Doc {
     /// row index underneath them changed.
     pending_src: Option<usize>,
     selection: PreviewSelection,
-}
-
-struct MediaPreview {
-    pixels: image::RgbaImage,
-    source_width: u32,
-    source_height: u32,
-    video_poster: bool,
 }
 
 /// One rendered row of the body: the source line it came from (so scroll
@@ -429,11 +477,7 @@ impl Doc {
     /// then honour any pending source-line scroll request.
     fn relayout(&mut self, width: u16, height: u16) {
         if self.rows_key != Some((width, height, self.wrap)) {
-            self.rows = if let Some(media) = &self.media {
-                render_media_rows(media, width, height)
-            } else {
-                build_rows(&self.lines, self.numbered, self.wrap, width)
-            };
+            self.rows = build_rows(&self.lines, self.numbered, self.wrap, width);
             self.rows_key = Some((width, height, self.wrap));
             self.selection = PreviewSelection::default();
         }
@@ -461,9 +505,6 @@ impl Doc {
     }
 
     fn on_mouse(&mut self, mouse: &MouseEvent, body: Rect) {
-        if self.media.is_some() {
-            return;
-        }
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 let Some(position) = self.text_position_at(body, mouse.column, mouse.row) else {
@@ -526,9 +567,6 @@ impl Doc {
     }
 
     fn select_all(&mut self) {
-        if self.media.is_some() {
-            return;
-        }
         let Some(last) = self.rows.last() else { return };
         let last_col = row_text_without_gutter(last, self.gutter()).chars().count();
         self.selection.anchor = Some(RenderPos::default());
@@ -630,80 +668,6 @@ fn selected_row(
     rendered
 }
 
-fn media_pixel(pixel: image::Rgba<u8>) -> Option<(u8, u8, u8)> {
-    let alpha = u16::from(pixel[3]);
-    if alpha < 8 {
-        return None;
-    }
-    let base = if crate::ui::is_light() { 255 } else { 0 };
-    let blend = |channel: u8| ((u16::from(channel) * alpha + base * (255 - alpha)) / 255) as u8;
-    Some((blend(pixel[0]), blend(pixel[1]), blend(pixel[2])))
-}
-
-/// Render raster media without relying on terminal-specific image protocols.
-/// One `▀` cell carries an upper pixel in its foreground and a lower pixel in
-/// its background, giving the pane two vertical pixels per terminal row.
-fn render_media_rows(media: &MediaPreview, width: u16, height: u16) -> Vec<Row> {
-    if width == 0 || height == 0 || media.source_width == 0 || media.source_height == 0 {
-        return Vec::new();
-    }
-    let max_pixel_height = u32::from(height).saturating_mul(2);
-    let scale = (f64::from(width) / f64::from(media.source_width))
-        .min(f64::from(max_pixel_height) / f64::from(media.source_height));
-    let target_width = (f64::from(media.source_width) * scale).round().max(1.0) as u32;
-    let target_height = (f64::from(media.source_height) * scale).round().max(1.0) as u32;
-    let pixels = image::imageops::resize(
-        &media.pixels,
-        target_width,
-        target_height,
-        image::imageops::FilterType::Triangle,
-    );
-    let rendered_height = target_height.div_ceil(2) as u16;
-    let top_pad = height.saturating_sub(rendered_height) / 2;
-    let left_pad = usize::from(width.saturating_sub(target_width as u16) / 2);
-    let mut rows = Vec::with_capacity(usize::from(top_pad + rendered_height));
-    for src in 0..usize::from(top_pad) {
-        rows.push(Row {
-            src,
-            line: Line::default(),
-        });
-    }
-    for pixel_y in (0..target_height).step_by(2) {
-        let mut spans = Vec::with_capacity(target_width as usize + 1);
-        if left_pad > 0 {
-            spans.push(Span::raw(" ".repeat(left_pad)));
-        }
-        for pixel_x in 0..target_width {
-            let upper = media_pixel(*pixels.get_pixel(pixel_x, pixel_y));
-            let lower = (pixel_y + 1 < target_height)
-                .then(|| media_pixel(*pixels.get_pixel(pixel_x, pixel_y + 1)))
-                .flatten();
-            let span = match (upper, lower) {
-                (Some(top), Some(bottom)) => Span::styled(
-                    "▀",
-                    Style::default()
-                        .fg(Color::Rgb(top.0, top.1, top.2))
-                        .bg(Color::Rgb(bottom.0, bottom.1, bottom.2)),
-                ),
-                (Some(top), None) => {
-                    Span::styled("▀", Style::default().fg(Color::Rgb(top.0, top.1, top.2)))
-                }
-                (None, Some(bottom)) => Span::styled(
-                    "▄",
-                    Style::default().fg(Color::Rgb(bottom.0, bottom.1, bottom.2)),
-                ),
-                (None, None) => Span::raw(" "),
-            };
-            spans.push(span);
-        }
-        rows.push(Row {
-            src: rows.len(),
-            line: Line::from(spans),
-        });
-    }
-    rows
-}
-
 /// Lay `lines` out for a `width`-wide body: wrap each source line (when
 /// wrapping is on), prefix the line-number gutter (blank on continuation
 /// rows, like an editor), and pad tinted diff rows to the full width.
@@ -758,16 +722,21 @@ fn load(request: &Request) -> Doc {
             context: String::new(),
             lines: vec![Line::raw("(closing)")],
             numbered: false,
-            media: None,
             scroll: 0,
             wrap: true,
-            glow_width: None,
+            rendered_width: None,
             rows: Vec::new(),
             rows_key: None,
             pending_src: None,
             selection: PreviewSelection::default(),
         },
-        Request::File { path, line } => load_file(path, *line),
+        Request::File {
+            path,
+            line,
+            renderer,
+            external,
+            ..
+        } => load_file(path, *line, renderer.as_deref().filter(|_| !external)),
         Request::Diff { root, rel, kind } => load_diff(root, rel, kind),
         Request::Show { root, spec, path } => load_show(root, spec, path.as_deref()),
     }
@@ -796,10 +765,9 @@ fn loading_doc(request: &Request) -> Doc {
         context,
         lines: vec![Line::raw("(loading preview…)")],
         numbered: false,
-        media: None,
         scroll: 0,
         wrap: true,
-        glow_width: None,
+        rendered_width: None,
         rows: Vec::new(),
         rows_key: None,
         pending_src: None,
@@ -947,10 +915,9 @@ fn load_show(root: &Path, spec: &str, path: Option<&str>) -> Doc {
         context: format!("git show {display_spec} — {}", root.display()),
         lines,
         numbered: false,
-        media: None,
         scroll: 0,
         wrap: true,
-        glow_width: None,
+        rendered_width: None,
         rows: Vec::new(),
         rows_key: None,
         pending_src: None,
@@ -958,75 +925,175 @@ fn load_show(root: &Path, spec: &str, path: Option<&str>) -> Doc {
     }
 }
 
-/// Render markdown text via `glow`. Returns `None` when glow is not installed
-/// or exits non-zero (caller falls back to syntax highlight).
-///
-/// Receives the already-read `text` buffer so the MAX_BYTES guard in
-/// `load_file` is honoured — glow would otherwise re-read the full file.
-/// Pipes via stdin (`-`) to avoid treating filenames starting with `-` as
-/// flags. The first render uses the most recently drawn body width; the event
-/// loop schedules one background reload if the actual body width differs.
-fn glow_markdown(text: &str, width: u16) -> Option<Vec<Line<'static>>> {
+/// Upper bound on a previewer's stdout. A full-width half-block image is
+/// about 20 bytes per cell, so a 200×100 render is ~400 KiB.
+const MAX_RENDER_BYTES: u64 = 4 * 1024 * 1024;
+/// Upper bound on what is piped INTO a previewer (images are binary and can
+/// be large; the 1 MiB `MAX_BYTES` text cap applies only to the built-in
+/// text path).
+const MAX_RENDER_INPUT: u64 = 32 * 1024 * 1024;
+/// A previewer that has not finished by then is killed.
+const RENDER_TIMEOUT: Duration = Duration::from_secs(8);
+/// Capture at most this much of a previewer's stderr for the notice.
+const MAX_RENDER_STDERR: u64 = 16 * 1024;
+
+/// The built-in previewer for `target` when no `[[preview]]` rule matches:
+/// Markdown through glow, images through viu. Both run through the same
+/// spawn path as user rules, so they share its timeout and caps.
+fn default_renderer_for(target: &Path) -> Option<&'static str> {
+    if is_image_file(target) {
+        Some("viu -b -w {width} -s {file}")
+    } else if has_extension(target, &["md", "markdown"]) {
+        Some("glow -s {theme} -w {width} -")
+    } else {
+        None
+    }
+}
+
+struct Captured {
+    status: std::process::ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+/// Run `command` with `input` on stdin, stdout capped at `cap + 1` bytes (so
+/// the caller can tell "exactly cap" from "more"), stderr capped at
+/// [`MAX_RENDER_STDERR`], killed after `timeout`. Readers run on threads so
+/// a chatty child can never deadlock against a full pipe.
+fn run_captured(
+    mut command: std::process::Command,
+    input: Vec<u8>,
+    cap: u64,
+    timeout: Duration,
+) -> Result<Captured, String> {
     use std::io::Write as _;
-    let args = glow_args(width, crate::ui::is_light());
-    let mut child = std::process::Command::new("glow")
-        .args(args)
-        .env("CLICOLOR_FORCE", "1")
+    command
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .ok()?;
-    if let Some(stdin) = child.stdin.take() {
-        let mut stdin = stdin;
-        let _ = stdin.write_all(text.as_bytes());
+        .stderr(std::process::Stdio::piped());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        command.creation_flags(0x0800_0000);
     }
-    let output = child.wait_with_output().ok()?;
+    let mut child = command.spawn().map_err(|error| error.to_string())?;
+    let mut stdin = child.stdin.take().ok_or("stdin unavailable")?;
+    let mut stdout = child.stdout.take().ok_or("stdout unavailable")?;
+    let mut stderr = child.stderr.take().ok_or("stderr unavailable")?;
+    // A tool that reads `{file}` itself never touches stdin; the write then
+    // fails with a broken pipe once it exits, which is fine.
+    let writer = std::thread::spawn(move || {
+        let _ = stdin.write_all(&input);
+    });
+    let stdout_reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = (&mut stdout).take(cap + 1).read_to_end(&mut bytes);
+        bytes
+    });
+    let stderr_reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = (&mut stderr)
+            .take(MAX_RENDER_STDERR)
+            .read_to_end(&mut bytes);
+        bytes
+    });
+    let deadline = Instant::now() + timeout;
+    let finish = |child: &mut std::process::Child| {
+        let _ = child.kill();
+        let _ = child.wait();
+    };
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Ok(None) => {
+                finish(&mut child);
+                let _ = writer.join();
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
+                return Err(format!("timed out after {} seconds", timeout.as_secs()));
+            }
+            Err(error) => {
+                finish(&mut child);
+                let _ = writer.join();
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
+                return Err(format!("status failed: {error}"));
+            }
+        }
+    };
+    let _ = writer.join();
+    let stdout = stdout_reader
+        .join()
+        .map_err(|_| "output reader failed".to_string())?;
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| "error reader failed".to_string())?;
+    Ok(Captured {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+/// Render `file` with a previewer `command` (`[[preview]]` rule or built-in
+/// default): substitute `{width}`/`{height}`/`{theme}`/`{line}`/`{file}`,
+/// resolve argv[0] through the shared PATH rules, pipe `input` on stdin, and
+/// turn the ANSI stdout into lines. `Err` carries a one-line reason for the
+/// notice; the caller decides what to show instead.
+fn render_with(
+    command: &str,
+    file: &Path,
+    input: &[u8],
+    width: u16,
+    height: u16,
+    light: bool,
+    line: Option<usize>,
+) -> Result<Vec<Line<'static>>, String> {
+    let name = crate::programs::display_name(command);
+    let subs = [
+        ("width", width.to_string()),
+        ("height", height.to_string()),
+        ("theme", if light { "light" } else { "dark" }.to_string()),
+        ("line", line.unwrap_or(1).max(1).to_string()),
+    ];
+    let argv =
+        crate::actions::command_argv(command, file, &subs).map_err(|error| error.to_string())?;
+    let program = crate::programs::resolve_program_here(&argv[0])
+        .ok_or_else(|| format!("{name} is not on PATH"))?;
+    let mut cmd = std::process::Command::new(program);
+    cmd.args(&argv[1..])
+        .env("COLUMNS", width.to_string())
+        .env("LINES", height.to_string())
+        .env("CLICOLOR_FORCE", "1")
+        .env("FORCE_COLOR", "1")
+        .env("COLORTERM", "truecolor")
+        .env_remove("NO_COLOR");
+    let output = run_captured(cmd, input.to_vec(), MAX_RENDER_BYTES, RENDER_TIMEOUT)
+        .map_err(|error| format!("{name} {error}"))?;
     if !output.status.success() {
-        return None;
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let detail = stderr.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
+        return Err(format!("{name} exited with {}: {detail}", output.status)
+            .trim_end_matches(": ")
+            .to_string());
     }
-    let rendered = String::from_utf8_lossy(&output.stdout);
-    if rendered.trim().is_empty() {
-        return None;
+    if output.stdout.len() as u64 > MAX_RENDER_BYTES {
+        return Err(format!(
+            "{name} output exceeded {} MiB",
+            MAX_RENDER_BYTES / 1024 / 1024
+        ));
     }
-    let mut lines = ansi::to_lines(&rendered);
+    let text = String::from_utf8_lossy(&output.stdout);
+    if text.trim().is_empty() {
+        return Err(format!("{name} produced no output"));
+    }
+    let mut lines = ansi::to_lines(&text);
     lines.truncate(MAX_LINES);
-    if lines.is_empty() {
-        return None;
-    }
-    Some(lines)
+    Ok(lines)
 }
-
-fn glow_args(width: u16, light: bool) -> Vec<String> {
-    vec![
-        "--style".into(),
-        if light { "light" } else { "dark" }.into(),
-        "--width".into(),
-        width.to_string(),
-        "-".into(),
-    ]
-}
-
-fn choose_text_render<F>(
-    glow_rendered: Option<Vec<Line<'static>>>,
-    fallback: F,
-    glow_width: u16,
-) -> (Vec<Line<'static>>, bool, Option<u16>)
-where
-    F: FnOnce() -> Vec<Line<'static>>,
-{
-    match glow_rendered {
-        Some(rendered) => (rendered, false, Some(glow_width)),
-        None => (fallback(), true, None),
-    }
-}
-
-const MAX_MEDIA_FILE_BYTES: u64 = 32 * 1024 * 1024;
-const MAX_MEDIA_PIXELS: u64 = 12_000_000;
-const MAX_MEDIA_DIMENSION: u32 = 8192;
-const MAX_MEDIA_ALLOC_BYTES: u64 = 64 * 1024 * 1024;
-const MAX_VIDEO_FRAME_BYTES: u64 = 16 * 1024 * 1024;
-const VIDEO_FRAME_TIMEOUT: Duration = Duration::from_secs(4);
 
 fn has_extension(target: &Path, extensions: &[&str]) -> bool {
     target
@@ -1048,282 +1115,99 @@ fn is_image_file(target: &Path) -> bool {
     )
 }
 
-fn is_video_file(target: &Path) -> bool {
-    has_extension(
-        target,
-        &[
-            "avi", "flv", "m4v", "mkv", "mov", "mp4", "mpeg", "mpg", "webm", "wmv",
-        ],
-    )
-}
-
-fn decode_image_file(target: &Path) -> Result<image::RgbaImage, String> {
-    let file_bytes = std::fs::metadata(target)
-        .map_err(|error| error.to_string())?
-        .len();
-    if file_bytes > MAX_MEDIA_FILE_BYTES {
-        return Err(format!(
-            "image file is too large ({} MiB limit)",
-            MAX_MEDIA_FILE_BYTES / 1024 / 1024
-        ));
-    }
-    let (width, height) = image::image_dimensions(target).map_err(|error| error.to_string())?;
-    if width > MAX_MEDIA_DIMENSION
-        || height > MAX_MEDIA_DIMENSION
-        || u64::from(width).saturating_mul(u64::from(height)) > MAX_MEDIA_PIXELS
-    {
-        return Err(format!("image is too large ({width}×{height})"));
-    }
-    let mut reader = image::ImageReader::open(target)
-        .map_err(|error| error.to_string())?
-        .with_guessed_format()
-        .map_err(|error| error.to_string())?;
-    let mut limits = image::Limits::default();
-    limits.max_image_width = Some(MAX_MEDIA_DIMENSION);
-    limits.max_image_height = Some(MAX_MEDIA_DIMENSION);
-    limits.max_alloc = Some(MAX_MEDIA_ALLOC_BYTES);
-    reader.limits(limits);
-    reader
-        .decode()
-        .map(|image| image.to_rgba8())
-        .map_err(|error| error.to_string())
-}
-
-fn ffmpeg_in_path(path: &std::ffi::OsStr, cwd: Option<&Path>) -> Option<PathBuf> {
-    let executable = if cfg!(windows) {
-        "ffmpeg.exe"
-    } else {
-        "ffmpeg"
-    };
-    std::env::split_paths(path)
-        .filter(|directory| directory.is_absolute())
-        .filter_map(|directory| directory.canonicalize().ok())
-        .filter(|directory| !cwd.is_some_and(|cwd| directory.starts_with(cwd)))
-        .map(|directory| directory.join(executable))
-        .find(|candidate| {
-            if !candidate.is_file() {
-                return false;
-            }
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt as _;
-                candidate
-                    .metadata()
-                    .is_ok_and(|metadata| metadata.permissions().mode() & 0o111 != 0)
-            }
-            #[cfg(not(unix))]
-            true
-        })
-}
-
-fn ffmpeg_on_path() -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    let cwd = std::env::current_dir()
-        .ok()
-        .and_then(|path| path.canonicalize().ok());
-    ffmpeg_in_path(&path, cwd.as_deref())
-}
-
-fn decode_video_poster(target: &Path) -> Result<image::RgbaImage, String> {
-    let ffmpeg =
-        ffmpeg_on_path().ok_or_else(|| "video preview needs ffmpeg on PATH".to_string())?;
-    let mut command = std::process::Command::new(ffmpeg);
-    command.args([
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-nostdin",
-        "-ss",
-        "0",
-        "-i",
-    ]);
-    command.arg(target);
-    command.args([
-        "-frames:v",
-        "1",
-        "-vf",
-        "scale=1280:720:force_original_aspect_ratio=decrease",
-        "-f",
-        "image2pipe",
-        "-vcodec",
-        "png",
-        "pipe:1",
-    ]);
-    command
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt as _;
-        command.creation_flags(0x0800_0000);
-    }
-    let mut child = command
-        .spawn()
-        .map_err(|error| format!("ffmpeg failed: {error}"))?;
-    let mut stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| "ffmpeg stdout unavailable".to_string())?;
-    let mut stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| "ffmpeg stderr unavailable".to_string())?;
-    let stdout_reader = std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        let _ = (&mut stdout)
-            .take(MAX_VIDEO_FRAME_BYTES + 1)
-            .read_to_end(&mut bytes);
-        bytes
-    });
-    let stderr_reader = std::thread::spawn(move || {
-        let mut bytes = Vec::new();
-        let _ = (&mut stderr).take(16 * 1024).read_to_end(&mut bytes);
-        bytes
-    });
-    let deadline = Instant::now() + VIDEO_FRAME_TIMEOUT;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(25));
-            }
-            Ok(None) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                let _ = stdout_reader.join();
-                let _ = stderr_reader.join();
-                return Err("video poster timed out after 4 seconds".into());
-            }
-            Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                let _ = stdout_reader.join();
-                let _ = stderr_reader.join();
-                return Err(format!("ffmpeg status failed: {error}"));
-            }
-        }
-    };
-    let stdout = stdout_reader
-        .join()
-        .map_err(|_| "ffmpeg output reader failed".to_string())?;
-    let stderr = stderr_reader
-        .join()
-        .map_err(|_| "ffmpeg error reader failed".to_string())?;
-    if !status.success() {
-        let stderr = String::from_utf8_lossy(&stderr);
-        return Err(format!(
-            "ffmpeg could not read video: {}",
-            stderr.lines().next().unwrap_or("unknown error")
-        ));
-    }
-    if stdout.len() as u64 > MAX_VIDEO_FRAME_BYTES {
-        return Err("video poster frame exceeded 16 MiB".into());
-    }
-    image::load_from_memory_with_format(&stdout, image::ImageFormat::Png)
-        .map(|image| image.to_rgba8())
-        .map_err(|error| format!("could not decode video frame: {error}"))
-}
-
-fn load_media_file(target: &Path, name: String, video_poster: bool) -> Doc {
-    let result = if video_poster {
-        decode_video_poster(target)
-    } else {
-        decode_image_file(target)
-    };
-    let (lines, media, context) = match result {
-        Ok(pixels) => {
-            let (source_width, source_height) = pixels.dimensions();
-            let kind = if video_poster {
-                "video poster"
-            } else {
-                "image"
-            };
-            (
-                Vec::new(),
-                Some(MediaPreview {
-                    pixels,
-                    source_width,
-                    source_height,
-                    video_poster,
-                }),
-                format!(
-                    "{} — {source_width}×{source_height} {kind}",
-                    target.display()
-                ),
-            )
-        }
-        Err(error) => (
-            vec![Line::raw(format!("({error})"))],
-            None,
-            target.display().to_string(),
-        ),
-    };
-    Doc {
-        name,
-        context,
-        lines,
-        numbered: false,
-        media,
-        scroll: 0,
-        wrap: false,
-        glow_width: None,
-        rows: Vec::new(),
-        rows_key: None,
-        pending_src: None,
-        selection: PreviewSelection::default(),
-    }
-}
-
-fn load_file(target: &Path, target_line: Option<usize>) -> Doc {
+fn load_file(target: &Path, target_line: Option<usize>, renderer: Option<&str>) -> Doc {
     let name = target
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| target.display().to_string());
-    let lower = name.to_lowercase();
-    if is_image_file(target) {
-        return load_media_file(target, name, false);
-    }
-    if is_video_file(target) {
-        return load_media_file(target, name, true);
-    }
-    let is_markdown = lower.ends_with(".md") || lower.ends_with(".markdown");
-    let (lines, numbered, glow_width) = match std::fs::read(target) {
+    let width = LAST_BODY_WIDTH
+        .load(std::sync::atomic::Ordering::Relaxed)
+        .max(20);
+    let height = LAST_BODY_HEIGHT
+        .load(std::sync::atomic::Ordering::Relaxed)
+        .max(1);
+    let light = crate::ui::is_light();
+    let is_image = is_image_file(target);
+    let (lines, numbered, rendered_width) = match std::fs::read(target) {
         Err(e) => (vec![Line::raw(format!("(unreadable: {e})"))], true, None),
         Ok(bytes) => {
-            if bytes.contains(&0) {
-                (
+            // Previewers, in order: the user's rule, then the built-in
+            // default for the type. A line-anchored preview (search hit)
+            // keeps the source view — rendered output has no line mapping.
+            let mut warning: Option<String> = None;
+            let mut rendered: Option<Vec<Line<'static>>> = None;
+            if target_line.is_none() {
+                let candidates = renderer
+                    .map(|command| (command, true))
+                    .into_iter()
+                    .chain(default_renderer_for(target).map(|command| (command, false)));
+                for (command, from_rule) in candidates {
+                    if bytes.len() as u64 > MAX_RENDER_INPUT {
+                        warning = Some(format!(
+                            "file exceeds the {} MiB previewer limit",
+                            MAX_RENDER_INPUT / 1024 / 1024
+                        ));
+                        break;
+                    }
+                    match render_with(command, target, &bytes, width, height, light, None) {
+                        Ok(lines) => {
+                            rendered = Some(lines);
+                            break;
+                        }
+                        Err(error) => {
+                            warning = Some(if from_rule {
+                                format!("{error} — showing built-in preview")
+                            } else {
+                                error
+                            });
+                        }
+                    }
+                }
+            }
+            let warn_line = |text: &str| Line::raw(format!("⚠ {text}")).dim();
+            match rendered {
+                Some(mut lines) => {
+                    if let Some(warning) = &warning {
+                        lines.insert(0, warn_line(warning));
+                    }
+                    (lines, false, Some(width))
+                }
+                None if is_image => {
+                    let text = match warning.as_deref() {
+                        Some(error) if error.ends_with("is not on PATH") => {
+                            "image preview needs viu on PATH (cargo install viu)".to_string()
+                        }
+                        Some(error) => error.to_string(),
+                        None => "image preview is not available".to_string(),
+                    };
+                    (vec![Line::raw(format!("({text})"))], false, None)
+                }
+                None if bytes.contains(&0) => (
                     vec![Line::raw(format!("(binary file — {} bytes)", bytes.len()))],
                     false,
                     None,
-                )
-            } else {
-                let truncated = bytes.len() > MAX_BYTES;
-                let text = String::from_utf8_lossy(&bytes[..bytes.len().min(MAX_BYTES)]);
-                // Markdown: render via glow; fall back to syntax highlight on failure.
-                let requested_glow_width = LAST_BODY_WIDTH
-                    .load(std::sync::atomic::Ordering::Relaxed)
-                    .max(20);
-                let glow_rendered = (is_markdown && target_line.is_none())
-                    .then(|| glow_markdown(&text, requested_glow_width))
-                    .flatten();
-                let fallback = || {
-                    crate::syntax::highlight(&name, &text, MAX_LINES).unwrap_or_else(|| {
-                        text.lines()
-                            .take(MAX_LINES)
-                            .map(|l| Line::raw(l.to_string()))
-                            .collect()
-                    })
-                };
-                let (mut lines, numbered, glow_width) =
-                    choose_text_render(glow_rendered, fallback, requested_glow_width);
-                if truncated || text.lines().count() > MAX_LINES {
-                    lines.push(Line::raw("… (truncated)"));
+                ),
+                None => {
+                    let truncated = bytes.len() > MAX_BYTES;
+                    let text = String::from_utf8_lossy(&bytes[..bytes.len().min(MAX_BYTES)]);
+                    let mut lines = crate::syntax::highlight(&name, &text, MAX_LINES)
+                        .unwrap_or_else(|| {
+                            text.lines()
+                                .take(MAX_LINES)
+                                .map(|l| Line::raw(l.to_string()))
+                                .collect()
+                        });
+                    if truncated || text.lines().count() > MAX_LINES {
+                        lines.push(Line::raw("… (truncated)"));
+                    }
+                    if lines.is_empty() {
+                        lines.push(Line::raw("(empty file)"));
+                    }
+                    if let Some(warning) = &warning {
+                        lines.insert(0, warn_line(warning));
+                    }
+                    (lines, true, None)
                 }
-                if lines.is_empty() {
-                    lines.push(Line::raw("(empty file)"));
-                }
-                (lines, numbered, glow_width)
             }
         }
     };
@@ -1332,11 +1216,10 @@ fn load_file(target: &Path, target_line: Option<usize>) -> Doc {
         context: target.display().to_string(),
         lines,
         numbered,
-        media: None,
         scroll: 0,
-        // Glow already laid out tables and paragraphs for `glow_width`.
-        wrap: glow_width.is_none(),
-        glow_width,
+        // A renderer already laid the content out for `rendered_width`.
+        wrap: rendered_width.is_none(),
+        rendered_width,
         rows: Vec::new(),
         rows_key: None,
         pending_src: target_line.map(|line| line.saturating_sub(1)),
@@ -1344,9 +1227,371 @@ fn load_file(target: &Path, target_line: Option<usize>) -> Doc {
     }
 }
 
-fn glow_needs_reload(doc: &Doc, body_width: u16) -> bool {
+/// `e` on a preview whose request carries an `[[editor]]` rule: open the
+/// file in its own tab, the way the sidebar's "Edit with …" does.
+fn open_rule_editor(path: &Path, command: &str) -> String {
+    let pane_id = std::env::var("HERDR_PANE_ID").unwrap_or_default();
+    let root = path
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let name = crate::programs::display_name(command);
+    match crate::actions::open_in_editor_tab_with(&pane_id, &root, path, command, None) {
+        Ok(()) => format!("opened with {name}"),
+        Err(error) => format!("{name} failed: {error}"),
+    }
+}
+
+/// Why hosting an external previewer on the pane ended.
+#[derive(Debug, PartialEq, Eq)]
+enum ExternalExit {
+    /// The control file asked for something else (another document, or
+    /// `Close`).
+    Request(Request),
+    /// The user pressed q/Esc on the held output.
+    Close,
+    /// The program could not run or exited non-zero: show the built-in
+    /// preview with this reason.
+    Failed(String),
+}
+
+/// Pixel size from an image file header (PNG, GIF, BMP, JPEG, WebP), so the
+/// built-in viu command can pick the axis that fits the pane. `None` for
+/// anything else; the caller then fits by height.
+fn image_px_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    let be32 = |at: usize| {
+        bytes
+            .get(at..at + 4)
+            .map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+    };
+    let le16 = |at: usize| {
+        bytes
+            .get(at..at + 2)
+            .map(|b| u16::from_le_bytes([b[0], b[1]]))
+    };
+    let le32 = |at: usize| {
+        bytes
+            .get(at..at + 4)
+            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    };
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return Some((be32(16)?, be32(20)?));
+    }
+    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        return Some((u32::from(le16(6)?), u32::from(le16(8)?)));
+    }
+    if bytes.starts_with(b"BM") {
+        let width = le32(18)? as i32;
+        let height = le32(22)? as i32;
+        return Some((width.unsigned_abs(), height.unsigned_abs()));
+    }
+    if bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP") {
+        return match bytes.get(12..16)? {
+            b"VP8X" => {
+                let le24 = |at: usize| {
+                    bytes
+                        .get(at..at + 3)
+                        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], 0]))
+                };
+                Some((le24(24)? + 1, le24(27)? + 1))
+            }
+            b"VP8 " => Some((u32::from(le16(26)? & 0x3FFF), u32::from(le16(28)? & 0x3FFF))),
+            b"VP8L" => {
+                let bits = le32(21)?;
+                Some(((bits & 0x3FFF) + 1, ((bits >> 14) & 0x3FFF) + 1))
+            }
+            _ => None,
+        };
+    }
+    if bytes.starts_with(b"\xFF\xD8") {
+        // Walk the segments to the first SOFn marker.
+        let mut i = 2;
+        while i + 9 < bytes.len() {
+            if bytes[i] != 0xFF {
+                i += 1;
+                continue;
+            }
+            let marker = bytes[i + 1];
+            if marker == 0xFF {
+                i += 1;
+                continue;
+            }
+            let is_sof = (0xC0..=0xCF).contains(&marker) && !matches!(marker, 0xC4 | 0xC8 | 0xCC);
+            if is_sof {
+                let h = u16::from_be_bytes([bytes[i + 5], bytes[i + 6]]);
+                let w = u16::from_be_bytes([bytes[i + 7], bytes[i + 8]]);
+                return Some((u32::from(w), u32::from(h)));
+            }
+            let len = usize::from(u16::from_be_bytes([bytes[i + 2], bytes[i + 3]]));
+            i += 2 + len.max(2);
+        }
+        return None;
+    }
+    None
+}
+
+/// The built-in external image command. viu keeps the aspect ratio when
+/// given ONE of `-w`/`-h` (both together stretch), so pick the axis the pane
+/// binds on: terminal cells are about twice as tall as wide.
+fn viu_fit_args(px: Option<(u32, u32)>, cols: u16, rows: u16) -> &'static str {
+    match px {
+        Some((w, h)) if w > 0 && h > 0 => {
+            let rows_at_full_width = (f64::from(h) / f64::from(w) * f64::from(cols) / 2.0).ceil();
+            if rows_at_full_width <= f64::from(rows) {
+                "-w {width}"
+            } else {
+                "-h {height}"
+            }
+        }
+        _ => "-h {height}",
+    }
+}
+
+fn viu_default_command(path: &Path, cols: u16, rows: u16) -> String {
+    let mut head = Vec::new();
+    if let Ok(file) = std::fs::File::open(path) {
+        let _ = file.take(64 * 1024).read_to_end(&mut head);
+    }
+    format!(
+        "viu -s {} {{file}}",
+        viu_fit_args(image_px_dimensions(&head), cols, rows)
+    )
+}
+
+/// The command to host on the pane's terminal for `request`, if any: an
+/// external `[[preview]]` rule, or the built-in viu default for an image
+/// with no rule. Line-anchored previews stay in the viewer.
+fn external_command_for(request: &Request) -> Option<String> {
+    let Request::File {
+        path,
+        line: None,
+        renderer,
+        external,
+        ..
+    } = request
+    else {
+        return None;
+    };
+    match renderer {
+        Some(command) if *external => Some(command.clone()),
+        Some(_) => None,
+        None if is_image_file(path) => {
+            let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+            Some(viu_default_command(
+                path,
+                cols,
+                rows.saturating_sub(2).max(1),
+            ))
+        }
+        None => None,
+    }
+}
+
+/// Terminal modes for a hosted child: cooked output (`\n` → `\r\n` stays
+/// on for tools that print lines) but no echo, no line buffering and no
+/// signal keys — a terminal's reply to the child's Kitty/DA1 probe must not
+/// be echoed onto the screen as text, and Ctrl+C must reach the child as a
+/// byte rather than killing this viewer along with it.
+#[cfg(unix)]
+fn quiet_child_mode() {
+    let _ = crossterm::terminal::disable_raw_mode();
+    // SAFETY: plain termios calls on stdin's descriptor with a zeroed,
+    // then fully initialised, termios struct.
+    unsafe {
+        let mut modes: libc::termios = std::mem::zeroed();
+        if libc::tcgetattr(libc::STDIN_FILENO, &mut modes) == 0 {
+            modes.c_lflag &= !(libc::ECHO | libc::ICANON | libc::ISIG);
+            modes.c_cc[libc::VMIN] = 1;
+            modes.c_cc[libc::VTIME] = 0;
+            let _ = libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &modes);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn quiet_child_mode() {
+    let _ = crossterm::terminal::disable_raw_mode();
+}
+
+/// Did the control file move on from `request`? `Some(Close)` included.
+fn control_moved_on(control: &Path, request: &Request) -> Option<Request> {
+    read_control(control).filter(|target| target != request)
+}
+
+/// Host `command` on the pane's own terminal: suspend the TUI, run the
+/// program with inherited stdio so it can negotiate Kitty graphics or run
+/// interactively, and keep whatever it drew on screen after a clean exit
+/// until q/Esc, the next request, or a resize (which re-runs it). The
+/// heartbeat and the control file keep being serviced throughout, so the
+/// sidebar can still switch or close this pane.
+fn run_external(
+    terminal: &mut ratatui::DefaultTerminal,
+    control: &Path,
+    request: &Request,
+    command: &str,
+    path: &Path,
+    mode: &ViewMode,
+) -> std::io::Result<ExternalExit> {
+    use std::io::Write as _;
+    let name = crate::programs::display_name(command);
+    let doc_key = request.doc_key();
+    let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
+    let mut last_heartbeat = Instant::now();
+    let heartbeat = |mode: &ViewMode, last: &mut Instant| {
+        if last.elapsed() >= Duration::from_secs(5) {
+            report_identity(mode, Some(&doc_key), control);
+            *last = Instant::now();
+        }
+    };
+    let outcome = 'rerun: loop {
+        let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+        let height = rows.saturating_sub(2).max(1);
+        let subs = [
+            ("width", cols.to_string()),
+            ("height", height.to_string()),
+            (
+                "theme",
+                if crate::ui::is_light() {
+                    "light"
+                } else {
+                    "dark"
+                }
+                .to_string(),
+            ),
+            ("line", "1".to_string()),
+        ];
+        let argv = match crate::actions::command_argv(command, path, &subs) {
+            Ok(argv) => argv,
+            Err(error) => break ExternalExit::Failed(error.to_string()),
+        };
+        let Some(program) = crate::programs::resolve_program_here(&argv[0]) else {
+            break ExternalExit::Failed(format!("{name} is not on PATH"));
+        };
+        // Fresh canvas inside the alternate screen: delete any images a
+        // previous run placed, clear, a dim header line, then the program
+        // draws from row 2.
+        quiet_child_mode();
+        let header = format!(
+            "\x1b[2m ✕  {}  {}\x1b[0m",
+            path.file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            path.display()
+        );
+        {
+            let mut out = std::io::stdout();
+            let _ = write!(out, "\x1b_Ga=d,d=A\x1b\\\x1b[2J\x1b[H{header}\r\n");
+            let _ = out.flush();
+        }
+        let mut cmd = std::process::Command::new(program);
+        cmd.args(&argv[1..])
+            .env("COLUMNS", cols.to_string())
+            .env("LINES", height.to_string())
+            .env_remove("NO_COLOR")
+            .stdin(std::process::Stdio::inherit())
+            .stdout(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::inherit());
+        let mut child = match cmd.spawn() {
+            Ok(child) => child,
+            Err(error) => break ExternalExit::Failed(format!("{name}: {error}")),
+        };
+        // Phase 1: the program owns the terminal. Only the control file and
+        // the heartbeat are serviced; keys go to the program.
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) => {}
+                Err(error) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break 'rerun ExternalExit::Failed(format!("{name}: {error}"));
+                }
+            }
+            if let Some(next) = control_moved_on(control, request) {
+                let _ = child.kill();
+                let _ = child.wait();
+                break 'rerun ExternalExit::Request(next);
+            }
+            heartbeat(mode, &mut last_heartbeat);
+            std::thread::sleep(Duration::from_millis(100));
+        };
+        if !status.success() {
+            break ExternalExit::Failed(format!("{name} exited with {status}"));
+        }
+        // Phase 2: hold the output. Raw mode so keys reach us without echo;
+        // q/Esc close, a resize re-runs, anything else is ignored.
+        let _ = crossterm::terminal::enable_raw_mode();
+        {
+            // Re-assert the chrome: a program that homed the cursor or
+            // scrolled may have taken the header with it.
+            let mut out = std::io::stdout();
+            let _ = write!(
+                out,
+                "\x1b[1;1H{header}\x1b[{rows};1H\x1b[2m q close  ({name})\x1b[0m"
+            );
+            let _ = out.flush();
+        }
+        loop {
+            if event::poll(Duration::from_millis(150))? {
+                match event::read()? {
+                    Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
+                        KeyCode::Char('q') | KeyCode::Esc => break 'rerun ExternalExit::Close,
+                        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            break 'rerun ExternalExit::Close;
+                        }
+                        _ => {}
+                    },
+                    Event::Resize(..) => continue 'rerun,
+                    _ => {}
+                }
+            }
+            if let Some(next) = control_moved_on(control, request) {
+                break 'rerun ExternalExit::Request(next);
+            }
+            heartbeat(mode, &mut last_heartbeat);
+        }
+    };
+    // Back to the TUI: raw mode, mouse, images gone, full redraw.
+    let _ = crossterm::terminal::enable_raw_mode();
+    let _ = crossterm::execute!(std::io::stdout(), EnableMouseCapture);
+    {
+        let mut out = std::io::stdout();
+        let _ = write!(out, "\x1b_Ga=d,d=A\x1b\\\x1b[2J\x1b[H");
+        let _ = out.flush();
+    }
+    let _ = terminal.clear();
+    Ok(outcome)
+}
+
+/// After an external previewer failed: load the built-in preview for the
+/// same request (its renderer ignored) with the reason on top, tagged with
+/// the ORIGINAL request so the loop's equality check accepts it.
+fn start_fallback_load(
+    request: Request,
+    reason: String,
+) -> (Request, std::sync::mpsc::Receiver<Doc>) {
+    let plain = match &request {
+        Request::File { path, line, .. } => Request::File {
+            path: path.clone(),
+            line: *line,
+            renderer: None,
+            editor: None,
+            external: false,
+        },
+        other => other.clone(),
+    };
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut doc = load(&plain);
+        doc.lines.insert(0, Line::raw(format!("⚠ {reason}")).dim());
+        let _ = sender.send(doc);
+    });
+    (request, receiver)
+}
+
+fn needs_rerender(doc: &Doc, body_width: u16) -> bool {
     let body_width = body_width.max(20);
-    doc.glow_width.is_some_and(|width| width != body_width)
+    doc.rendered_width.is_some_and(|width| width != body_width)
 }
 
 fn load_diff(root: &Path, rel: &str, kind: &str) -> Doc {
@@ -1402,10 +1647,9 @@ fn load_diff(root: &Path, rel: &str, kind: &str) -> Doc {
         context: format!("{} — {what} diff", root.join(rel).display()),
         lines,
         numbered: false,
-        media: None,
         scroll: 0,
         wrap: true,
-        glow_width: None,
+        rendered_width: None,
         rows: Vec::new(),
         rows_key: None,
         pending_src: None,
@@ -1754,10 +1998,9 @@ pub fn run(control: &Path) -> std::io::Result<()> {
         context: String::new(),
         lines: vec![Line::raw("(waiting for a click in the sidebar)")],
         numbered: false,
-        media: None,
         scroll: 0,
         wrap: true,
-        glow_width: None,
+        rendered_width: None,
         rows: Vec::new(),
         rows_key: None,
         pending_src: None,
@@ -1791,7 +2034,41 @@ pub fn run(control: &Path) -> std::io::Result<()> {
     let mut last_diff_refresh = Instant::now();
     let mut diff_refresh: Option<(Request, std::sync::mpsc::Receiver<Doc>)> = None;
     let mut identity_pending = false;
+    let mut external_failed: Option<Request> = None;
     let result = loop {
+        // An external previewer (mode = "external", or the built-in viu for
+        // images) takes the pane's terminal until the next request.
+        if prompt.is_none()
+            && matches!(mode, ViewMode::Preview(_))
+            && let Some(request) = current.clone()
+            && external_failed.as_ref() != Some(&request)
+            && let Some(command) = external_command_for(&request)
+            && let Request::File { path, .. } = &request
+        {
+            preview_load = None;
+            let path = path.clone();
+            match run_external(&mut terminal, control, &request, &command, &path, &mode)? {
+                ExternalExit::Request(Request::Close) | ExternalExit::Close => {
+                    if close_own_pane(control, &current, &mut notice) {
+                        break Ok(());
+                    }
+                    // Restore failed: the notice explains; a second q closes.
+                    external_failed = Some(request);
+                }
+                ExternalExit::Request(next) => {
+                    mode = ViewMode::Preview(loading_doc(&next));
+                    current = Some(next.clone());
+                    preview_load = Some(start_preview_load(next));
+                    identity_pending = true;
+                    notice = None;
+                }
+                ExternalExit::Failed(error) => {
+                    external_failed = Some(request.clone());
+                    preview_load = Some(start_fallback_load(request, error));
+                }
+            }
+            continue;
+        }
         let loaded =
             preview_load
                 .as_ref()
@@ -1807,7 +2084,7 @@ pub fn run(control: &Path) -> std::io::Result<()> {
             if current.as_ref() == Some(&request)
                 && let (ViewMode::Preview(doc), Some(mut loaded)) = (&mut mode, loaded)
             {
-                if doc.glow_width.is_some() && loaded.glow_width.is_some() {
+                if doc.rendered_width.is_some() && loaded.rendered_width.is_some() {
                     loaded.scroll = doc.scroll;
                 }
                 *doc = loaded;
@@ -1843,7 +2120,7 @@ pub fn run(control: &Path) -> std::io::Result<()> {
         if preview_load.is_none()
             && let (ViewMode::Preview(doc), Some(request @ Request::File { line: None, .. })) =
                 (&mode, current.as_ref())
-            && glow_needs_reload(doc, body_width)
+            && needs_rerender(doc, body_width)
         {
             LAST_BODY_WIDTH.store(body_width, std::sync::atomic::Ordering::Relaxed);
             preview_load = Some(start_preview_load(request.clone()));
@@ -1992,8 +2269,15 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                                             close_own_pane(control, &current, &mut notice);
                                     }
                                     KeyCode::Char('e') => {
-                                        if doc.media.is_some() {
-                                            notice = Some("media previews are read-only".into());
+                                        if let Some(Request::File {
+                                            path,
+                                            editor: Some(command),
+                                            ..
+                                        }) = current.as_ref()
+                                        {
+                                            // An [[editor]] rule: its own tab
+                                            // through the editor-tab path.
+                                            notice = Some(open_rule_editor(path, command));
                                         } else if let Some(Request::File { path, .. }) =
                                             current.as_ref()
                                         {
@@ -2035,7 +2319,7 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                                     }
                                     KeyCode::Home | KeyCode::Char('g') => doc.scroll = 0,
                                     KeyCode::End | KeyCode::Char('G') => doc.scroll = max,
-                                    KeyCode::Char('w') if doc.media.is_none() => {
+                                    KeyCode::Char('w') => {
                                         doc.pending_src = Some(doc.top_src());
                                         doc.wrap = !doc.wrap;
                                     }
@@ -2166,6 +2450,7 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                     preview_load = Some(start_preview_load(request));
                     identity_pending = true;
                     notice = None;
+                    external_failed = None;
                 }
             }
         }
@@ -2234,6 +2519,7 @@ fn draw_doc(
     // Lay the body out for THIS width first: everything below (the clamp,
     // the slice, the page stride) counts rendered rows.
     LAST_BODY_WIDTH.store(body.width, std::sync::atomic::Ordering::Relaxed);
+    LAST_BODY_HEIGHT.store(body.height, std::sync::atomic::Ordering::Relaxed);
     doc.relayout(body.width, body.height);
     doc.scroll = doc.scroll.min(
         doc.rows
@@ -2291,12 +2577,6 @@ fn draw_doc(
     };
     let hint = if let Some(notice) = notice {
         format!(" {notice}")
-    } else if let Some(media) = &doc.media {
-        if media.video_poster {
-            " video poster frame  q close".into()
-        } else {
-            " image preview  q close".into()
-        }
     } else if editable {
         preview_hint(&["e edit", "space/b page", wrap_hint], footer.width)
     } else {
@@ -2957,7 +3237,9 @@ pub(crate) fn previews_in(pane_list_json: &str) -> Vec<PreviewPane> {
         .collect()
 }
 
-fn tab_is_plugin_only(pane_list_json: &str, tab_id: &str) -> bool {
+/// Every pane in `tab_id` is one of ours (sidebar, viewer, or a custom-editor
+/// wrapper), so closing the whole tab cannot take a user's shell or agent.
+pub(crate) fn tab_is_plugin_only(pane_list_json: &str, tab_id: &str) -> bool {
     #[derive(serde::Deserialize)]
     struct Msg {
         result: Res,
@@ -2994,6 +3276,7 @@ fn tab_is_plugin_only(pane_list_json: &str, tab_id: &str) -> bool {
             pane.tokens.contains_key(METADATA_SOURCE)
                 || pane.tokens.contains_key("herdr-sidebar-explorer")
                 || pane.tokens.contains_key("herdr-sidebar-git")
+                || pane.tokens.contains_key("herdr-sidebar-editor")
                 || pane
                     .label
                     .as_deref()
@@ -3390,6 +3673,8 @@ fn side_neighbor(layout_json: &str, pane_id: &str, on_the_left: bool) -> Option<
 
 #[cfg(test)]
 mod tests {
+    use ratatui::style::Color;
+
     use super::*;
 
     fn doc_of(lines: Vec<Line<'static>>, numbered: bool) -> Doc {
@@ -3398,10 +3683,9 @@ mod tests {
             context: String::new(),
             lines,
             numbered,
-            media: None,
             scroll: 0,
             wrap: true,
-            glow_width: None,
+            rendered_width: None,
             rows: Vec::new(),
             rows_key: None,
             pending_src: None,
@@ -3416,95 +3700,101 @@ mod tests {
     }
 
     #[test]
-    fn raster_media_uses_two_truecolor_pixels_per_cell() {
-        let mut pixels = image::RgbaImage::new(2, 2);
-        for x in 0..2 {
-            pixels.put_pixel(x, 0, image::Rgba([255, 0, 0, 255]));
-            pixels.put_pixel(x, 1, image::Rgba([0, 0, 255, 255]));
-        }
-        let rows = render_media_rows(
-            &MediaPreview {
-                pixels,
-                source_width: 2,
-                source_height: 2,
-                video_poster: false,
-            },
-            2,
-            1,
-        );
-        assert_eq!(rows.len(), 1);
-        assert_eq!(row_texts(&rows), vec!["▀▀"]);
-        for span in &rows[0].line.spans {
-            assert_eq!(span.style.fg, Some(Color::Rgb(255, 0, 0)));
-            assert_eq!(span.style.bg, Some(Color::Rgb(0, 0, 255)));
-        }
+    fn image_headers_yield_pixel_sizes_and_viu_fits_the_binding_axis() {
+        let mut png = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
+        png.extend(1832u32.to_be_bytes());
+        png.extend(955u32.to_be_bytes());
+        assert_eq!(image_px_dimensions(&png), Some((1832, 955)));
+        let mut gif = b"GIF89a".to_vec();
+        gif.extend(320u16.to_le_bytes());
+        gif.extend(200u16.to_le_bytes());
+        assert_eq!(image_px_dimensions(&gif), Some((320, 200)));
+        let mut jpeg = b"\xFF\xD8\xFF\xE0\0\x10JFIF\0\x01\x01\0\0\x01\0\x01\0\0".to_vec();
+        jpeg.extend(b"\xFF\xC0\0\x11\x08");
+        jpeg.extend(480u16.to_be_bytes());
+        jpeg.extend(640u16.to_be_bytes());
+        jpeg.extend([3, 1, 0x22, 0, 2, 0x11, 1, 3, 0x11, 1]);
+        assert_eq!(image_px_dimensions(&jpeg), Some((640, 480)));
+        let mut webp = b"RIFF\0\0\0\0WEBPVP8X\x0a\0\0\0\0\0\0\0".to_vec();
+        webp.extend(&(99u32).to_le_bytes()[..3]);
+        webp.extend(&(49u32).to_le_bytes()[..3]);
+        assert_eq!(image_px_dimensions(&webp), Some((100, 50)));
+        assert_eq!(image_px_dimensions(b"not an image"), None);
+
+        // 1832×955 in an 80×24 body: full width needs ~21 rows, fits → width.
+        assert_eq!(viu_fit_args(Some((1832, 955)), 80, 24), "-w {width}");
+        // A portrait image binds on height.
+        assert_eq!(viu_fit_args(Some((600, 1200)), 80, 24), "-h {height}");
+        assert_eq!(viu_fit_args(None, 80, 24), "-h {height}");
     }
 
     #[test]
-    fn media_extensions_are_case_insensitive_and_disjoint() {
+    fn built_in_previewers_follow_the_file_type() {
         assert!(is_image_file(Path::new("photo.JPEG")));
-        assert!(is_video_file(Path::new("clip.MP4")));
-        assert!(!is_video_file(Path::new("photo.png")));
         assert!(!is_image_file(Path::new("notes.txt")));
-    }
-
-    #[test]
-    fn image_files_decode_into_media_and_oversized_inputs_stop_before_decode() {
-        let root = std::env::temp_dir().join(format!("viewer-media-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
-
-        let image_path = root.join("sample.png");
-        image::RgbaImage::from_pixel(3, 2, image::Rgba([12, 34, 56, 255]))
-            .save_with_format(&image_path, image::ImageFormat::Png)
-            .unwrap();
-        let doc = load_file(&image_path, None);
-        assert!(doc.media.is_some());
-        assert!(doc.lines.is_empty());
-
-        let oversized = root.join("oversized.png");
-        std::fs::File::create(&oversized)
-            .unwrap()
-            .set_len(MAX_MEDIA_FILE_BYTES + 1)
-            .unwrap();
-        assert!(
-            decode_image_file(&oversized)
-                .unwrap_err()
-                .contains("MiB limit")
-        );
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn ffmpeg_lookup_skips_project_local_path_entries() {
-        let root = std::env::temp_dir().join(format!("viewer-ffmpeg-{}", std::process::id()));
-        let project = root.join("project");
-        let local_bin = project.join("tools");
-        let external_bin = root.join("external");
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&local_bin).unwrap();
-        std::fs::create_dir_all(&external_bin).unwrap();
-        let executable = if cfg!(windows) {
-            "ffmpeg.exe"
-        } else {
-            "ffmpeg"
-        };
-        for directory in [&local_bin, &external_bin] {
-            let file = directory.join(executable);
-            std::fs::write(&file, b"placeholder").unwrap();
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt as _;
-                std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755)).unwrap();
-            }
-        }
-        let search_path = std::env::join_paths([&local_bin, &external_bin]).unwrap();
-        let project = project.canonicalize().unwrap();
         assert_eq!(
-            ffmpeg_in_path(&search_path, Some(&project)),
-            Some(external_bin.canonicalize().unwrap().join(executable))
+            default_renderer_for(Path::new("photo.PNG")),
+            Some("viu -b -w {width} -s {file}")
         );
-        std::fs::remove_dir_all(root).unwrap();
+        assert_eq!(
+            default_renderer_for(Path::new("README.md")),
+            Some("glow -s {theme} -w {width} -")
+        );
+        // No video previews: a clip is just a binary file.
+        assert_eq!(default_renderer_for(Path::new("clip.mp4")), None);
+        assert_eq!(default_renderer_for(Path::new("main.rs")), None);
+    }
+
+    #[test]
+    fn render_with_captures_stdout_and_reports_failures() {
+        // `git` is on every CI leg. `--version` exercises a plain capture;
+        // the `{file}` path is appended as the last argument, which `git
+        // --version` ignores.
+        let file = Path::new("/nonexistent/x.md");
+        let lines = render_with("git --version", file, b"", 80, 24, false, None).unwrap();
+        assert!(
+            lines[0].to_string().starts_with("git version"),
+            "{}",
+            lines[0]
+        );
+
+        let error = render_with(
+            "git definitely-not-a-command",
+            file,
+            b"",
+            80,
+            24,
+            false,
+            None,
+        )
+        .unwrap_err();
+        assert!(error.starts_with("git exited with"), "{error}");
+        assert!(error.contains("definitely-not-a-command"), "{error}");
+
+        let error = render_with(
+            "no-such-previewer-xyz {file}",
+            file,
+            b"",
+            80,
+            24,
+            false,
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(error, "no-such-previewer-xyz is not on PATH");
+    }
+
+    #[test]
+    fn run_captured_delivers_stdin_to_the_child() {
+        let mut cmd = std::process::Command::new("git");
+        cmd.args(["hash-object", "--stdin"]);
+        let out = run_captured(cmd, b"hello\n".to_vec(), 1024, Duration::from_secs(10)).unwrap();
+        assert!(out.status.success());
+        // git's blob hash of "hello\n".
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            "ce013625030ba8dba906f756967f9e9ca394464a"
+        );
     }
 
     #[test]
@@ -3834,7 +4124,14 @@ mod tests {
             {"tab_id":"w1:t2","label":"a.rs · preview","tokens":{}},
             {"tab_id":"w1:t2","label":"pwsh","tokens":{}}
         ]}}"#;
+        // A custom-editor wrapper pane has no label of its own; its running
+        // heartbeat token is what marks it as ours.
+        let with_editor = r#"{"result":{"panes":[
+            {"tab_id":"w1:t2","label":"Sidebar","tokens":{"herdr-sidebar-explorer":"1"}},
+            {"tab_id":"w1:t2","tokens":{"herdr-sidebar-editor":"1","hs-editor-path":"abc"}}
+        ]}}"#;
         assert!(tab_is_plugin_only(plugin_only, "w1:t2"));
+        assert!(tab_is_plugin_only(with_editor, "w1:t2"));
         assert!(!tab_is_plugin_only(with_shell, "w1:t2"));
         assert!(tab_is_plugin_only(resumed, "w1:t2"));
         assert!(!tab_is_plugin_only(resumed_with_shell, "w1:t2"));
@@ -4181,7 +4478,7 @@ mod tests {
         let mut bytes = vec![b'a'; 9000];
         bytes.push(0);
         std::fs::write(&path, bytes).unwrap();
-        let doc = load_file(&path, None);
+        let doc = load_file(&path, None, None);
         let rendered: String = doc.lines[0]
             .spans
             .iter()
@@ -4467,22 +4764,85 @@ mod tests {
     #[test]
     fn requests_roundtrip() {
         assert_eq!(parse_request("close"), Some(Request::Close));
-        let f = file_request(Path::new("C:/x/y.rs"));
+        let plain = |path: &str, line: Option<usize>| Request::File {
+            path: PathBuf::from(path),
+            line,
+            renderer: None,
+            editor: None,
+            external: false,
+        };
+        let f = file_request(Path::new("C:/x/y.rs"), None, None, None, false);
+        assert_eq!(f, "file\tC:/x/y.rs\t");
+        assert_eq!(parse_request(&f), Some(plain("C:/x/y.rs", None)));
+        let f = file_request(Path::new("C:/x/y.rs"), Some(42), None, None, false);
+        assert_eq!(parse_request(&f), Some(plain("C:/x/y.rs", Some(42))));
+        // Resolved previewer/editor commands ride along as trailing fields.
+        let f = file_request(
+            Path::new("/r/a.md"),
+            None,
+            Some("leaf --inline ansi:{width} {file}"),
+            Some("nvim {file}"),
+            false,
+        );
         assert_eq!(
             parse_request(&f),
             Some(Request::File {
-                path: PathBuf::from("C:/x/y.rs"),
+                path: PathBuf::from("/r/a.md"),
                 line: None,
+                renderer: Some("leaf --inline ansi:{width} {file}".into()),
+                editor: Some("nvim {file}".into()),
+                external: false,
             })
         );
-        let f = file_request_at(Path::new("C:/x/y.rs"), 42);
+        let f = file_request(
+            Path::new("/r/a.md"),
+            Some(3),
+            None,
+            Some("nvim {file}"),
+            false,
+        );
+        let parsed = parse_request(&f).unwrap();
+        assert_eq!(request_payload(&parsed), f);
+        assert!(matches!(
+            parsed,
+            Request::File {
+                renderer: None,
+                editor: Some(_),
+                line: Some(3),
+                ..
+            }
+        ));
+        // External previewers carry a sixth field.
+        let f = file_request(Path::new("/r/a.png"), None, Some("viu {file}"), None, true);
+        assert_eq!(f, "file\t/r/a.png\t\tviu {file}\t\t1");
+        let parsed = parse_request(&f).unwrap();
+        assert!(matches!(
+            &parsed,
+            Request::File { external: true, renderer: Some(r), .. } if r == "viu {file}"
+        ));
+        assert_eq!(request_payload(&parsed), f);
+        assert_eq!(external_command_for(&parsed).as_deref(), Some("viu {file}"));
+        assert_eq!(external_command_for(&plain("/r/a.rs", None)), None);
+        // An internal renderer never hosts; a line-anchored image stays in the viewer.
+        let variant = |line: Option<usize>, external: bool| Request::File {
+            path: PathBuf::from("/r/a.png"),
+            line,
+            renderer: Some("viu {file}".into()),
+            editor: None,
+            external,
+        };
+        assert_eq!(external_command_for(&variant(None, false)), None);
+        assert_eq!(external_command_for(&variant(Some(2), true)), None);
+        // Legacy forms from an older sidebar still parse.
         assert_eq!(
-            parse_request(&f),
-            Some(Request::File {
-                path: PathBuf::from("C:/x/y.rs"),
-                line: Some(42),
-            })
+            parse_request("file\tC:/x/y.rs"),
+            Some(plain("C:/x/y.rs", None))
         );
+        assert_eq!(
+            parse_request("file\tC:/x/y.rs\t7"),
+            Some(plain("C:/x/y.rs", Some(7)))
+        );
+        assert_eq!(parse_request("C:/x/y.rs"), Some(plain("C:/x/y.rs", None)));
         let s = show_request(Path::new("C:/repo"), "stash@{1}", None);
         assert_eq!(
             parse_request(&s),
@@ -4516,6 +4876,9 @@ mod tests {
             Some(Request::File {
                 path: PathBuf::from("C:/plain.txt"),
                 line: None,
+                renderer: None,
+                editor: None,
+                external: false,
             })
         );
         assert_eq!(parse_request("  "), None);
@@ -4588,7 +4951,7 @@ mod tests {
         for name in ["sample.txt", "sample.md"] {
             let path = root.join(name);
             std::fs::write(&path, "one\ntwo\nthree\n").unwrap();
-            let doc = load_file(&path, Some(2));
+            let doc = load_file(&path, Some(2), None);
             assert_eq!(doc.pending_src, Some(1));
             assert!(
                 doc.numbered,
@@ -4599,61 +4962,36 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires the optional glow executable"]
-    fn glow_markdown_returns_styled_spans() {
-        let md = "# Heading\n\n**bold** and `code`\n";
-        let lines = glow_markdown(md, 80);
-        assert!(lines.is_some(), "glow_markdown returned None");
-        let lines = lines.unwrap();
-        assert!(!lines.is_empty(), "glow_markdown returned empty lines");
-        // At least one span must have a non-default style (proof that ANSI was parsed)
-        let has_styled = lines.iter().any(|l| {
-            l.spans
-                .iter()
-                .any(|s| s.style != ratatui::style::Style::default())
-        });
-        assert!(
-            has_styled,
-            "glow_markdown returned no styled spans — ANSI not parsed"
-        );
-    }
-
-    #[test]
-    fn glow_rendered_markdown_uses_the_body_width_without_generic_rewrap() {
-        let rendered = vec![Line::raw("preformatted table")];
-        let fallback = vec![Line::raw("markdown source")];
-        let (lines, numbered, glow_width) = choose_text_render(Some(rendered), || fallback, 80);
+    fn rendered_output_uses_the_body_width_without_generic_rewrap() {
         let doc = Doc {
             name: "table.md".into(),
             context: String::new(),
-            lines,
-            numbered,
-            media: None,
+            lines: vec![Line::raw("preformatted table")],
+            numbered: false,
             scroll: 0,
-            wrap: glow_width.is_none(),
-            glow_width,
+            wrap: false,
+            rendered_width: Some(80),
             rows: Vec::new(),
             rows_key: None,
             pending_src: None,
             selection: PreviewSelection::default(),
         };
-        assert!(!doc.wrap, "glow output must not be generically re-wrapped");
-        assert!(!doc.numbered, "glow formats its own layout, no gutter");
-        assert_eq!(doc.glow_width, Some(80));
-        assert!(!glow_needs_reload(&doc, 80));
-        assert!(glow_needs_reload(&doc, 60));
-    }
-
-    #[test]
-    fn glow_arguments_always_carry_theme_width_and_stdin_sentinel() {
-        assert_eq!(
-            glow_args(39, true),
-            ["--style", "light", "--width", "39", "-"]
+        assert!(
+            !doc.wrap,
+            "renderer output must not be generically re-wrapped"
         );
-        assert_eq!(
-            glow_args(120, false),
-            ["--style", "dark", "--width", "120", "-"]
+        assert!(
+            !doc.numbered,
+            "a renderer formats its own layout, no gutter"
         );
+        assert!(!needs_rerender(&doc, 80));
+        assert!(needs_rerender(&doc, 60));
+        let plain = Doc {
+            rendered_width: None,
+            wrap: true,
+            ..doc
+        };
+        assert!(!needs_rerender(&plain, 60), "source views never re-render");
     }
 
     #[test]
@@ -4731,6 +5069,9 @@ mod tests {
         let file = Request::File {
             path: PathBuf::from("/repo/a.rs"),
             line: None,
+            renderer: None,
+            editor: None,
+            external: false,
         };
         let restored = control_after_failed_close(&Some(file.clone()));
         assert_eq!(parse_request(&restored), Some(file));

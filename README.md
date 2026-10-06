@@ -47,12 +47,15 @@ Use the mouse or press `1`, `2`, and `3`.
 - Click a file to reuse an ephemeral preview tab; double-click to pin it. Preview in the
   same tab with **Preview opens in: pane**, or opt into experimental `replace` mode:
   working panes move to a temporary tab while you preview; Esc / `q` brings them back.
-- Preview text, Markdown, images, and—when `ffmpeg` is available—video poster frames.
+- Preview text, Markdown (via `glow`), and images (via `viu`).
   Read-only previews support mouse selection and clipboard copy, including OSC 52 over SSH.
 - Find files with `Ctrl+P`; search project contents with `Ctrl+F` or `Ctrl+Shift+F`.
   Search supports case, whole-word, regex, and include/exclude filters.
 - Stage files or folders from the tree without crossing nested-repository boundaries.
 - Opt into a terminal editor for mouse clicks, while Enter keeps the built-in preview.
+- Per-filetype previewers (`*.md` → `dawn -P`, then `leaf --inline`: the first one on `PATH`
+  renders inside the preview pane) and editors (`*.md` → `dawn`, then `nvim`, in their own tab),
+  globally or per project.
 - Press `e` in a text preview for the experimental editor with selection, find,
   clipboard actions, explicit save, and external-change protection.
 
@@ -94,6 +97,7 @@ Settings persist across tabs and restarts. Configure:
 - Left/right docking and preferred width
 - Material/emoji icons and VS Code/light/terminal colors
 - Tab (default), split-pane, or temporary takeover previews and optional custom editor
+- Per-filetype previewers and editors (global rules file, optional per-project rules)
 - Source Control list/tree view (shared across sidebars)
 - Hidden files, Git decorations, Git footer, and footer hotkeys
 - Auto-open, strict open/close toggle, focus-on-open, and live folder following
@@ -167,8 +171,8 @@ Useful development actions:
 Use the `-windows` suffix for each direct action on Windows.
 
 All docking, metadata, pane creation, and preview control use herdr's socket API directly.
-The plugin is one Rust crate; optional external tools only enhance Markdown (`glow`), video
-posters (`ffmpeg`), and AI commit drafts (`claude`).
+The plugin is one Rust crate; optional external tools only enhance Markdown (`glow`), images
+(`viu`), per-filetype previews you configure, and AI commit drafts (`claude`).
 
 <div align="center">
 <sub>Screenshots: herdr on Windows Terminal with a Nerd Font.</sub>

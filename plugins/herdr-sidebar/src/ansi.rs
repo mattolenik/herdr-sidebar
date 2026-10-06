@@ -2,7 +2,7 @@
 //! `git diff --color=always`, `git show`, `glow`, `viu -b`, and any
 //! per-filetype previewer a user configures. Supports 16-color + bright,
 //! 256-color, truecolor (both `;` and `:` forms), bold/dim/italic/underline/
-//! strikethrough/reverse, resets, and backspace overstrike. Style carries
+//! strikethrough/reverse, resets. Style carries
 //! across lines because renderers routinely open a colour on one line and
 //! close it on a later one. Every other escape sequence — cursor movement,
 //! erases, private modes, OSC hyperlinks, DCS/APC payloads such as the
@@ -38,27 +38,6 @@ fn parse_line(raw: &str, start: Style) -> (Line<'static>, Style) {
         match c {
             '\u{1b}' => {}
             '\r' => continue,
-            '\u{8}' => {
-                // Overstrike (man/less): `x\bx` = bold x, `_\bx` / `x\b_` =
-                // underlined x. A plain backspace just discards the
-                // character it steps over, like a terminal overwrite.
-                let Some(prev) = text.pop() else { continue };
-                let next = chars.peek().copied();
-                let overstruck = match next {
-                    Some(n) if n == prev => Some((prev, Modifier::BOLD)),
-                    Some(n) if prev == '_' => Some((n, Modifier::UNDERLINED)),
-                    Some('_') => Some((prev, Modifier::UNDERLINED)),
-                    _ => None,
-                };
-                if let Some((ch, modifier)) = overstruck {
-                    chars.next();
-                    if !text.is_empty() {
-                        spans.push(Span::styled(std::mem::take(&mut text), style));
-                    }
-                    spans.push(Span::styled(ch.to_string(), style.add_modifier(modifier)));
-                }
-                continue;
-            }
             _ => {
                 text.push(c);
                 continue;
@@ -355,21 +334,5 @@ mod tests {
             "Read \u{1b}]8;id=docs;https://example.com\u{1b}\\the docs\u{1b}]8;;\u{1b}\\ now",
         );
         assert_eq!(st[0].to_string(), "Read the docs now");
-    }
-
-    #[test]
-    fn backspace_overstrike_renders_bold_and_underline() {
-        let lines = to_lines("N\u{8}NAME _\u{8}u x\u{8}_ a\u{8}b");
-        assert_eq!(lines[0].to_string(), "NAME u x b");
-        let bold = &lines[0].spans[0];
-        assert_eq!(bold.content, "N");
-        assert!(bold.style.add_modifier.contains(Modifier::BOLD));
-        let underlined: Vec<_> = lines[0]
-            .spans
-            .iter()
-            .filter(|s| s.style.add_modifier.contains(Modifier::UNDERLINED))
-            .map(|s| s.content.to_string())
-            .collect();
-        assert_eq!(underlined, vec!["u", "x"]);
     }
 }

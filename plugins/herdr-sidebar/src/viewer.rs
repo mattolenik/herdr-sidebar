@@ -934,8 +934,6 @@ const MAX_RENDER_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_RENDER_INPUT: u64 = 32 * 1024 * 1024;
 /// A previewer that has not finished by then is killed.
 const RENDER_TIMEOUT: Duration = Duration::from_secs(8);
-/// Capture at most this much of a previewer's stderr for the notice.
-const MAX_RENDER_STDERR: u64 = 16 * 1024;
 
 /// The built-in previewer for `target` when no `[[preview]]` rule matches:
 /// Markdown through glow, images through viu. Both run through the same
@@ -950,22 +948,16 @@ fn default_renderer_for(target: &Path) -> Option<&'static str> {
     }
 }
 
-struct Captured {
-    status: std::process::ExitStatus,
-    stdout: Vec<u8>,
-    stderr: Vec<u8>,
-}
-
 /// Run `command` with `input` on stdin, stdout capped at `cap + 1` bytes (so
-/// the caller can tell "exactly cap" from "more"), stderr capped at
-/// [`MAX_RENDER_STDERR`], killed after `timeout`. Readers run on threads so
+/// the caller can tell "exactly cap" from "more"), stderr capped at 16 KiB,
+/// killed after `timeout`. Readers run on threads so
 /// a chatty child can never deadlock against a full pipe.
 fn run_captured(
     mut command: std::process::Command,
     input: Vec<u8>,
     cap: u64,
     timeout: Duration,
-) -> Result<Captured, String> {
+) -> Result<std::process::Output, String> {
     use std::io::Write as _;
     command
         .stdin(std::process::Stdio::piped())
@@ -992,9 +984,7 @@ fn run_captured(
     });
     let stderr_reader = std::thread::spawn(move || {
         let mut bytes = Vec::new();
-        let _ = (&mut stderr)
-            .take(MAX_RENDER_STDERR)
-            .read_to_end(&mut bytes);
+        let _ = (&mut stderr).take(16 * 1024).read_to_end(&mut bytes);
         bytes
     });
     let deadline = Instant::now() + timeout;
@@ -1031,7 +1021,7 @@ fn run_captured(
     let stderr = stderr_reader
         .join()
         .map_err(|_| "error reader failed".to_string())?;
-    Ok(Captured {
+    Ok(std::process::Output {
         status,
         stdout,
         stderr,
@@ -1254,9 +1244,9 @@ enum ExternalExit {
     Edit,
 }
 
-/// Pixel size from an image file header (PNG, GIF, BMP, JPEG, WebP), so the
-/// built-in viu command can pick the axis that fits the pane. `None` for
-/// anything else; the caller then fits by height.
+/// Pixel size from an image file header (PNG, GIF, JPEG), so the built-in
+/// viu command can pick the axis that fits the pane. `None` for anything
+/// else; the caller then fits by height.
 fn image_px_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
     let be32 = |at: usize| {
         bytes
@@ -1268,39 +1258,11 @@ fn image_px_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
             .get(at..at + 2)
             .map(|b| u16::from_le_bytes([b[0], b[1]]))
     };
-    let le32 = |at: usize| {
-        bytes
-            .get(at..at + 4)
-            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-    };
     if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
         return Some((be32(16)?, be32(20)?));
     }
     if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
         return Some((u32::from(le16(6)?), u32::from(le16(8)?)));
-    }
-    if bytes.starts_with(b"BM") {
-        let width = le32(18)? as i32;
-        let height = le32(22)? as i32;
-        return Some((width.unsigned_abs(), height.unsigned_abs()));
-    }
-    if bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP") {
-        return match bytes.get(12..16)? {
-            b"VP8X" => {
-                let le24 = |at: usize| {
-                    bytes
-                        .get(at..at + 3)
-                        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], 0]))
-                };
-                Some((le24(24)? + 1, le24(27)? + 1))
-            }
-            b"VP8 " => Some((u32::from(le16(26)? & 0x3FFF), u32::from(le16(28)? & 0x3FFF))),
-            b"VP8L" => {
-                let bits = le32(21)?;
-                Some(((bits & 0x3FFF) + 1, ((bits >> 14) & 0x3FFF) + 1))
-            }
-            _ => None,
-        };
     }
     if bytes.starts_with(b"\xFF\xD8") {
         // Walk the segments to the first SOFn marker.
@@ -1410,11 +1372,6 @@ fn quiet_child_mode() {
 #[cfg(not(unix))]
 fn quiet_child_mode() {
     let _ = crossterm::terminal::disable_raw_mode();
-}
-
-/// Did the control file move on from `request`? `Some(Close)` included.
-fn control_moved_on(control: &Path, request: &Request) -> Option<Request> {
-    read_control(control).filter(|target| target != request)
 }
 
 /// Host `command` on the pane's own terminal: suspend the TUI, run the
@@ -1549,7 +1506,7 @@ fn run_external(
                     break 'rerun ExternalExit::Failed(format!("{name}: {error}"));
                 }
             }
-            if let Some(next) = control_moved_on(control, request) {
+            if let Some(next) = read_control(control).filter(|target| target != request) {
                 if preview {
                     let _ = child.kill();
                     let _ = child.wait();
@@ -1598,7 +1555,7 @@ fn run_external(
                     _ => {}
                 }
             }
-            if let Some(next) = control_moved_on(control, request) {
+            if let Some(next) = read_control(control).filter(|target| target != request) {
                 break 'rerun ExternalExit::Request(next);
             }
             heartbeat(mode, &mut last_heartbeat);
@@ -3812,10 +3769,6 @@ mod tests {
         jpeg.extend(640u16.to_be_bytes());
         jpeg.extend([3, 1, 0x22, 0, 2, 0x11, 1, 3, 0x11, 1]);
         assert_eq!(image_px_dimensions(&jpeg), Some((640, 480)));
-        let mut webp = b"RIFF\0\0\0\0WEBPVP8X\x0a\0\0\0\0\0\0\0".to_vec();
-        webp.extend(&(99u32).to_le_bytes()[..3]);
-        webp.extend(&(49u32).to_le_bytes()[..3]);
-        assert_eq!(image_px_dimensions(&webp), Some((100, 50)));
         assert_eq!(image_px_dimensions(b"not an image"), None);
 
         // 1832×955 in an 80×24 body: full width needs ~21 rows, fits → width.

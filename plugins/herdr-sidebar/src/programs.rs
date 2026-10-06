@@ -12,7 +12,6 @@
 use std::ffi::OsStr;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant, SystemTime};
 
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use serde::Deserialize;
@@ -21,8 +20,6 @@ use serde::Deserialize;
 pub const GLOBAL_FILE: &str = "preview-programs.toml";
 /// Per-project rules at the Explorer root (consulted first, when enabled).
 pub const PROJECT_FILE: &str = ".herdr-sidebar.toml";
-/// How often the cache re-stats the rule files on idle ticks.
-const RECHECK_EVERY: Duration = Duration::from_millis(500);
 
 /// Placeholders a `[[preview]]` command may use.
 const PREVIEW_PLACEHOLDERS: &[&str] = &["file", "width", "height", "theme", "line"];
@@ -119,7 +116,6 @@ pub struct Rule {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Resolved {
     pub command: String,
-    pub executable: PathBuf,
     /// Program basename for labels ("Edit with nvim").
     pub name: String,
     pub external: bool,
@@ -173,6 +169,7 @@ struct Compiled {
     paths: GlobSet,
 }
 
+#[derive(Default)]
 struct Layer {
     previews: Vec<Compiled>,
     editors: Vec<Compiled>,
@@ -181,19 +178,13 @@ struct Layer {
 /// The compiled rule set (project layer first, then global) plus every
 /// problem found while loading, so a bad project file never disables the
 /// global one and callers can surface the first error as a notice.
+#[derive(Default)]
 pub struct Rules {
     layers: Vec<Layer>,
     pub errors: Vec<String>,
 }
 
 impl Rules {
-    pub fn empty() -> Self {
-        Rules {
-            layers: Vec::new(),
-            errors: Vec::new(),
-        }
-    }
-
     /// First `[[preview]]` rule, in precedence order, matching `file`.
     pub fn preview_for(&self, root: &Path, file: &Path) -> Option<&Rule> {
         self.find(Kind::Preview, root, file)
@@ -287,10 +278,9 @@ impl Rule {
                 continue;
             };
             tried.push(display_name(candidate));
-            if let Some(executable) = resolve_program(&program, path, pathext, cwd) {
+            if resolve_program(&program, path, pathext, cwd).is_some() {
                 return Ok(Resolved {
                     command: candidate.clone(),
-                    executable,
                     name: display_name(candidate),
                     external: self.external,
                 });
@@ -385,10 +375,6 @@ fn pathext() -> Vec<String> {
 /// lookup otherwise searches the current directory first), and on unix the
 /// file must carry an execute bit. On Windows a name without an extension
 /// also tries each `PATHEXT` extension.
-pub fn find_executable(name: &OsStr, path: &OsStr, cwd: Option<&Path>) -> Option<PathBuf> {
-    find_executable_in(name, path, &pathext(), cwd)
-}
-
 fn find_executable_in(
     name: &OsStr,
     path: &OsStr,
@@ -429,7 +415,7 @@ pub fn load(root: &Path, include_project: bool) -> Rules {
 }
 
 pub fn load_from(project: Option<&Path>, global: Option<&Path>) -> Rules {
-    let mut rules = Rules::empty();
+    let mut rules = Rules::default();
     for file in [project, global].into_iter().flatten() {
         let label = file
             .file_name()
@@ -447,15 +433,11 @@ pub fn load_from(project: Option<&Path>, global: Option<&Path>) -> Rules {
 }
 
 fn parse_layer(text: &str, label: &str, errors: &mut Vec<String>) -> Layer {
-    let empty = Layer {
-        previews: Vec::new(),
-        editors: Vec::new(),
-    };
     let file: RuleFile = match toml::from_str(text) {
         Ok(file) => file,
         Err(error) => {
             errors.push(format!("{label}: {}", toml_message(text, &error)));
-            return empty;
+            return Layer::default();
         }
     };
     if !file.rule.is_empty() {
@@ -487,20 +469,15 @@ fn toml_message(text: &str, error: &toml::de::Error) -> String {
 
 /// `{name}` tokens in a command that are not in `allowed`.
 fn unknown_placeholders(command: &str, allowed: &[&str]) -> Vec<String> {
-    let mut unknown = Vec::new();
-    let mut rest = command;
-    while let Some(start) = rest.find('{') {
-        let after = &rest[start + 1..];
-        let Some(end) = after.find('}') else { break };
-        let name = &after[..end];
-        if !name.is_empty()
-            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-            && !allowed.contains(&name)
-            && !unknown.iter().any(|u| u == name)
-        {
-            unknown.push(name.to_string());
+    let mut unknown: Vec<String> = Vec::new();
+    for name in regex::Regex::new(r"\{(\w+)\}")
+        .expect("static pattern")
+        .captures_iter(command)
+        .map(|c| c[1].to_string())
+    {
+        if !allowed.contains(&name.as_str()) && !unknown.contains(&name) {
+            unknown.push(name);
         }
-        rest = &after[end + 1..];
     }
     unknown
 }
@@ -623,61 +600,6 @@ fn ensure_file(path: &Path) -> io::Result<()> {
     }
 }
 
-/// Rules cached per Explorer root, re-read when either file's mtime changes.
-/// Stats run at most every 500 ms unless forced.
-pub struct Cache {
-    rules: Rules,
-    stamps: [Option<SystemTime>; 2],
-    checked: Option<Instant>,
-    root: PathBuf,
-    include_project: bool,
-}
-
-impl Cache {
-    pub fn new(root: PathBuf) -> Self {
-        Cache {
-            rules: Rules::empty(),
-            stamps: [None, None],
-            checked: None,
-            root,
-            include_project: false,
-        }
-    }
-
-    pub fn current(&self) -> &Rules {
-        &self.rules
-    }
-
-    pub fn refresh(&mut self, include_project: bool, force: bool) -> &Rules {
-        let due = match self.checked {
-            None => true,
-            Some(at) => force || at.elapsed() >= RECHECK_EVERY,
-        };
-        if !due {
-            return &self.rules;
-        }
-        let project = include_project.then(|| project_path(&self.root));
-        let stamps = [
-            project.as_deref().and_then(modified),
-            global_path().as_deref().and_then(modified),
-        ];
-        let changed = self.checked.is_none()
-            || stamps != self.stamps
-            || include_project != self.include_project;
-        if changed {
-            self.rules = load(&self.root, include_project);
-            self.stamps = stamps;
-            self.include_project = include_project;
-        }
-        self.checked = Some(Instant::now());
-        &self.rules
-    }
-}
-
-fn modified(path: &Path) -> Option<SystemTime> {
-    std::fs::metadata(path).ok()?.modified().ok()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -701,7 +623,7 @@ mod tests {
     }
 
     fn parse(text: &str) -> Rules {
-        let mut rules = Rules::empty();
+        let mut rules = Rules::default();
         let layer = parse_layer(text, "test.toml", &mut rules.errors);
         rules.layers.push(layer);
         rules
@@ -1035,7 +957,6 @@ mod tests {
         let resolved = first.resolve_in(&path, &pathext, None).unwrap();
         assert_eq!(resolved.command, "mdview {file}");
         assert_eq!(resolved.name, "mdview");
-        assert_eq!(resolved.executable, mdview.canonicalize().unwrap());
 
         let none =
             preview_rule("[[preview]]\npatterns = [\"*.md\"]\ncommand = [\"leaf\", \"glow\"]\n");
@@ -1065,13 +986,7 @@ mod tests {
             "[[preview]]\npatterns = [\"*.md\"]\ncommand = {direct:?}\n"
         ));
         let empty = std::env::join_paths::<[&Path; 0], _>([]).unwrap();
-        assert_eq!(
-            rule_direct
-                .resolve_in(&empty, &pathext, None)
-                .unwrap()
-                .executable,
-            mdview
-        );
+        assert!(rule_direct.resolve_in(&empty, &pathext, None).is_ok());
         let missing = preview_rule(&format!(
             "[[preview]]\npatterns = [\"*.md\"]\ncommand = \"{}/nope\"\n",
             bin_a.display().to_string().replace('\\', "/")
@@ -1139,40 +1054,6 @@ mod tests {
         let examples = parse(&uncommented);
         assert!(examples.errors.is_empty(), "{:?}", examples.errors);
         assert_eq!((examples.preview_count(), examples.editor_count()), (3, 1));
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn cache_reloads_when_a_rule_file_changes() {
-        let dir = tmp("cache");
-        let project = project_path(&dir);
-        let mut cache = Cache::new(dir.clone());
-        // Only the project file is under test control; the global file may or
-        // may not exist on this machine, so compare project-driven counts.
-        let baseline = cache.refresh(false, true).len();
-        std::fs::write(
-            &project,
-            "[[preview]]\npatterns = [\"*.md\"]\ncommand = \"cat\"\n",
-        )
-        .unwrap();
-        assert_eq!(
-            cache.refresh(false, true).len(),
-            baseline,
-            "project layer is off"
-        );
-        assert_eq!(cache.refresh(true, true).len(), baseline + 1);
-        std::fs::write(
-            &project,
-            "[[preview]]\npatterns = [\"*.md\"]\ncommand = \"cat\"\n[[editor]]\npatterns = [\"*.rs\"]\ncommand = \"vi\"\n",
-        )
-        .unwrap();
-        let bumped = SystemTime::now() + Duration::from_secs(5);
-        let _ = std::fs::File::options()
-            .write(true)
-            .open(&project)
-            .and_then(|file| file.set_modified(bumped));
-        assert_eq!(cache.refresh(true, true).len(), baseline + 2);
-        assert_eq!(cache.current().len(), baseline + 2);
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

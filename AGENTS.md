@@ -676,7 +676,7 @@ HACKING.md — budget time for that before promising a patched build.
   root-relative slash path; matching is case-insensitive on every OS. `command` is a string or a
   PREFERENCE-ORDERED list; each entry is tokenized with `split_editor_command` at load, rejected
   for unknown `{placeholders}` (preview: file/width/height/theme/line; editor: file/line), and
-  resolved at use time with the shared `find_executable`/`resolve_program` in the SIDEBAR
+  resolved at use time with the shared `resolve_program` in the SIDEBAR
   process's PATH. **The sidebar resolves, the viewer only runs**: `open_preview_at` passes the
   resolved previewer and editor commands as trailing fields of the `file\t<path>\t<line>`
   control request (`Request::File { renderer, editor }`), so the viewer never reads rule files and
@@ -729,7 +729,7 @@ HACKING.md — budget time for that before promising a patched build.
   On every exit path raw mode, mouse capture and `terminal.clear()` are restored. The built-in
   image default is computed in the viewer (`external_command_for` → `viu_default_command`): viu
   keeps the aspect ratio with ONE of `-w`/`-h` but stretches with both, so
-  `image_px_dimensions` reads the PNG/GIF/BMP/JPEG/WebP header (first 64 KiB) and
+  `image_px_dimensions` reads the PNG/GIF/JPEG header (first 64 KiB) and
   `viu_fit_args` picks the binding axis assuming cells are ~2× taller than wide; unknown
   formats fit by height. Line-anchored previews never host. Not verified on Windows.
 - **`ansi::to_lines` contract** (arbitrary renderers hit all of these): SGR style carries ACROSS
@@ -738,8 +738,7 @@ HACKING.md — budget time for that before promising a patched build.
   leaks `25l`; `ESC(B`-style nF and single-byte `ESC7`/`ESC8`/`ESC=` sequences are consumed
   whole; OSC/DCS/APC/PM/SOS payloads are skipped through BEL or ST; `9`/`29` strikethrough,
   `21` underline, `58;2;r;g;b`/`58;5;n` underline-colour parameters are consumed, colon-form
-  `38:2::r:g:b` with the empty colour-space slot parses; backspace overstrike (`x\bx` bold,
-  `_\bx` underline) renders like man/less. Cursor-positioned output (direct Kitty placement,
+  `38:2::r:g:b` with the empty colour-space slot parses. Cursor-positioned output (direct Kitty placement,
   Sixel) cannot map onto a scrollable document and is dropped, not rendered.
 - `MenuEntry` labels are `Cow<'static, str>` (no `Copy`) because "Edit with <name>" names the
   resolved candidate. The phase-0 "preview tab" hack (`hs-editor-preview`/origin tokens, Esc

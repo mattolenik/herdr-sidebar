@@ -360,7 +360,7 @@ pub struct App {
     /// Last left-click (row index, when) for double-click detection.
     last_click: Option<(usize, std::time::Instant)>,
     /// Per-filetype preview program rules for this root (`programs.rs`).
-    programs: programs::Cache,
+    programs: programs::Rules,
     /// Where the most recent preview landed, with its document key — so a
     /// double click pins that exact tab instead of re-opening it.
     last_preview: Option<(String, herdr_sidebar::viewer::PreviewTarget)>,
@@ -475,7 +475,6 @@ impl App {
         } else {
             Vec::new()
         };
-        let root_for_programs = tree.root_path();
         let mut app = Self {
             tree,
             rows,
@@ -501,7 +500,7 @@ impl App {
             last_mouse: None,
             mouse_pos: None,
             last_click: None,
-            programs: programs::Cache::new(root_for_programs),
+            programs: programs::Rules::default(),
             last_preview: None,
             last_beat: std::time::Instant::now(),
             picking: None,
@@ -540,8 +539,6 @@ impl App {
     /// on their own. Self-throttling, so the event loop may call it freely.
     pub fn tick(&mut self) {
         self.sync_shared_settings();
-        self.programs
-            .refresh(self.sidebar_state.project_preview_rules, false);
         self.sync_shared_tree();
         self.collect_quick_index();
         self.collect_content_search();
@@ -856,7 +853,9 @@ impl App {
         // The sidebar owns the rules (root + trust gate); the viewer only
         // runs what it is handed.
         let renderer = self.resolve_rule(path, programs::Kind::Preview);
-        let editor = self.editor_rule_for(path).map(|r| r.command);
+        let editor = self
+            .resolve_rule(path, programs::Kind::Editor)
+            .map(|r| r.command);
         let payload = herdr_sidebar::viewer::file_request(
             path,
             line,
@@ -1388,7 +1387,9 @@ impl App {
         // Resolve here so the label names the editor that will actually run
         // ("Edit with nvim" on a machine without dawn).
         let program = match &target {
-            Some((path, false)) => self.editor_rule_for(&path.clone()).map(|r| r.name),
+            Some((path, false)) => self
+                .resolve_rule(&path.clone(), programs::Kind::Editor)
+                .map(|r| r.name),
             _ => None,
         };
         let entries = actions::menu_entries(
@@ -1986,9 +1987,8 @@ impl App {
 
     fn open_settings(&mut self) {
         herdr_sidebar::updates::check();
-        // The rule count row reads the cache; make it current first.
-        self.programs
-            .refresh(self.sidebar_state.project_preview_rules, true);
+        // The rule count row reads the loaded rules; make them current.
+        self.reload_rules();
         self.suspend_search_for_modal();
         self.overlay = Some(Overlay::Settings {
             selected: 0,
@@ -2463,15 +2463,13 @@ impl App {
     /// applies the rule.
     fn resolve_rule(&mut self, path: &Path, kind: programs::Kind) -> Option<programs::Resolved> {
         let root = self.tree.root_path();
-        let rules = self
-            .programs
-            .refresh(self.sidebar_state.project_preview_rules, true);
-        if let Some(error) = rules.first_error() {
+        self.reload_rules();
+        if let Some(error) = self.programs.first_error() {
             self.notice = Some(format!("preview programs: {error}"));
         }
         let rule = match kind {
-            programs::Kind::Preview => rules.preview_for(&root, path),
-            programs::Kind::Editor => rules.editor_for(&root, path),
+            programs::Kind::Preview => self.programs.preview_for(&root, path),
+            programs::Kind::Editor => self.programs.editor_for(&root, path),
         }?;
         match rule.resolve() {
             Ok(resolved) => Some(resolved),
@@ -2493,16 +2491,19 @@ impl App {
         }
     }
 
-    /// The `[[editor]]` rule for `path` (no global fallback): the menu label
-    /// and the viewer's `e` key.
-    fn editor_rule_for(&mut self, path: &Path) -> Option<programs::Resolved> {
-        self.resolve_rule(path, programs::Kind::Editor)
+    /// The rule files are tiny: re-read them whenever rules are consulted so
+    /// an edit to either file applies on the next click.
+    fn reload_rules(&mut self) {
+        self.programs = programs::load(
+            &self.tree.root_path(),
+            self.sidebar_state.project_preview_rules,
+        );
     }
 
     /// What "Use editor on click" opens: the file's editor rule, else the
     /// global custom editor.
     fn editor_for(&mut self, path: &Path) -> Option<String> {
-        self.editor_rule_for(path)
+        self.resolve_rule(path, programs::Kind::Editor)
             .map(|resolved| resolved.command)
             .or_else(actions::configured_editor)
     }
@@ -2585,7 +2586,7 @@ impl App {
             (
                 Setting::PreviewPrograms,
                 "Preview programs...",
-                self.programs.current().summary(),
+                self.programs.summary(),
                 programs::global_path().is_some(),
             ),
             (
@@ -2761,8 +2762,7 @@ impl App {
                 self.sidebar_state = sidebar::update_state(|state| {
                     state.project_preview_rules = !state.project_preview_rules;
                 });
-                self.programs
-                    .refresh(self.sidebar_state.project_preview_rules, true);
+                self.reload_rules();
             }
             Setting::HiddenFiles => {
                 self.tree.show_hidden = !self.tree.show_hidden;
@@ -2964,7 +2964,7 @@ impl App {
             MenuAction::EditWith => {
                 let Some((path, _)) = target else { return };
                 // `resolve_rule` already set the notice when nothing applies.
-                if let Some(resolved) = self.editor_rule_for(&path) {
+                if let Some(resolved) = self.resolve_rule(&path, programs::Kind::Editor) {
                     self.open_custom_editor(&path, &resolved.command, None);
                 }
             }

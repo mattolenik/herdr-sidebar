@@ -73,7 +73,7 @@ command = "viu -s -h {height} {file}"
 [[preview]]
 patterns = ["*.pdf"]
 mode = "external"
-command = "meowpdf {file}"
+command = ["pdfterm {file}", "tdf {file}"]
 
 # More examples:
 #

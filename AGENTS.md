@@ -707,7 +707,7 @@ HACKING.md — budget time for that before promising a patched build.
   preview (search hit) always uses the built-in SOURCE view — rendered output has no line mapping.
 - **The plugin names no tool in code.** `programs::load` seeds `preview-programs.toml` from
   `TEMPLATE` on first load; its three ACTIVE rules (glow for Markdown, external viu for images,
-  external meowpdf for PDFs) are suggestions the user edits. Nothing else picks a program.
+  external pdfterm or tdf for PDFs) are suggestions the user edits. Nothing else picks a program.
 - **`viewer::render_with` is the one spawn path** for previewers. argv[0] goes through `resolve_program_here` (absolute PATH entries only, cwd
   excluded, exec bit, PATHEXT), the child gets `COLUMNS`/`LINES`/`CLICOLOR_FORCE`/`FORCE_COLOR`/
   `COLORTERM=truecolor` with `NO_COLOR` removed and `CREATE_NO_WINDOW` on Windows, the file bytes

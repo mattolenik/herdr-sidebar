@@ -14,9 +14,8 @@ Herdr keybindings can invoke `show-explorer`, `show-search`, `show-git`, or `qui
 directly (`-windows` suffix on Windows), so chords such as `Cmd+P` are remappable by the host.
 The Git footer keeps branch switching and sync one click away in every view and can be hidden
 from Settings.
-Images render in the preview pane through `viu` (`cargo install viu`) with real Kitty graphics
-where the terminal supports them, and Markdown through `glow`; both are per-filetype previewers
-you can override (below).
+Per-filetype previewers render Markdown, images, PDFs and anything else through programs you
+choose; the seeded rules file suggests `glow`, `viu` and `meowpdf` (below).
 To open clicked files in a terminal editor, configure "Custom editor…" in sidebar Settings, then
 enable "Use editor on click". Clicking an already-open file focuses its existing editor tab;
 keyboard Enter continues to use the built-in preview.
@@ -48,10 +47,11 @@ The file is also piped on stdin for tools that read `-`. Placeholders: `{file}` 
 absent), `{width}` and `{height}` (the pane body in cells), `{theme}` (`light`/`dark`), `{line}`.
 Add `mode = "external"` to a `[[preview]]` rule to give the program the preview pane's real
 terminal instead: it can then draw Kitty graphics or run interactively, and the pane keeps what
-it drew until `q`/Esc, the next click, or a resize (which re-runs it). Without a matching rule,
-Markdown goes through `glow` and images through `viu` in external mode, so pictures show as real
-pixels on a Kitty-capable terminal (Ghostty, Kitty, WezTerm) and as half-blocks elsewhere;
-everything else is syntax-highlighted source. A failing rule falls back to that built-in rendering with a
+it drew until `q`/Esc, the next click, or a resize (which re-runs it). The plugin itself
+has no built-in tools: the rules file is seeded on first use with three suggested defaults
+(`glow` for Markdown, and in external mode `viu` for images and `meowpdf` for PDFs, which draw
+real pixels on a Kitty-capable terminal); change or delete them freely. Files no rule matches
+show as syntax-highlighted source. A failing rule falls back to that built-in rendering with a
 one-line warning at the top. A search hit clicked at a line always shows the source view, since
 rendered output has no line numbers.
 

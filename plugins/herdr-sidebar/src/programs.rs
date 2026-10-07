@@ -26,8 +26,8 @@ const PREVIEW_PLACEHOLDERS: &[&str] = &["file", "width", "height", "theme", "lin
 /// Placeholders an `[[editor]]` command may use.
 const EDITOR_PLACEHOLDERS: &[&str] = &["file", "line"];
 
-/// Seed written the first time Settings opens the global file. Every example
-/// is commented out, so it parses to zero rules.
+/// Seed written on first load. The plugin itself knows no tool: the three
+/// active rules are suggestions the user can change or delete.
 pub const TEMPLATE: &str = r#"# herdr-sidebar: per-filetype preview and editor programs.
 #
 # A clicked file is matched against these rules in order; the first rule whose
@@ -49,8 +49,7 @@ pub const TEMPLATE: &str = r#"# herdr-sidebar: per-filetype preview and editor p
 # Add `mode = "external"` to give the program the preview pane's real terminal
 # instead: it can then draw Kitty graphics or run interactively. The pane keeps
 # what it drew until q / Esc, the next click, or a resize (which re-runs it).
-# Built-in defaults when no rule matches: Markdown through `glow` (internal),
-# images through `viu` (external, so pixels show on a Kitty-capable terminal).
+# Files no rule matches use the built-in source preview.
 #
 # [[editor]] commands get a real terminal. `e` inside a preview runs the
 # editor IN the preview pane and reloads the document when it exits; the `m`
@@ -59,6 +58,25 @@ pub const TEMPLATE: &str = r#"# herdr-sidebar: per-filetype preview and editor p
 # Placeholders: {file} (appended when absent), {line} (a search hit's line,
 # else 1).
 #
+# The rules below are suggested defaults — the plugin has no opinion about
+# tools. Change or delete them freely.
+
+[[preview]]
+patterns = ["*.md", "*.markdown"]
+command = "glow -s {theme} -w {width} -"
+
+[[preview]]
+patterns = ["*.png", "*.jpg", "*.jpeg", "*.gif", "*.webp", "*.bmp", "*.tif", "*.tiff"]
+mode = "external"
+command = "viu -s -h {height} {file}"
+
+[[preview]]
+patterns = ["*.pdf"]
+mode = "external"
+command = "meowpdf {file}"
+
+# More examples:
+#
 # [[preview]]
 # patterns = ["*.md", "*.markdown"]
 # command = ["dawn -P {file}", "leaf --inline ansi:{width} {file}", "glow -s {theme} -w {width} -"]
@@ -66,11 +84,6 @@ pub const TEMPLATE: &str = r#"# herdr-sidebar: per-filetype preview and editor p
 # [[preview]]
 # patterns = ["*.json", "*.yaml", "*.toml"]
 # command = "bat --color=always --style=plain --terminal-width {width} {file}"
-#
-# [[preview]]
-# patterns = ["*.png", "*.jpg"]
-# mode = "external"
-# command = ["viu -t -s {file}", "chafa -f kitty {file}"]
 #
 # [[editor]]
 # patterns = ["*.md"]
@@ -410,6 +423,8 @@ pub fn project_path(root: &Path) -> PathBuf {
 /// Load the rules for `root`: the project file first (only when
 /// `include_project`), then the global file. Missing files are simply empty.
 pub fn load(root: &Path, include_project: bool) -> Rules {
+    // First run: seed the suggested defaults so previews work out of the box.
+    let _ = ensure_global_file();
     let project = include_project.then(|| project_path(root));
     load_from(project.as_deref(), global_path().as_deref())
 }
@@ -1028,7 +1043,7 @@ mod tests {
     }
 
     #[test]
-    fn ensure_file_seeds_the_template_once_and_it_parses_to_nothing() {
+    fn ensure_file_seeds_the_template_once_and_its_defaults_parse() {
         let dir = tmp("seed");
         let file = dir.join("nested").join(GLOBAL_FILE);
         ensure_file(&file).unwrap();
@@ -1037,8 +1052,21 @@ mod tests {
         ensure_file(&file).unwrap();
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "# edited\n");
         let seeded = parse(TEMPLATE);
-        assert!(seeded.is_empty());
         assert!(seeded.errors.is_empty(), "{:?}", seeded.errors);
+        assert_eq!((seeded.preview_count(), seeded.editor_count()), (3, 0));
+        let root = Path::new("/r");
+        assert!(
+            seeded
+                .preview_for(root, Path::new("/r/a.PDF"))
+                .unwrap()
+                .external
+        );
+        assert!(
+            !seeded
+                .preview_for(root, Path::new("/r/a.md"))
+                .unwrap()
+                .external
+        );
         // The commented examples themselves are valid once uncommented.
         let uncommented: String = TEMPLATE
             .lines()
@@ -1053,7 +1081,7 @@ mod tests {
             .collect();
         let examples = parse(&uncommented);
         assert!(examples.errors.is_empty(), "{:?}", examples.errors);
-        assert_eq!((examples.preview_count(), examples.editor_count()), (3, 1));
+        assert_eq!((examples.preview_count(), examples.editor_count()), (2, 1));
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

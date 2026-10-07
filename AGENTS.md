@@ -200,6 +200,18 @@ executed by Bash on Linux/macOS and mixed or CRLF endings fail before the launch
 
 ### Testing hooks headless (no TUI attached)
 
+- **Never drive the maintainer's live session for verification** (user-rejected: it steals focus,
+  reuses their pinned preview tabs, and pins/relabels tabs under them). Use a separate named
+  session: `herdr --session hs-test` started under a fake sized TTY with inherited `HERDR_*`
+  env cleared (herdr refuses a nested attach) and `NO_COLOR` removed —
+  `env -u NO_COLOR -u HERDR_SOCKET_PATH -u HERDR_PANE_ID -u HERDR_TAB_ID -u HERDR_WORKSPACE_ID
+  -u HERDR_ENV -u HERDR_BIN_PATH nohup script -q /dev/null /bin/zsh -c 'stty rows 50 cols 200;
+  exec herdr --session hs-test' &`. `herdr session list --json` gives its `socket_path`; export
+  it as `HERDR_SOCKET_PATH` and every `herdr tab/pane …` command targets that session. Plugin
+  registration is global, so the linked checkout's hooks dock sidebars there too; the plugin's
+  state dir (`state.json`, `preview-programs.toml`) is also shared, so settings edits made for a
+  test still reach the real session. `herdr session stop hs-test` ends it.
+
 - Bare `herdr server` STARTS a foreground server (it does not print help) and restores the
   persisted session — all workspaces and panes respawn. Handy for exercising plugin hooks
   from a script; test in throwaway workspaces and close them after.
@@ -693,27 +705,28 @@ HACKING.md — budget time for that before promising a patched build.
   exit. `e` on HELD external previewer output (an image) does the same. Only with no editor
   configured anywhere does `e` fall back to the in-pane editor. Keyboard Enter never opens an editor. A line-anchored
   preview (search hit) always uses the built-in SOURCE view — rendered output has no line mapping.
-- **`viewer::render_with` is the one spawn path** for user previewers AND the built-in defaults
-  (`default_renderer_for`: Markdown → `glow -s {theme} -w {width} -`, images → `viu -b -w {width}
-  -s {file}`). argv[0] goes through `resolve_program_here` (absolute PATH entries only, cwd
+- **The plugin names no tool in code.** `programs::load` seeds `preview-programs.toml` from
+  `TEMPLATE` on first load; its three ACTIVE rules (glow for Markdown, external viu for images,
+  external meowpdf for PDFs) are suggestions the user edits. Nothing else picks a program.
+- **`viewer::render_with` is the one spawn path** for previewers. argv[0] goes through `resolve_program_here` (absolute PATH entries only, cwd
   excluded, exec bit, PATHEXT), the child gets `COLUMNS`/`LINES`/`CLICOLOR_FORCE`/`FORCE_COLOR`/
   `COLORTERM=truecolor` with `NO_COLOR` removed and `CREATE_NO_WINDOW` on Windows, the file bytes
   are piped on stdin (writer thread; EPIPE from a `{file}`-reading tool is expected) up to
   `MAX_RENDER_INPUT` (32 MiB), stdout is capped at `MAX_RENDER_BYTES` (4 MiB) and stderr at 16 KiB
   on reader threads, and `RENDER_TIMEOUT` (8 s) kills a stuck child. The old ffmpeg poster path
-  was the template for this (`run_captured`); glow previously had NO timeout or cap. A user
-  renderer's failure prepends a dim `⚠ … — showing built-in preview` line to the fallback; a
-  failed built-in image renderer shows `(image preview needs viu on PATH (cargo install viu))`.
+  was the template for this (`run_captured`); glow previously had NO timeout or cap. A
+  renderer's failure prepends a dim `⚠ … — showing built-in preview` line to the source/binary
+  fallback.
   `Doc.rendered_width` (ex `glow_width`) + `needs_rerender` re-run the renderer at the new body
   width, scroll kept; `LAST_BODY_HEIGHT` joins `LAST_BODY_WIDTH` for `{height}`.
 - **No in-process image decoding and no ffmpeg anymore** (user decision): the `image` crate,
   `MediaPreview`, the `▀` renderer and the video poster path are gone; a video file previews as
-  `(binary file …)`. Images use the EXTERNAL previewer mode below with viu, so they are real
-  Kitty graphics on Ghostty/Kitty/WezTerm (the handshake passes through herdr: a query from a
-  pane was answered `ESC_Gi=31;OK`) and half-blocks elsewhere. `viu` in a PIPE cannot do
-  graphics (no terminal answers its query; it emits the query `ESC_G…a=q…ESC\\` plus a DA1
-  probe `ESC[c` and falls back to blocks — the ANSI parser consumes both whole), which is why
-  the internal `viu -b` route is only the fallback after an external failure.
+  `(binary file …)`. The seeded image rule uses the EXTERNAL previewer mode below with viu, so
+  images are real Kitty graphics on Ghostty/Kitty/WezTerm (the handshake passes through herdr:
+  a query from a pane was answered `ESC_Gi=31;OK`). `viu` in a PIPE cannot do graphics (no
+  terminal answers its query; it emits the query `ESC_G…a=q…ESC\\` plus a DA1 probe `ESC[c`
+  and falls back to blocks — the ANSI parser consumes both whole). viu keeps the aspect ratio
+  with ONE of `-w`/`-h` but stretches with both, hence `-h {height}` in the seeded rule.
 - **External previewers (`mode = "external"`, `viewer::run_external`)** host the program on
   the preview pane's own terminal: the viewer stays in its alternate screen but disables raw
   mode and mouse capture, deletes prior Kitty images (`ESC_Ga=d,d=A`), clears, prints a dim
@@ -726,12 +739,7 @@ HACKING.md — budget time for that before promising a patched build.
   `ExternalExit::Failed`; the loop then runs `start_fallback_load` (the plain request with the
   reason prepended, tagged with the ORIGINAL request so the equality check accepts it) and
   remembers `external_failed` so the same request is not re-hosted until a new request arrives.
-  On every exit path raw mode, mouse capture and `terminal.clear()` are restored. The built-in
-  image default is computed in the viewer (`external_command_for` → `viu_default_command`): viu
-  keeps the aspect ratio with ONE of `-w`/`-h` but stretches with both, so
-  `image_px_dimensions` reads the PNG/GIF/JPEG header (first 64 KiB) and
-  `viu_fit_args` picks the binding axis assuming cells are ~2× taller than wide; unknown
-  formats fit by height. Line-anchored previews never host. Not verified on Windows.
+  On every exit path raw mode, mouse capture and `terminal.clear()` are restored. Line-anchored previews never host. Not verified on Windows.
 - **`ansi::to_lines` contract** (arbitrary renderers hit all of these): SGR style carries ACROSS
   lines until reset; CSI is parsed per ECMA-48 (parameter bytes `0x30–0x3F`, intermediates
   `0x20–0x2F`, one final `0x40–0x7E`) and only a plain `…m` applies, so `ESC[?25l` no longer
@@ -1101,9 +1109,9 @@ It replaced the original pane-ID-keyed park/restore implementation; the optional
 - `glow` receives the actual preview-body width and the configured light/dark color mode. Its
   terminal-formatted output bypasses the generic text wrapper; first-load and resize mismatches
   schedule one background reload at the new width while preserving the reader's scroll offset.
-- Image previews are rendered by `viu -b` through the same previewer pipeline as everything
-  else (see "Per-filetype previewers" above); there is no in-process decoder, no `image` crate,
-  and no video preview. `is_image_file` keeps the extension list that selects the viu default.
+- Image previews come from whatever the user's rules say (the seeded default is external viu,
+  see "Per-filetype previewers" above); there is no in-process decoder, no `image` crate, no
+  video preview, and no extension list in code.
 
 ### Syntax highlighting (file preview)
 

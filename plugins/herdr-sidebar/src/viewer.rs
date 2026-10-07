@@ -935,19 +935,6 @@ const MAX_RENDER_INPUT: u64 = 32 * 1024 * 1024;
 /// A previewer that has not finished by then is killed.
 const RENDER_TIMEOUT: Duration = Duration::from_secs(8);
 
-/// The built-in previewer for `target` when no `[[preview]]` rule matches:
-/// Markdown through glow, images through viu. Both run through the same
-/// spawn path as user rules, so they share its timeout and caps.
-fn default_renderer_for(target: &Path) -> Option<&'static str> {
-    if is_image_file(target) {
-        Some("viu -b -w {width} -s {file}")
-    } else if has_extension(target, &["md", "markdown"]) {
-        Some("glow -s {theme} -w {width} -")
-    } else {
-        None
-    }
-}
-
 /// Run `command` with `input` on stdin, stdout capped at `cap + 1` bytes (so
 /// the caller can tell "exactly cap" from "more"), stderr capped at 16 KiB,
 /// killed after `timeout`. Readers run on threads so
@@ -1085,26 +1072,6 @@ fn render_with(
     Ok(lines)
 }
 
-fn has_extension(target: &Path, extensions: &[&str]) -> bool {
-    target
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| {
-            extensions
-                .iter()
-                .any(|candidate| extension.eq_ignore_ascii_case(candidate))
-        })
-}
-
-fn is_image_file(target: &Path) -> bool {
-    has_extension(
-        target,
-        &[
-            "bmp", "gif", "ico", "jpeg", "jpg", "png", "tif", "tiff", "webp",
-        ],
-    )
-}
-
 fn load_file(target: &Path, target_line: Option<usize>, renderer: Option<&str>) -> Doc {
     let name = target
         .file_name()
@@ -1117,39 +1084,26 @@ fn load_file(target: &Path, target_line: Option<usize>, renderer: Option<&str>) 
         .load(std::sync::atomic::Ordering::Relaxed)
         .max(1);
     let light = crate::ui::is_light();
-    let is_image = is_image_file(target);
     let (lines, numbered, rendered_width) = match std::fs::read(target) {
         Err(e) => (vec![Line::raw(format!("(unreadable: {e})"))], true, None),
         Ok(bytes) => {
-            // Previewers, in order: the user's rule, then the built-in
-            // default for the type. A line-anchored preview (search hit)
-            // keeps the source view — rendered output has no line mapping.
+            // A line-anchored preview (search hit) keeps the source view —
+            // rendered output has no line mapping.
             let mut warning: Option<String> = None;
             let mut rendered: Option<Vec<Line<'static>>> = None;
-            if target_line.is_none() {
-                let candidates = renderer
-                    .map(|command| (command, true))
-                    .into_iter()
-                    .chain(default_renderer_for(target).map(|command| (command, false)));
-                for (command, from_rule) in candidates {
-                    if bytes.len() as u64 > MAX_RENDER_INPUT {
-                        warning = Some(format!(
-                            "file exceeds the {} MiB previewer limit",
-                            MAX_RENDER_INPUT / 1024 / 1024
-                        ));
-                        break;
-                    }
+            if target_line.is_none()
+                && let Some(command) = renderer
+            {
+                if bytes.len() as u64 > MAX_RENDER_INPUT {
+                    warning = Some(format!(
+                        "file exceeds the {} MiB previewer limit",
+                        MAX_RENDER_INPUT / 1024 / 1024
+                    ));
+                } else {
                     match render_with(command, target, &bytes, width, height, light, None) {
-                        Ok(lines) => {
-                            rendered = Some(lines);
-                            break;
-                        }
+                        Ok(lines) => rendered = Some(lines),
                         Err(error) => {
-                            warning = Some(if from_rule {
-                                format!("{error} — showing built-in preview")
-                            } else {
-                                error
-                            });
+                            warning = Some(format!("{error} — showing built-in preview"));
                         }
                     }
                 }
@@ -1161,16 +1115,6 @@ fn load_file(target: &Path, target_line: Option<usize>, renderer: Option<&str>) 
                         lines.insert(0, warn_line(warning));
                     }
                     (lines, false, Some(width))
-                }
-                None if is_image => {
-                    let text = match warning.as_deref() {
-                        Some(error) if error.ends_with("is not on PATH") => {
-                            "image preview needs viu on PATH (cargo install viu)".to_string()
-                        }
-                        Some(error) => error.to_string(),
-                        None => "image preview is not available".to_string(),
-                    };
-                    (vec![Line::raw(format!("({text})"))], false, None)
                 }
                 None if bytes.contains(&0) => (
                     vec![Line::raw(format!("(binary file — {} bytes)", bytes.len()))],
@@ -1244,107 +1188,17 @@ enum ExternalExit {
     Edit,
 }
 
-/// Pixel size from an image file header (PNG, GIF, JPEG), so the built-in
-/// viu command can pick the axis that fits the pane. `None` for anything
-/// else; the caller then fits by height.
-fn image_px_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
-    let be32 = |at: usize| {
-        bytes
-            .get(at..at + 4)
-            .map(|b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
-    };
-    let le16 = |at: usize| {
-        bytes
-            .get(at..at + 2)
-            .map(|b| u16::from_le_bytes([b[0], b[1]]))
-    };
-    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
-        return Some((be32(16)?, be32(20)?));
-    }
-    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
-        return Some((u32::from(le16(6)?), u32::from(le16(8)?)));
-    }
-    if bytes.starts_with(b"\xFF\xD8") {
-        // Walk the segments to the first SOFn marker.
-        let mut i = 2;
-        while i + 9 < bytes.len() {
-            if bytes[i] != 0xFF {
-                i += 1;
-                continue;
-            }
-            let marker = bytes[i + 1];
-            if marker == 0xFF {
-                i += 1;
-                continue;
-            }
-            let is_sof = (0xC0..=0xCF).contains(&marker) && !matches!(marker, 0xC4 | 0xC8 | 0xCC);
-            if is_sof {
-                let h = u16::from_be_bytes([bytes[i + 5], bytes[i + 6]]);
-                let w = u16::from_be_bytes([bytes[i + 7], bytes[i + 8]]);
-                return Some((u32::from(w), u32::from(h)));
-            }
-            let len = usize::from(u16::from_be_bytes([bytes[i + 2], bytes[i + 3]]));
-            i += 2 + len.max(2);
-        }
-        return None;
-    }
-    None
-}
-
-/// The built-in external image command. viu keeps the aspect ratio when
-/// given ONE of `-w`/`-h` (both together stretch), so pick the axis the pane
-/// binds on: terminal cells are about twice as tall as wide.
-fn viu_fit_args(px: Option<(u32, u32)>, cols: u16, rows: u16) -> &'static str {
-    match px {
-        Some((w, h)) if w > 0 && h > 0 => {
-            let rows_at_full_width = (f64::from(h) / f64::from(w) * f64::from(cols) / 2.0).ceil();
-            if rows_at_full_width <= f64::from(rows) {
-                "-w {width}"
-            } else {
-                "-h {height}"
-            }
-        }
-        _ => "-h {height}",
-    }
-}
-
-fn viu_default_command(path: &Path, cols: u16, rows: u16) -> String {
-    let mut head = Vec::new();
-    if let Ok(file) = std::fs::File::open(path) {
-        let _ = file.take(64 * 1024).read_to_end(&mut head);
-    }
-    format!(
-        "viu -s {} {{file}}",
-        viu_fit_args(image_px_dimensions(&head), cols, rows)
-    )
-}
-
-/// The command to host on the pane's terminal for `request`, if any: an
-/// external `[[preview]]` rule, or the built-in viu default for an image
-/// with no rule. Line-anchored previews stay in the viewer.
+/// The command to host on the pane's terminal for `request`: an external
+/// `[[preview]]` rule. Line-anchored previews stay in the viewer.
 fn external_command_for(request: &Request) -> Option<String> {
-    let Request::File {
-        path,
-        line: None,
-        renderer,
-        external,
-        ..
-    } = request
-    else {
-        return None;
-    };
-    match renderer {
-        Some(command) if *external => Some(command.clone()),
-        Some(_) => None,
-        None if is_image_file(path) => {
-            let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
-            Some(viu_default_command(
-                path,
-                cols,
-                rows.saturating_sub(2).max(1),
-            ))
-        }
-        None => None,
+    match request {
+        Request::File {
+            line: None,
+            renderer: Some(command),
+            external: true,
+            ..
+        } => Some(command.clone()),
+        _ => None,
     }
 }
 
@@ -2075,8 +1929,8 @@ pub fn run(control: &Path) -> std::io::Result<()> {
             external_failed = None;
             continue;
         }
-        // An external previewer (mode = "external", or the built-in viu for
-        // images) takes the pane's terminal until the next request.
+        // An external previewer (mode = "external") takes the pane's terminal
+        // until the next request.
         if prompt.is_none()
             && matches!(mode, ViewMode::Preview(_))
             && let Some(request) = current.clone()
@@ -3751,48 +3605,6 @@ mod tests {
         rows.iter()
             .map(|r| r.line.spans.iter().map(|s| s.content.as_ref()).collect())
             .collect()
-    }
-
-    #[test]
-    fn image_headers_yield_pixel_sizes_and_viu_fits_the_binding_axis() {
-        let mut png = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
-        png.extend(1832u32.to_be_bytes());
-        png.extend(955u32.to_be_bytes());
-        assert_eq!(image_px_dimensions(&png), Some((1832, 955)));
-        let mut gif = b"GIF89a".to_vec();
-        gif.extend(320u16.to_le_bytes());
-        gif.extend(200u16.to_le_bytes());
-        assert_eq!(image_px_dimensions(&gif), Some((320, 200)));
-        let mut jpeg = b"\xFF\xD8\xFF\xE0\0\x10JFIF\0\x01\x01\0\0\x01\0\x01\0\0".to_vec();
-        jpeg.extend(b"\xFF\xC0\0\x11\x08");
-        jpeg.extend(480u16.to_be_bytes());
-        jpeg.extend(640u16.to_be_bytes());
-        jpeg.extend([3, 1, 0x22, 0, 2, 0x11, 1, 3, 0x11, 1]);
-        assert_eq!(image_px_dimensions(&jpeg), Some((640, 480)));
-        assert_eq!(image_px_dimensions(b"not an image"), None);
-
-        // 1832×955 in an 80×24 body: full width needs ~21 rows, fits → width.
-        assert_eq!(viu_fit_args(Some((1832, 955)), 80, 24), "-w {width}");
-        // A portrait image binds on height.
-        assert_eq!(viu_fit_args(Some((600, 1200)), 80, 24), "-h {height}");
-        assert_eq!(viu_fit_args(None, 80, 24), "-h {height}");
-    }
-
-    #[test]
-    fn built_in_previewers_follow_the_file_type() {
-        assert!(is_image_file(Path::new("photo.JPEG")));
-        assert!(!is_image_file(Path::new("notes.txt")));
-        assert_eq!(
-            default_renderer_for(Path::new("photo.PNG")),
-            Some("viu -b -w {width} -s {file}")
-        );
-        assert_eq!(
-            default_renderer_for(Path::new("README.md")),
-            Some("glow -s {theme} -w {width} -")
-        );
-        // No video previews: a clip is just a binary file.
-        assert_eq!(default_renderer_for(Path::new("clip.mp4")), None);
-        assert_eq!(default_renderer_for(Path::new("main.rs")), None);
     }
 
     #[test]

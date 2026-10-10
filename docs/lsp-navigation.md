@@ -14,7 +14,9 @@ server), and they must be fast enough that the user does not wait on the first c
 
 - Windows. The design is Unix-only until lspmux's Windows story is checked.
 - Editing features: completion, diagnostics, rename, code actions, formatting.
-- Diff / `git show` documents, binary, non-UTF-8 and over-size documents: no LSP.
+- Diff / `git show` documents, binary, non-UTF-8 and over-size documents (the viewer's
+  existing text caps: `MAX_BYTES` 1 MiB, `MAX_LINES`): no LSP. `didOpen` must send
+  exactly the text on screen, so a truncated document is never opened.
 - Owning processes. We never spawn, supervise or kill lspmux or a language server.
 
 ## Architecture
@@ -35,8 +37,10 @@ tree click ─► sidebar resolves [[lsp]] rule ─► control request (… \t<s
 ```
 
 - **The sidebar resolves, the viewer only runs** (same rule as previewers and
-  editors). The resolved server command rides in the control request as a trailing
-  field; the viewer never reads rule files and the document key stays the path.
+  editors). The resolved server command and the workspace root ride in the control
+  request as fields 7 and 8 (after the positional external flag in field 6); the
+  viewer never reads rule files and the document key stays the path. Navigation
+  requests the viewer writes for itself copy both fields from the origin.
 - **lspmux is the only multiplexing we use.** Every preview tab is its own
   `herdr-sidebar --preview` process; without sharing, every tab would pay a full
   index (rust-analyzer: seconds to a minute and up to gigabytes). The lspmux shim
@@ -49,12 +53,13 @@ tree click ─► sidebar resolves [[lsp]] rule ─► control request (… \t<s
   disconnects, and the language servers are gone five minutes later. The idle lspmux
   daemon costs a few MB and is the user's to manage.
 
-### Policy exception: lspmux is named in code
+### Policy exceptions: lspmux and leaf are named in code
 
-The plugin otherwise names no tool (see AGENTS.md). lspmux is the one exception: the
-shim invocation, the running-check and the install/start advice are lspmux-specific
-by nature, and the user chose it as the architecture. Language servers themselves stay
-in the rules file only.
+The plugin otherwise names no tool (see AGENTS.md). Two exceptions, both user
+decisions: lspmux (the shim invocation, the running-check and the install/start
+advice are lspmux-specific by nature) and leaf for rendering hover Markdown (a fixed
+inline renderer, independent of the user's Markdown previewer rule). Language servers
+themselves stay in the rules file only.
 
 ## Configuration
 
@@ -64,22 +69,27 @@ A third table in `preview-programs.toml` (and `.herdr-sidebar.toml` under the ex
 ```toml
 [[lsp]]
 patterns = ["*.rs"]
+roots = ["Cargo.toml"]
 command = "rust-analyzer"
 
 [[lsp]]
 patterns = ["*.go"]
+roots = ["go.mod"]
 command = "gopls"
 
 [[lsp]]
 patterns = ["*.c", "*.h", "*.cpp", "*.hpp", "*.cc"]
+roots = ["compile_commands.json", ".clangd"]
 command = "clangd --background-index"
 
 [[lsp]]
 patterns = ["*.ts", "*.tsx", "*.js", "*.jsx"]
+roots = ["tsconfig.json", "package.json"]
 command = ["tsgo --lsp --stdio", "typescript-language-server --stdio"]
 
 [[lsp]]
 patterns = ["*.py"]
+roots = ["pyproject.toml", "setup.py"]
 command = ["ty server", "basedpyright-langserver --stdio", "pyright-langserver --stdio"]
 ```
 
@@ -89,16 +99,30 @@ command = ["ty server", "basedpyright-langserver --stdio", "pyright-langserver -
   (Verify during implementation that `lspmux client` forwards trailing arguments to
   the server; its README wrapper example passes `$@`, so it should.)
 - Placeholders: none. Servers take no file argument; the workspace is sent in
-  `initialize`.
-- Workspace root: the file's enclosing git worktree root (`Git::owner_of`, nearest
-  repository), else the Explorer root. The same root must be computed identically in
-  every tab or lspmux will spawn one server per spelling.
+  `initialize`. `roots` is optional; unknown keys are load errors like elsewhere.
+- Workspace root: walk UP from the viewed file's directory; the first ancestor that
+  contains any name in the rule's `roots` is the root. No `roots`, or no ancestor
+  matches: the file's enclosing git worktree root (`Git::owner_of`, nearest
+  repository). Not in a repository: the Explorer root. This is Helix's convention, so
+  a Helix pane on the same crate shares the server if Helix also uses the lspmux shim.
+  Why not the git root: servers only discover their project file in the root they are
+  given (rust-analyzer: `Cargo.toml`, gopls: `go.mod`, …), and this very repository
+  keeps its crate at `plugins/herdr-sidebar` with no root `Cargo.toml`. Two crates in
+  one repository therefore get two server instances, which is correct. The root is part
+  of lspmux's instance key, so the sidebar computes it (it resolves the rule) and passes
+  it in the control request with the command; the viewer sends it as
+  `workspaceFolders[0]` and `rootUri` and sets the shim's cwd to it.
 - The seeded template gains the five rules above as ACTIVE suggestions (the user can
-  edit or delete them, as with the previewer rules). Helix's `languages.toml` is the
-  reference for further entries.
+  edit or delete them, as with the previewer rules). Helix's default `languages.toml`
+  is a reference for writing further entries by hand; the plugin never reads it.
 - Settings gets a row `Code navigation: <status>` where status is one of
-  `lspmux not installed`, `lspmux not running`, `ready` — the same text the first
-  Ctrl+click notice uses.
+  `lspmux not installed`, `lspmux not running`, `lspmux running`. The SIDEBAR process
+  computes it itself when the modal opens (resolve `lspmux` on PATH, then `lspmux
+  status` on a worker thread; the row reads `checking…` until it lands) through the
+  same shared `lsp::preflight` function the viewer uses, so the two can never disagree
+  on wording. "lspmux running" promises nothing per file: whether a given document
+  navigates also needs a matching `[[lsp]]` rule whose server is installed, and those
+  failures are viewer notices at open time.
 
 ### Environment is part of lspmux's instance key — scrub it
 
@@ -113,13 +137,14 @@ no `HERDR_` key.
 
 ## Preflight and user advice
 
-Checked lazily on the first document that has an `[[lsp]]` match, cached for the
-process, re-checked on the 5 s heartbeat only while the last answer was a failure.
+In the viewer: checked lazily on the first document that has an `[[lsp]]` match,
+cached for the process, re-checked on the next navigation gesture (not on a timer)
+while the last answer was a failure. In the sidebar: on Settings open, see above.
 
 | Finding | How detected | Advice shown (viewer notice + Settings row) |
 |---|---|---|
 | lspmux not installed | `resolve_program("lspmux")` is None | `lspmux is not installed — brew install lspmux` on macOS; `cargo install lspmux` elsewhere (Linux distro packages exist, see repology). |
-| lspmux installed, server not running | `lspmux status` exits non-zero (connection refused to its configured socket). Cheap, run once; no polling while idle. | per init system, below |
+| lspmux installed, server not running | `lspmux status` exits non-zero (connection refused to its configured socket). Run once per check; never polled. | per init system, below |
 | Language server not installed | rule has no resolvable candidate | `no language server for *.rs — tried rust-analyzer` (same wording as the previewer fall-through) |
 | Shim connects but server crashes / `initialize` fails | shim exits or `initialize` returns an error | `rust-analyzer failed: <first stderr line>`; retry once on the next click |
 
@@ -135,7 +160,8 @@ Per-init-system start advice:
   If lspmux was installed with cargo instead, point the user at lspmux's example
   `lspmux.plist` (install to `~/Library/LaunchAgents/`, fill in the binary path, then
   `launchctl load -w ~/Library/LaunchAgents/org.codeberg.p2502.lspmux.plist`). Detect
-  "installed via brew" by the resolved path starting with the brew prefix.
+  "installed via brew" by the resolved path starting with `$HOMEBREW_PREFIX`, else
+  `/opt/homebrew` or `/usr/local`.
 - **Linux with systemd (user session).** The advice names the unit and the command,
   nothing else: `install lspmux's user service (see its README / lspmux.service), then
   systemctl --user enable --now lspmux`. The plugin never writes a unit file.
@@ -160,25 +186,44 @@ function `lsp::advice(os, init_system, lspmux_path) -> String` with unit tests p
   methods used. No async runtime (the viewer is a synchronous crossterm loop).
 - **Messages used.** `initialize` (capabilities: `positionEncodings: ["utf-8",
   "utf-16"]`, `window.workDoneProgress: true`), `initialized`,
-  `textDocument/didOpen` (full text), `textDocument/didChange` (full sync, only while
-  the in-pane editor has the document open), `textDocument/definition`,
+  `textDocument/didOpen` (full text), `textDocument/didChange` (full sync, only in the
+  fallback in-pane editor; the normal `e` path runs an external editor and is covered
+  by `didClose` + `didOpen` of the reloaded text when it exits), `textDocument/definition`,
   `textDocument/references` (`includeDeclaration: true`), `textDocument/hover`,
-  `textDocument/documentSymbol`, `$/cancelRequest`, `shutdown` + `exit`. Optional when
-  the server advertises them: `declaration`, `typeDefinition`, `implementation`.
+  `textDocument/documentSymbol`, `shutdown` + `exit`. Optional when the server
+  advertises them: `declaration`, `typeDefinition`, `implementation`. The client must
+  also ANSWER two server→client requests, because lspmux forwards them to a connected
+  client and rust-analyzer blocks on the reply: `workspace/configuration` (an array of
+  `null`, one per item) and `window/workDoneProgress/create` (`null`). Every other
+  server request gets a `null` success reply too, as a default. There is no
+  `$/cancelRequest`: lspmux retags request ids per client and forwards the cancel
+  untouched, so the server never matches it; staleness is handled by "apply only if
+  the document still matches".
 - **Position encoding.** Columns in the viewer are Unicode scalar indexes (the editor's
-  convention). Convert to the negotiated encoding at the boundary: utf-8 byte offsets
-  when the server accepted `utf-8` (rust-analyzer, clangd, gopls do), UTF-16 code units
-  otherwise. One function each way, unit-tested on a line with an emoji and CJK.
+  convention). Convert at the boundary to the encoding named by the `initialize` RESULT
+  the viewer receives, not the one it asked for: lspmux initializes a server once with
+  the first client's parameters and replays that result to every later client, so a
+  shared rust-analyzer may be speaking whatever Helix negotiated. A missing
+  `positionEncoding` means UTF-16 (the spec default); `utf-8` means byte offsets. For
+  the same reason `$/progress` is optional: the first client may not have asked for
+  it, and the footer simply shows nothing. One conversion function each way,
+  unit-tested on a line with an emoji and CJK.
 - **Lifecycle.** Spawn and `initialize` when a document with an `[[lsp]]` match
   finishes loading (prewarm — the user reads before clicking). `didOpen` right after.
   On a control request for a different file in the same workspace: `didClose` old,
-  `didOpen` new, same session. Different workspace: `shutdown`/`exit`, new shim. On
-  viewer exit: `shutdown`/`exit` with a 1 s grace, then kill the shim (never the
-  server; that is behind lspmux).
+  `didOpen` new, same session. Navigation targets keep the origin's session and
+  workspace whatever directory they live in (a definition in `~/.cargo/registry` is
+  just another `didOpen`); only a fresh sidebar click re-resolves rules and may start
+  a session for another workspace (`shutdown`/`exit`, new shim). On viewer exit:
+  `shutdown`/`exit` with a 1 s grace, then kill the shim (never the server; that is
+  behind lspmux). The shim stays connected for the life of the tab, by decision: an
+  open preview tab is a client like an open editor, and keeping its language server
+  warm is lspmux's job as a background service. There is no idle disconnect.
 - **Threading.** All requests run on the existing load-worker pattern: the UI thread
   sends, polls the channel at `LOAD_POLL` while a request is in flight, and applies a
   result only if the document (and its version) still matches. Request timeout 5 s,
-  then `$/cancelRequest` and a notice. A new navigation request cancels the previous.
+  then a notice. A new navigation request supersedes the previous; a late result for
+  an older request is discarded.
 - **Progress.** `$/progress` begin/report/end from the server (rust-analyzer "Indexing",
   gopls "Loading packages") is shown in the viewer footer as `indexing… 43%`. A click
   during indexing is queued (one slot) and fires on `end`, instead of returning an
@@ -194,8 +239,8 @@ Cmd is not encoded in SGR mouse reports), so:
 | Ctrl+left click on a symbol | Go to definition. One result: jump. Several: picker overlay. None: notice `no definition`. |
 | Ctrl+right click | Menu at the pointer: Go to Definition, Go to Type Definition / Implementation (capability-gated), Find References, Hover, Document Symbols, Back. Acts on the position under the pointer. |
 | `m` (existing keyboard menu key) | Same menu, acting on the last clicked position (the selection anchor). |
-| `Alt+Left` / `[` | Back: pop the stack (request + scroll). `]` forward. |
-| Hover | Floating box at the pointer with the server's Markdown rendered through the existing ANSI/plain path, dismissed by any key or click. |
+| `Ctrl+-` | Back: pop the history (request + scroll). `Ctrl+Alt+-` forward. |
+| Pointer dwell (~500 ms on one cell) or the menu's Hover | `textDocument/hover` for that position; the result is shown in a floating box at the pointer (see **Hover** below), dismissed by motion off the cell, any key, click or scroll, and by a timer since terminals send no "pointer left the pane" event. |
 
 - **Cell → text position.** Rows are tagged with their source line (`Row` in
   `viewer.rs`); the editor already maps a cell to a Unicode column through the gutter,
@@ -211,6 +256,27 @@ Cmd is not encoded in SGR mouse reports), so:
   the source view.) Pinned/ephemeral status of the tab is untouched: navigation is the
   same document family, so the tab keeps its label suffix; the label updates to the new
   file name as it does for any request.
+- **History.** Every document change pushes the document being left (request + scroll)
+  onto the back history: a Ctrl+click jump, a picker choice, AND a sidebar click that
+  replaces the ephemeral preview, so Back after a tree click returns to what was being
+  read before it. Forward is cleared by any new push, browser-style. Capped at 50.
+  Keys: `Ctrl+-` back, `Ctrl+Alt+-` forward. In legacy terminal keyboard encoding
+  (herdr panes do not enable the kitty keyboard protocol) `Ctrl+-` arrives as `0x1F`
+  and `Ctrl+Alt+-` as `ESC 0x1F`; crossterm reports them as Ctrl+`7` and Ctrl+Alt+`7`,
+  so the viewer matches on `Char('7')` with CONTROL, with and without ALT. `Ctrl+Shift+-`
+  was rejected because it also encodes as `0x1F`. macOS users need Option to act as Alt
+  (Ghostty: `macos-option-as-alt = true`), which the README states. Verify the chords
+  from a real terminal in `hs-test` first; `pane send-keys` injects synthetic keys and
+  proves nothing about the terminal's encoding.
+- **Hover.** Servers return hover content as Markdown (a fenced signature, then the
+  doc comment). It is rendered with `leaf --inline ansi:{width}`, the Markdown piped on
+  stdin (verified: leaf renders stdin with no file argument), through the existing
+  `render_with` spawn path so it gets the same timeout, output cap and colour env; the
+  ANSI result goes through `ansi::to_lines` into the box. This is a FIXED command, not
+  the user's `[[preview]]` Markdown rule (that rule may be an external viewer or a
+  slow renderer; the tooltip must be instant and inline). With leaf missing, the box
+  shows the Markdown as plain text with fence markers stripped. Box width is min(60,
+  pane width − 4); height is capped at half the pane with the rest cut.
 - **References picker.** Overlay list `path:line  <trimmed line text>`, grouped by
   file, j/k and mouse, Enter jumps, Esc closes. Capped at 500 entries with a `+N more`
   footer. Reuses the Quick Open list rendering.
@@ -238,8 +304,10 @@ Cmd is not encoded in SGR mouse reports), so:
 - A result referencing a file outside the workspace (stdlib, registry source): still
   opened; the sidebar tree does not need to contain it (the viewer loads any readable
   path, as it does today).
-- Documents the in-pane editor has dirtied: `didChange` keeps the server current;
-  navigation results use the in-memory text's line numbers.
+- After the external editor exits, the viewer reloads and re-opens the document
+  (`didClose`/`didOpen`); edits made elsewhere reach the server through its own file
+  watching. The fallback in-pane editor sends `didChange`, and navigation results use
+  the in-memory text's line numbers.
 
 ## Testing
 
@@ -263,17 +331,38 @@ Cmd is not encoded in SGR mouse reports), so:
    methods, env scrubbing.
 4. Viewer: prewarm, progress footer, Ctrl+click definition with back stack.
 5. Ctrl+right-click / `m` menu, references and symbols pickers, hover box.
-6. Docs: README sections, AGENTS.md invariants (env scrubbing, lspmux-only exception,
-   never own a server), this document marked implemented.
+6. Docs: README sections (including: your editor shares the server only if it also
+   goes through the lspmux shim with the same root and arguments; macOS Option must
+   act as Alt for forward), AGENTS.md invariants (env scrubbing, the lspmux and leaf
+   exceptions, never own a server, roots walk), this document marked implemented.
+
+## Resolved from lspmux's source (0.3.x)
+
+- `lspmux client --server-path X args…` forwards trailing arguments to the server
+  (`SERVER_ARGS`), so rules may carry `--background-index` / `--stdio`. Server path,
+  arguments, environment and workspace root form the instance key.
+- Server→client requests are not dropped: `window/workDoneProgress/create` and
+  `client/registerCapability` are broadcast with faked replies (capabilities cached
+  and replayed to late clients); `workspace/configuration` goes to one client, hence
+  the answering requirement above. Server notifications, `$/progress` included, are
+  broadcast to every client after initialization; messages during the server's own
+  `initialize` are discarded.
+- `initialize` runs once per instance with the first client's parameters; the result
+  is replayed to later clients (hence the position-encoding rule above).
+- Workspace root is taken from `workspaceFolders[0]`, then `rootUri`, then the shim's
+  cwd, keyed by device and inode so symlink spellings collapse.
 
 ## Open questions
 
-- Does `lspmux client` forward extra server arguments (`--background-index`,
-  `--stdio`)? If not, rules must be bare server names and args live in a wrapper
-  script, which the doc should say.
-- lspmux drops server→client requests (`workspace/configuration`,
-  `client/registerCapability`, `window/workDoneProgress/create`). rust-analyzer works
-  with it by design; confirm gopls and tsgo tolerate the missing replies, and that
-  `$/progress` notifications (not requests) still pass through.
-- Whether to honour an existing `~/.config/helix/languages.toml` as a second rule
-  source instead of seeding our own list. Deferred: the seeded list is five lines.
+None. Decided: the plugin never reads Helix's (or any editor's) configuration; it
+borrows Helix's conventions (`roots` markers, preference lists) and seeds its own
+rules.
+
+## Verify live in `hs-test` before building
+
+- Ctrl+left click reaches the viewer with the ctrl bit and does not start a drag
+  selection.
+- `Ctrl+-` and `Ctrl+Alt+-` arrive as distinct byte sequences from the real terminal.
+- `lspmux status` exit code with the service stopped.
+- `tsgo --lsp --stdio` and `ty server` are the right invocations for the installed
+  versions.

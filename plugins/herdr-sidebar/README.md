@@ -3,7 +3,7 @@
 **The sidebar your terminal was missing** — a VS Code-inspired file explorer + source
 control panel in one dockable herdr pane.
 
-<img src="docs/media/hero.png" alt="The sidebar docked beside a 2x2 fleet of Claude Code and Codex agents" width="860">
+<img src="../../docs/media/hero.png" alt="The sidebar docked beside a 2x2 fleet of Claude Code and Codex agents" width="860">
 
 **The full tour lives in the [repo README](../../README.md)** — features, screenshots,
 keys, and settings.

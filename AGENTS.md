@@ -1183,7 +1183,7 @@ FileStream refuses pipe paths).
 
 ## README screenshots (how-to)
 
-The framed screenshots in `plugins/herdr-sidebar/docs/media/` are produced with the
+The framed screenshots in `docs/media/` are produced with the
 scripts in `tools/screenshots/` (capture → crop → frame). Full reshoot procedure, verified
 end-to-end twice:
 

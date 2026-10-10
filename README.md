@@ -17,7 +17,7 @@ tabs — ephemeral until you double-click to pin one.
 
 <br><br>
 
-<img src="plugins/herdr-sidebar/docs/media/hero.png" alt="The sidebar docked beside a 2x2 fleet of Claude Code and Codex agents" width="920">
+<img src="docs/media/hero.png" alt="The sidebar docked beside a 2x2 fleet of Claude Code and Codex agents" width="920">
 
 </div>
 
@@ -39,7 +39,7 @@ Use the mouse or press `1`, `2`, and `3`.
 ### Explorer & Preview
 
 <div align="center">
-<img src="plugins/herdr-sidebar/docs/media/preview.png" alt="Explorer and file preview" width="920">
+<img src="docs/media/preview.png" alt="Explorer and file preview" width="920">
 </div>
 
 - Navigate a real expandable tree with file icons, hover actions, Git decorations, and
@@ -66,7 +66,7 @@ working panes back manually. Third-party TUIs are not yet verified with takeover
 ### Source Control
 
 <div align="center">
-<img src="plugins/herdr-sidebar/docs/media/source-control.png" alt="Source Control view" width="920">
+<img src="docs/media/source-control.png" alt="Source Control view" width="920">
 </div>
 
 - Stage, unstage, discard, commit, inspect diffs, and sync with the upstream.
@@ -85,7 +85,7 @@ working panes back manually. Third-party TUIs are not yet verified with takeover
 ## Settings
 
 <div align="center">
-<img src="plugins/herdr-sidebar/docs/media/settings.png" alt="Sidebar settings" width="920">
+<img src="docs/media/settings.png" alt="Sidebar settings" width="920">
 </div>
 
 The current version appears at the top. Official GitHub installations offer **Update & refresh**

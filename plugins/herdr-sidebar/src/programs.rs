@@ -25,6 +25,9 @@ pub const PROJECT_FILE: &str = ".herdr-sidebar.toml";
 const PREVIEW_PLACEHOLDERS: &[&str] = &["file", "width", "height", "theme", "line"];
 /// Placeholders an `[[editor]]` command may use.
 const EDITOR_PLACEHOLDERS: &[&str] = &["file", "line"];
+/// An `[[lsp]]` command is a language server: it takes no file argument
+/// (the workspace is sent in `initialize`), so any placeholder is an error.
+const LSP_PLACEHOLDERS: &[&str] = &[];
 
 /// Seed written on first load. The plugin itself knows no tool: the three
 /// active rules are suggestions the user can change or delete.
@@ -58,6 +61,14 @@ pub const TEMPLATE: &str = r#"# herdr-sidebar: per-filetype preview and editor p
 # Placeholders: {file} (appended when absent), {line} (a search hit's line,
 # else 1).
 #
+# [[lsp]] commands are language servers for code navigation in the preview
+# (Ctrl+click a symbol for its definition, Ctrl+right-click or `m` for
+# references, hover and symbols). They need the `lspmux` service running
+# (Settings → Code navigation shows its state). No placeholders: the server
+# gets its workspace in `initialize`. `roots` lists the project-file names
+# that mark a workspace root, searched upward from the viewed file; without
+# a match the file's git worktree root is used, else the sidebar's root.
+#
 # The rules below are suggested defaults — the plugin has no opinion about
 # tools. Change or delete them freely.
 
@@ -74,6 +85,31 @@ command = "viu -s -h {height} {file}"
 patterns = ["*.pdf"]
 mode = "external"
 command = ["pdfterm {file}", "tdf {file}"]
+
+[[lsp]]
+patterns = ["*.rs"]
+roots = ["Cargo.toml"]
+command = "rust-analyzer"
+
+[[lsp]]
+patterns = ["*.go"]
+roots = ["go.mod"]
+command = "gopls"
+
+[[lsp]]
+patterns = ["*.c", "*.h", "*.cpp", "*.hpp", "*.cc"]
+roots = ["compile_commands.json", ".clangd"]
+command = "clangd --background-index"
+
+[[lsp]]
+patterns = ["*.ts", "*.tsx", "*.js", "*.jsx"]
+roots = ["tsconfig.json", "package.json"]
+command = ["tsgo --lsp --stdio", "typescript-language-server --stdio"]
+
+[[lsp]]
+patterns = ["*.py"]
+roots = ["pyproject.toml", "setup.py"]
+command = ["ty server", "basedpyright-langserver --stdio", "pyright-langserver --stdio"]
 
 # More examples:
 #
@@ -95,6 +131,7 @@ command = ["pdfterm {file}", "tdf {file}"]
 pub enum Kind {
     Preview,
     Editor,
+    Lsp,
 }
 
 impl Kind {
@@ -102,6 +139,7 @@ impl Kind {
         match self {
             Kind::Preview => "preview",
             Kind::Editor => "editor",
+            Kind::Lsp => "lsp",
         }
     }
 
@@ -109,6 +147,7 @@ impl Kind {
         match self {
             Kind::Preview => PREVIEW_PLACEHOLDERS,
             Kind::Editor => EDITOR_PLACEHOLDERS,
+            Kind::Lsp => LSP_PLACEHOLDERS,
         }
     }
 }
@@ -123,6 +162,9 @@ pub struct Rule {
     /// preview pane's real terminal (Kitty graphics, interactive tools)
     /// instead of rendering to stdout for the viewer.
     pub external: bool,
+    /// `[[lsp]]` only: file names that mark a workspace root
+    /// (`Cargo.toml`, `go.mod`, …); see [`workspace_root`].
+    pub roots: Vec<String>,
 }
 
 /// The candidate that exists on this machine, chosen at use time.
@@ -132,6 +174,7 @@ pub struct Resolved {
     /// Program basename for labels ("Edit with nvim").
     pub name: String,
     pub external: bool,
+    pub roots: Vec<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -139,6 +182,7 @@ pub struct Resolved {
 struct RuleFile {
     preview: Vec<RawRule>,
     editor: Vec<RawRule>,
+    lsp: Vec<RawRule>,
     /// The phase-0 table name. Kept only to tell the user to rename it.
     rule: Vec<toml::Value>,
 }
@@ -150,6 +194,7 @@ struct RawRule {
     pattern: Option<String>,
     command: OneOrMany,
     mode: Option<String>,
+    roots: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -186,6 +231,17 @@ struct Compiled {
 struct Layer {
     previews: Vec<Compiled>,
     editors: Vec<Compiled>,
+    lsps: Vec<Compiled>,
+}
+
+impl Layer {
+    fn of(&self, kind: Kind) -> &[Compiled] {
+        match kind {
+            Kind::Preview => &self.previews,
+            Kind::Editor => &self.editors,
+            Kind::Lsp => &self.lsps,
+        }
+    }
 }
 
 /// The compiled rule set (project layer first, then global) plus every
@@ -208,6 +264,16 @@ impl Rules {
         self.find(Kind::Editor, root, file)
     }
 
+    /// First `[[lsp]]` rule, in precedence order, matching `file`.
+    pub fn lsp_for(&self, root: &Path, file: &Path) -> Option<&Rule> {
+        self.find(Kind::Lsp, root, file)
+    }
+
+    /// First rule of `kind`, in precedence order, matching `file`.
+    pub fn rule_for(&self, kind: Kind, root: &Path, file: &Path) -> Option<&Rule> {
+        self.find(kind, root, file)
+    }
+
     fn find(&self, kind: Kind, root: &Path, file: &Path) -> Option<&Rule> {
         let name = file.file_name()?.to_string_lossy();
         let rel = file
@@ -216,10 +282,7 @@ impl Rules {
             .map(|p| p.to_string_lossy().replace('\\', "/"));
         self.layers
             .iter()
-            .flat_map(|layer| match kind {
-                Kind::Preview => layer.previews.iter(),
-                Kind::Editor => layer.editors.iter(),
-            })
+            .flat_map(|layer| layer.of(kind).iter())
             .find(|compiled| {
                 compiled.names.is_match(&*name)
                     || rel.as_deref().is_some_and(|r| compiled.paths.is_match(r))
@@ -227,23 +290,31 @@ impl Rules {
             .map(|compiled| &compiled.rule)
     }
 
+    fn count(&self, kind: Kind) -> usize {
+        self.layers.iter().map(|layer| layer.of(kind).len()).sum()
+    }
+
     pub fn preview_count(&self) -> usize {
-        self.layers.iter().map(|layer| layer.previews.len()).sum()
+        self.count(Kind::Preview)
     }
 
     pub fn editor_count(&self) -> usize {
-        self.layers.iter().map(|layer| layer.editors.len()).sum()
+        self.count(Kind::Editor)
+    }
+
+    pub fn lsp_count(&self) -> usize {
+        self.count(Kind::Lsp)
     }
 
     pub fn len(&self) -> usize {
-        self.preview_count() + self.editor_count()
+        self.preview_count() + self.editor_count() + self.lsp_count()
     }
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
-    /// Settings-row value: `error`, `none`, or `2 previews · 1 editor`.
+    /// Settings-row value: `error`, `none`, or `2 previews · 1 editor · 5 lsp`.
     pub fn summary(&self) -> String {
         if self.first_error().is_some() {
             return "error".into();
@@ -252,11 +323,22 @@ impl Rules {
             1 => format!("1 {word}"),
             n => format!("{n} {word}s"),
         };
-        match (self.preview_count(), self.editor_count()) {
-            (0, 0) => "none".into(),
-            (p, 0) => plural(p, "preview"),
-            (0, e) => plural(e, "editor"),
-            (p, e) => format!("{} · {}", plural(p, "preview"), plural(e, "editor")),
+        let parts: Vec<String> = [
+            (
+                self.preview_count(),
+                plural(self.preview_count(), "preview"),
+            ),
+            (self.editor_count(), plural(self.editor_count(), "editor")),
+            (self.lsp_count(), format!("{} lsp", self.lsp_count())),
+        ]
+        .into_iter()
+        .filter(|(n, _)| *n > 0)
+        .map(|(_, text)| text)
+        .collect();
+        if parts.is_empty() {
+            "none".into()
+        } else {
+            parts.join(" · ")
         }
     }
 
@@ -296,11 +378,38 @@ impl Rule {
                     command: candidate.clone(),
                     name: display_name(candidate),
                     external: self.external,
+                    roots: self.roots.clone(),
                 });
             }
         }
         Err(tried)
     }
+}
+
+/// The workspace a language server should index for `file`: the nearest
+/// ancestor directory holding one of the rule's `roots` markers (a server
+/// only finds its project file in the root it is given — this repository
+/// keeps its crate under `plugins/herdr-sidebar` with no root `Cargo.toml`);
+/// without a match, the enclosing git worktree (`repo_root`); outside any
+/// repository, the sidebar's `explorer_root`.
+pub fn workspace_root(
+    file: &Path,
+    roots: &[String],
+    repo_root: Option<&Path>,
+    explorer_root: &Path,
+) -> PathBuf {
+    if !roots.is_empty() {
+        let mut dir = file.parent();
+        while let Some(candidate) = dir {
+            if roots.iter().any(|marker| candidate.join(marker).exists()) {
+                return candidate.to_path_buf();
+            }
+            dir = candidate.parent();
+        }
+    }
+    repo_root
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| explorer_root.to_path_buf())
 }
 
 /// Where `program` (argv[0] of a command) lives: checked directly when it
@@ -469,6 +578,7 @@ fn parse_layer(text: &str, label: &str, errors: &mut Vec<String>) -> Layer {
     Layer {
         previews: compile_all(file.preview, Kind::Preview, errors),
         editors: compile_all(file.editor, Kind::Editor, errors),
+        lsps: compile_all(file.lsp, Kind::Lsp, errors),
     }
 }
 
@@ -514,13 +624,25 @@ fn compile(
             ));
             return None;
         }
-        (Kind::Editor, Some(_)) => {
+        (Kind::Editor | Kind::Lsp, Some(_)) => {
             errors.push(format!(
                 "{label} {table} {index}: `mode` applies to [[preview]] rules only"
             ));
             return None;
         }
     };
+    if kind != Kind::Lsp && !raw.roots.is_empty() {
+        errors.push(format!(
+            "{label} {table} {index}: `roots` applies to [[lsp]] rules only"
+        ));
+        return None;
+    }
+    let roots: Vec<String> = raw
+        .roots
+        .into_iter()
+        .map(|marker| marker.trim().to_string())
+        .filter(|marker| !marker.is_empty())
+        .collect();
     let mut patterns = raw.patterns;
     patterns.extend(raw.pattern);
     patterns.retain(|pattern| !pattern.trim().is_empty());
@@ -582,6 +704,7 @@ fn compile(
             patterns,
             candidates,
             external,
+            roots,
         },
         names,
         paths,
@@ -1022,6 +1145,119 @@ mod tests {
     }
 
     #[test]
+    fn lsp_rules_parse_with_roots_and_reject_placeholders_and_mode() {
+        let rules = parse(
+            r#"
+            [[preview]]
+            patterns = ["*.md"]
+            command = "glow"
+
+            [[lsp]]
+            patterns = ["*.rs"]
+            roots = ["Cargo.toml", " ", "rust-project.json"]
+            command = ["rust-analyzer", "ra-multiplex client"]
+
+            [[lsp]]
+            patterns = ["*.go"]
+            command = "gopls {file}"
+
+            [[lsp]]
+            patterns = ["*.py"]
+            mode = "external"
+            command = "ty server"
+
+            [[preview]]
+            patterns = ["*.c"]
+            roots = ["Makefile"]
+            command = "bat"
+            "#,
+        );
+        let root = Path::new(ROOT);
+        let rust = rules.lsp_for(root, Path::new("/r/src/lib.rs")).unwrap();
+        assert_eq!(rust.roots, vec!["Cargo.toml", "rust-project.json"]);
+        assert_eq!(rust.candidates.len(), 2);
+        assert!(
+            rules
+                .preview_for(root, Path::new("/r/src/lib.rs"))
+                .is_none()
+        );
+        assert!(rules.lsp_for(root, Path::new("/r/a.go")).is_none());
+        assert!(rules.lsp_for(root, Path::new("/r/a.py")).is_none());
+        assert!(rules.preview_for(root, Path::new("/r/a.c")).is_none());
+        assert_eq!((rules.preview_count(), rules.lsp_count()), (1, 1));
+        assert_eq!(rules.summary(), "error");
+        let has = |needle: &str| rules.errors.iter().any(|e| e.contains(needle));
+        assert_eq!(rules.errors.len(), 4, "{:?}", rules.errors);
+        assert!(has("lsp 2: unknown placeholder {file}"));
+        assert!(has("lsp 2: no usable command"));
+        assert!(has("lsp 3: `mode` applies to [[preview]]"));
+        assert!(has("preview 2: `roots` applies to [[lsp]]"));
+    }
+
+    #[test]
+    fn lsp_rules_follow_layer_precedence() {
+        let dir = tmp("lsp-precedence");
+        let project = dir.join(PROJECT_FILE);
+        let global = dir.join(GLOBAL_FILE);
+        std::fs::write(
+            &project,
+            "[[lsp]]\npatterns = [\"*.rs\"]\ncommand = \"project-ra\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &global,
+            "[[lsp]]\npatterns = [\"*.rs\"]\ncommand = \"global-ra\"\n",
+        )
+        .unwrap();
+        let both = load_from(Some(&project), Some(&global));
+        assert_eq!(
+            both.lsp_for(&dir, &dir.join("x.rs")).unwrap().candidates,
+            vec!["project-ra"]
+        );
+        assert_eq!(both.summary(), "2 lsp");
+        assert_eq!(
+            load_from(None, Some(&global))
+                .lsp_for(&dir, &dir.join("x.rs"))
+                .unwrap()
+                .candidates,
+            vec!["global-ra"]
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn workspace_root_walks_up_to_a_marker_then_repo_then_explorer() {
+        let dir = tmp("roots");
+        let crate_dir = dir.join("plugins").join("crate");
+        let src = crate_dir.join("src").join("deep");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(crate_dir.join("Cargo.toml"), "").unwrap();
+        let file = src.join("main.rs");
+        std::fs::write(&file, "").unwrap();
+        let explorer = Path::new("/explorer");
+        let repo = Some(dir.as_path());
+        let markers = |m: &[&str]| m.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            workspace_root(&file, &markers(&["Cargo.toml"]), repo, explorer),
+            crate_dir
+        );
+        // A marker list that matches nothing falls back to the repository.
+        assert_eq!(
+            workspace_root(&file, &markers(&["go.mod"]), repo, explorer),
+            dir
+        );
+        assert_eq!(workspace_root(&file, &[], repo, explorer), dir);
+        assert_eq!(workspace_root(&file, &[], None, explorer), explorer);
+        // The marker next to the file itself counts.
+        std::fs::write(src.join("go.mod"), "").unwrap();
+        assert_eq!(
+            workspace_root(&file, &markers(&["go.mod"]), repo, explorer),
+            src
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn find_executable_tries_pathext_only_for_bare_names() {
         let dir = tmp("pathext");
         fake_exe(&dir, "tool.cmd");
@@ -1054,6 +1290,13 @@ mod tests {
         let seeded = parse(TEMPLATE);
         assert!(seeded.errors.is_empty(), "{:?}", seeded.errors);
         assert_eq!((seeded.preview_count(), seeded.editor_count()), (3, 0));
+        assert_eq!(seeded.lsp_count(), 5);
+        assert_eq!(seeded.summary(), "3 previews · 5 lsp");
+        let rust = seeded
+            .lsp_for(Path::new("/r"), Path::new("/r/src/main.rs"))
+            .unwrap();
+        assert_eq!(rust.roots, vec!["Cargo.toml"]);
+        assert_eq!(rust.candidates, vec!["rust-analyzer"]);
         let root = Path::new("/r");
         assert!(
             seeded

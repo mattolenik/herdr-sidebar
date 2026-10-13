@@ -2467,10 +2467,7 @@ impl App {
         if let Some(error) = self.programs.first_error() {
             self.notice = Some(format!("preview programs: {error}"));
         }
-        let rule = match kind {
-            programs::Kind::Preview => self.programs.preview_for(&root, path),
-            programs::Kind::Editor => self.programs.editor_for(&root, path),
-        }?;
+        let rule = self.programs.rule_for(kind, &root, path)?;
         match rule.resolve() {
             Ok(resolved) => Some(resolved),
             Err(tried) => {
@@ -2481,6 +2478,7 @@ impl App {
                 let what = match kind {
                     programs::Kind::Preview => "preview program",
                     programs::Kind::Editor => "editor",
+                    programs::Kind::Lsp => "language server",
                 };
                 self.notice = Some(format!(
                     "no {what} for {name} on PATH (tried {})",

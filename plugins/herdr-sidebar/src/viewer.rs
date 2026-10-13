@@ -27,6 +27,7 @@ use crate::ansi;
 use crate::editor::{EditAction, Editor, SaveOutcome};
 use crate::icons::{IconTheme, icon};
 use crate::ipc;
+use crate::lsp;
 use crate::ui::{icon_style as ui_icon_style, palette};
 
 /// Metadata source/token that marks the viewer pane, so the sidebar can find
@@ -483,12 +484,18 @@ struct Doc {
     /// row index underneath them changed.
     pending_src: Option<usize>,
     selection: PreviewSelection,
+    /// The exact text on screen when this is a navigable source view (not
+    /// truncated, no warning line prepended): what `didOpen` sends and what
+    /// clicked cells map into. `None` turns code navigation off.
+    source: Option<std::sync::Arc<String>>,
 }
 
 /// One rendered row of the body: the source line it came from (so scroll
-/// position survives a relayout) and the styled row itself.
+/// position survives a relayout), the source character its first cell
+/// shows (wrapped continuations start later), and the styled row itself.
 struct Row {
     src: usize,
+    start: usize,
     line: Line<'static>,
 }
 
@@ -571,6 +578,28 @@ impl Doc {
             }
             _ => {}
         }
+    }
+
+    /// The source line and Unicode-scalar column under a cell, for code
+    /// navigation: through the gutter, the wrap offset and tab expansion.
+    /// `None` outside the body, on the gutter, or without a source text.
+    fn source_position_at(&self, body: Rect, column: u16, row: u16) -> Option<(usize, usize)> {
+        let source = self.source.as_ref()?;
+        if column < body.x || column >= body.right() || row < body.y || row >= body.bottom() {
+            return None;
+        }
+        let rendered = self.rows.get(self.scroll + usize::from(row - body.y))?;
+        let x = usize::from(column - body.x).checked_sub(self.gutter())?;
+        let line = source.lines().nth(rendered.src)?;
+        let mut display = 0;
+        for (index, c) in line.chars().enumerate().skip(rendered.start) {
+            let width = crate::wrap::char_width(c, display);
+            if display + width > x {
+                return Some((rendered.src, index));
+            }
+            display += width;
+        }
+        Some((rendered.src, line.chars().count()))
     }
 
     fn text_position_at(&self, body: Rect, column: u16, row: u16) -> Option<RenderPos> {
@@ -712,13 +741,13 @@ fn build_rows(lines: &[Line<'static>], numbered: bool, wrap: bool, width: u16) -
     for (src, line) in lines.iter().enumerate() {
         let contains_tab = line.spans.iter().any(|span| span.content.contains('\t'));
         let pieces = if content > 0 && contains_tab {
-            crate::wrap::wrap_line(line, if wrap { content } else { usize::MAX })
+            crate::wrap::wrap_line_with_starts(line, if wrap { content } else { usize::MAX })
         } else if wrap && content > 0 && line.width() > content {
-            crate::wrap::wrap_line(line, content)
+            crate::wrap::wrap_line_with_starts(line, content)
         } else {
-            vec![line.clone()]
+            vec![(0, line.clone())]
         };
-        for (i, piece) in pieces.into_iter().enumerate() {
+        for (i, (start, piece)) in pieces.into_iter().enumerate() {
             let mut row = piece;
             if numbered {
                 // The number sits on the first row only; continuations
@@ -742,7 +771,11 @@ fn build_rows(lines: &[Line<'static>], numbered: bool, wrap: bool, width: u16) -
                     row.spans.push(Span::raw(" ".repeat(pad)));
                 }
             }
-            rows.push(Row { src, line: row });
+            rows.push(Row {
+                src,
+                start,
+                line: row,
+            });
         }
     }
     rows
@@ -762,6 +795,7 @@ fn load(request: &Request) -> Doc {
             rows_key: None,
             pending_src: None,
             selection: PreviewSelection::default(),
+            source: None,
         },
         Request::File {
             path,
@@ -805,6 +839,7 @@ fn loading_doc(request: &Request) -> Doc {
         rows_key: None,
         pending_src: None,
         selection: PreviewSelection::default(),
+        source: None,
     }
 }
 
@@ -955,6 +990,7 @@ fn load_show(root: &Path, spec: &str, path: Option<&str>) -> Doc {
         rows_key: None,
         pending_src: None,
         selection: PreviewSelection::default(),
+        source: None,
     }
 }
 
@@ -1117,6 +1153,7 @@ fn load_file(target: &Path, target_line: Option<usize>, renderer: Option<&str>) 
         .load(std::sync::atomic::Ordering::Relaxed)
         .max(1);
     let light = crate::ui::is_light();
+    let mut source: Option<std::sync::Arc<String>> = None;
     let (lines, numbered, rendered_width) = match std::fs::read(target) {
         Err(e) => (vec![Line::raw(format!("(unreadable: {e})"))], true, None),
         Ok(bytes) => {
@@ -1173,6 +1210,11 @@ fn load_file(target: &Path, target_line: Option<usize>, renderer: Option<&str>) 
                     if let Some(warning) = &warning {
                         lines.insert(0, warn_line(warning));
                     }
+                    // Code navigation needs the screen to BE the file: a
+                    // truncated or warning-prefixed view would misplace
+                    // every line the server reports.
+                    let exact = !truncated && warning.is_none() && lines.len() <= MAX_LINES;
+                    source = exact.then(|| std::sync::Arc::new(text.into_owned()));
                     (lines, true, None)
                 }
             }
@@ -1191,6 +1233,7 @@ fn load_file(target: &Path, target_line: Option<usize>, renderer: Option<&str>) 
         rows_key: None,
         pending_src: target_line.map(|line| line.saturating_sub(1)),
         selection: PreviewSelection::default(),
+        source,
     }
 }
 
@@ -1552,6 +1595,7 @@ fn load_diff(root: &Path, rel: &str, kind: &str) -> Doc {
         rows_key: None,
         pending_src: None,
         selection: PreviewSelection::default(),
+        source: None,
     }
 }
 
@@ -1864,6 +1908,450 @@ fn heartbeat_due(last: u64, now: u64) -> bool {
     now < last || now - last >= 5
 }
 
+/// Polling interval while a language-server handshake or request is in
+/// flight: prompt enough for a warm server, cheap enough for a cold one.
+const NAV_POLL: Duration = Duration::from_millis(50);
+/// A navigation request unanswered for this long is dropped with a notice.
+const NAV_TIMEOUT: Duration = Duration::from_secs(5);
+/// `initialize` may take seconds on a cold server; the worker waits this long.
+const INIT_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// What a navigation gesture asks the server.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)] // the menu (next phase) issues the rest
+enum NavKind {
+    Definition,
+    TypeDefinition,
+    Implementation,
+    References,
+    Hover,
+    Symbols,
+}
+
+impl NavKind {
+    fn method(self) -> &'static str {
+        match self {
+            NavKind::Definition => "definition",
+            NavKind::TypeDefinition => "typeDefinition",
+            NavKind::Implementation => "implementation",
+            NavKind::References => "references",
+            NavKind::Hover => "hover",
+            NavKind::Symbols => "documentSymbol",
+        }
+    }
+}
+
+/// Why a handshake did not produce a client.
+enum ConnectError {
+    /// lspmux is missing or not running: the advice to show.
+    Preflight(String),
+    Failed(String),
+}
+
+struct Inflight {
+    kind: NavKind,
+    /// The document the gesture was made on; a reply is applied only while
+    /// it is still showing.
+    doc: Request,
+    started: Instant,
+    receiver: std::sync::mpsc::Receiver<Result<serde_json::Value, String>>,
+}
+
+/// Something the event loop must act on after [`Nav::collect`].
+enum NavEvent {
+    Notice(String),
+    /// A reply for `kind` on the document it was asked about.
+    Reply(NavKind, serde_json::Value),
+}
+
+/// Code-navigation state for the pane: one language-server session (through
+/// the lspmux shim), the handshake worker, the request in flight and the
+/// back/forward history. See docs/lsp-navigation.md.
+#[derive(Default)]
+struct Nav {
+    session: Option<(LspSpec, lsp::Client)>,
+    connecting: Option<(
+        LspSpec,
+        std::sync::mpsc::Receiver<Result<lsp::Client, ConnectError>>,
+    )>,
+    /// Advice from the last failed preflight. Re-checked on the next
+    /// gesture, never on a timer or a document load.
+    preflight_failed: Option<String>,
+    /// The document the server has open.
+    open: Option<PathBuf>,
+    version: i32,
+    history: lsp::History<(Request, usize)>,
+    inflight: Option<Inflight>,
+    /// One gesture parked while the server connects or indexes.
+    queued: Option<(NavKind, usize, usize)>,
+    /// Scroll to restore once the load for a history entry lands.
+    restore_scroll: Option<(Request, usize)>,
+}
+
+fn server_name(spec: &LspSpec) -> String {
+    crate::programs::display_name(&spec.command)
+}
+
+fn nav_spec(request: &Request) -> Option<&LspSpec> {
+    match request {
+        Request::File { lsp, .. } => lsp.as_ref(),
+        _ => None,
+    }
+}
+
+impl Nav {
+    /// Whether the loop should poll quickly for a worker.
+    fn busy(&self) -> bool {
+        self.connecting.is_some() || self.inflight.is_some()
+    }
+
+    /// Footer status while the server reports progress.
+    fn status(&self) -> Option<String> {
+        let (_, client) = self.session.as_ref()?;
+        let progress = client.progress()?;
+        Some(match progress.percentage {
+            Some(pct) => format!("{}… {pct}%", progress.title.to_lowercase()),
+            None => format!("{}…", progress.title.to_lowercase()),
+        })
+    }
+
+    /// A document finished loading: open it on the server (prewarming the
+    /// connection when there is none), or close the previous one when this
+    /// document is not navigable.
+    fn on_loaded(&mut self, request: &Request, doc: &Doc) {
+        self.drop_dead();
+        if let Some(path) = self.open.take()
+            && let Some((_, client)) = &mut self.session
+        {
+            client.did_close(&path);
+        }
+        self.queued = None;
+        let Some(spec) = nav_spec(request) else {
+            return;
+        };
+        if doc.source.is_none() {
+            return;
+        }
+        if self
+            .session
+            .as_ref()
+            .is_some_and(|(active, _)| active != spec)
+            && let Some((_, client)) = self.session.take()
+        {
+            std::thread::spawn(move || client.shutdown());
+        }
+        if self
+            .connecting
+            .as_ref()
+            .is_some_and(|(pending, _)| pending != spec)
+        {
+            self.connecting = None;
+        }
+        match &self.session {
+            Some(_) => self.open_current(request, doc),
+            None if self.connecting.is_none() && self.preflight_failed.is_none() => {
+                self.start_connect(spec.clone());
+            }
+            None => {}
+        }
+    }
+
+    fn open_current(&mut self, request: &Request, doc: &Doc) {
+        let (Request::File { path, .. }, Some(source), Some((_, client))) =
+            (request, &doc.source, &mut self.session)
+        else {
+            return;
+        };
+        self.version += 1;
+        client.did_open(path, source, self.version);
+        self.open = Some(path.clone());
+    }
+
+    fn drop_dead(&mut self) {
+        if self
+            .session
+            .as_ref()
+            .is_some_and(|(_, client)| client.is_dead())
+        {
+            self.session = None;
+            self.open = None;
+        }
+    }
+
+    /// Preflight, spawn the shim and run `initialize` on a worker.
+    fn start_connect(&mut self, spec: LspSpec) {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker_spec = spec.clone();
+        std::thread::spawn(move || {
+            let state = lsp::preflight();
+            let outcome = match lsp::advice_here(state) {
+                Some(advice) => Err(ConnectError::Preflight(advice)),
+                None => lsp::Transport::spawn(&worker_spec)
+                    .map_err(|e| ConnectError::Failed(e.to_string()))
+                    .and_then(|transport| {
+                        let mut client = lsp::Client::new(transport);
+                        client
+                            .initialize(&worker_spec.root, INIT_TIMEOUT)
+                            .map(|()| client)
+                            .map_err(ConnectError::Failed)
+                    }),
+            };
+            let _ = sender.send(outcome);
+        });
+        self.connecting = Some((spec, receiver));
+    }
+
+    /// A navigation gesture at a source position on `request`'s document.
+    /// Sends the request, or parks it while the server connects or indexes.
+    /// Returns the notice to show, if any.
+    fn gesture(
+        &mut self,
+        kind: NavKind,
+        request: &Request,
+        doc: &Doc,
+        line: usize,
+        col: usize,
+    ) -> Option<String> {
+        self.drop_dead();
+        let Some(spec) = nav_spec(request).cloned() else {
+            return Some(format!(
+                "no [[lsp]] rule for {} (Settings → Preview programs…)",
+                doc.name
+            ));
+        };
+        if doc.source.is_none() {
+            return Some("code navigation needs the plain source view".into());
+        }
+        if self.session.is_none() {
+            self.queued = Some((kind, line, col));
+            if self.connecting.is_none() {
+                let advice = self.preflight_failed.take();
+                self.start_connect(spec.clone());
+                return advice;
+            }
+            return Some(format!("connecting to {}…", server_name(&spec)));
+        }
+        if self.open.is_none() {
+            self.open_current(request, doc);
+        }
+        if self.status().is_some() {
+            self.queued = Some((kind, line, col));
+            return Some("waiting for the server to finish indexing…".into());
+        }
+        self.send(kind, request, doc, line, col);
+        None
+    }
+
+    fn send(&mut self, kind: NavKind, request: &Request, doc: &Doc, line: usize, col: usize) {
+        let (Request::File { path, .. }, Some(source), Some((_, client))) =
+            (request, &doc.source, &mut self.session)
+        else {
+            return;
+        };
+        let text = source.lines().nth(line).unwrap_or("");
+        let character = lsp::to_lsp_col(text, col, client.encoding);
+        let receiver = match kind {
+            NavKind::References => client.references(path, line, character),
+            NavKind::Symbols => client.document_symbols(path),
+            other => client.at(other.method(), path, line, character),
+        };
+        self.inflight = Some(Inflight {
+            kind,
+            doc: request.clone(),
+            started: Instant::now(),
+            receiver,
+        });
+    }
+
+    /// Drain the workers: the handshake, the server's own traffic, the
+    /// request in flight. Call once per loop iteration.
+    fn collect(&mut self, current: Option<&Request>, doc: Option<&Doc>) -> Vec<NavEvent> {
+        let mut events = Vec::new();
+        if let Some((spec, receiver)) = &self.connecting {
+            match receiver.try_recv() {
+                Ok(Ok(client)) => {
+                    let spec = spec.clone();
+                    self.connecting = None;
+                    self.session = Some((spec, client));
+                    if let (Some(request), Some(doc)) = (current, doc)
+                        && nav_spec(request) == self.session.as_ref().map(|(s, _)| s)
+                    {
+                        self.open_current(request, doc);
+                    }
+                }
+                Ok(Err(ConnectError::Preflight(advice))) => {
+                    self.connecting = None;
+                    if self.queued.take().is_some() {
+                        events.push(NavEvent::Notice(advice.clone()));
+                    }
+                    self.preflight_failed = Some(advice);
+                }
+                Ok(Err(ConnectError::Failed(error))) => {
+                    let name = server_name(spec);
+                    self.connecting = None;
+                    self.queued = None;
+                    events.push(NavEvent::Notice(format!("{name} failed: {error}")));
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => self.connecting = None,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        if let Some((_, client)) = &mut self.session {
+            client.pump();
+        }
+        let was_dead = self
+            .session
+            .as_ref()
+            .is_some_and(|(_, client)| client.is_dead());
+        if was_dead {
+            self.drop_dead();
+            self.inflight = None;
+            self.queued = None;
+            events.push(NavEvent::Notice("language server connection closed".into()));
+        }
+        if let Some(inflight) = &self.inflight {
+            match inflight.receiver.try_recv() {
+                Ok(outcome) => {
+                    let Inflight { kind, doc, .. } = self.inflight.take().expect("checked");
+                    if current == Some(&doc) {
+                        match outcome {
+                            Ok(value) => events.push(NavEvent::Reply(kind, value)),
+                            Err(error) => events.push(NavEvent::Notice(error)),
+                        }
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => self.inflight = None,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    if inflight.started.elapsed() > NAV_TIMEOUT {
+                        let name = self
+                            .session
+                            .as_ref()
+                            .map(|(spec, _)| server_name(spec))
+                            .unwrap_or_else(|| "the language server".into());
+                        self.inflight = None;
+                        events.push(NavEvent::Notice(format!("{name} did not answer")));
+                    }
+                }
+            }
+        }
+        // A parked gesture fires once the server is connected and idle.
+        if let Some((kind, line, col)) = self.queued
+            && self.session.is_some()
+            && self.status().is_none()
+            && let (Some(request), Some(doc)) = (current, doc)
+        {
+            self.queued = None;
+            if self.open.is_none() {
+                self.open_current(request, doc);
+            }
+            self.send(kind, request, doc, line, col);
+        }
+        events
+    }
+
+    /// Shut the session down (viewer exit).
+    fn finish(&mut self) {
+        if let Some((_, client)) = self.session.take() {
+            client.shutdown();
+        }
+    }
+}
+
+/// Show `target` in this pane: a jump within the current file scrolls and
+/// flashes the line; another file loads through the normal request path with
+/// the origin's language server, so the sidebar's routing stays consistent.
+/// The document being left goes onto the back history.
+#[allow(clippy::too_many_arguments)]
+fn go_to(
+    nav: &mut Nav,
+    target: &lsp::Target,
+    current: &mut Option<Request>,
+    mode: &mut ViewMode,
+    preview_load: &mut Option<(Request, std::sync::mpsc::Receiver<Doc>)>,
+    control: &Path,
+    identity_pending: &mut bool,
+    notice: &mut Option<String>,
+) {
+    let (Some(origin @ Request::File { path, lsp, .. }), ViewMode::Preview(doc)) =
+        (current.as_ref(), &mut *mode)
+    else {
+        return;
+    };
+    let line = target.line + 1;
+    let name = target
+        .path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    nav.history.push((origin.clone(), doc.scroll));
+    if &target.path == path {
+        doc.pending_src = Some(target.line);
+        *notice = Some(format!("{name}:{line}"));
+        return;
+    }
+    let request = Request::File {
+        path: target.path.clone(),
+        line: Some(line),
+        renderer: None,
+        editor: None,
+        external: false,
+        lsp: lsp.clone(),
+    };
+    let _ = write_scratch_file(control, &request_payload(&request));
+    *mode = ViewMode::Preview(loading_doc(&request));
+    *current = Some(request.clone());
+    *preview_load = Some(start_preview_load(request));
+    *identity_pending = true;
+    *notice = Some(format!("{name}:{line}"));
+}
+
+/// Back (`forward == false`) or forward through the navigation history.
+#[allow(clippy::too_many_arguments)]
+fn history_step(
+    nav: &mut Nav,
+    forward: bool,
+    current: &mut Option<Request>,
+    mode: &mut ViewMode,
+    preview_load: &mut Option<(Request, std::sync::mpsc::Receiver<Doc>)>,
+    control: &Path,
+    identity_pending: &mut bool,
+    notice: &mut Option<String>,
+) {
+    let (Some(here), ViewMode::Preview(doc)) = (current.clone(), &mut *mode) else {
+        return;
+    };
+    let now = (here.clone(), doc.scroll);
+    let step = if forward {
+        nav.history.forward(now)
+    } else {
+        nav.history.back(now)
+    };
+    let Some((request, scroll)) = step else {
+        *notice = Some(
+            if forward {
+                "nothing ahead"
+            } else {
+                "nothing to go back to"
+            }
+            .into(),
+        );
+        return;
+    };
+    if request == here {
+        doc.pending_src = None;
+        doc.scroll = scroll;
+        *notice = None;
+        return;
+    }
+    let _ = write_scratch_file(control, &request_payload(&request));
+    *mode = ViewMode::Preview(loading_doc(&request));
+    *current = Some(request.clone());
+    nav.restore_scroll = Some((request.clone(), scroll));
+    *preview_load = Some(start_preview_load(request));
+    *identity_pending = true;
+    *notice = None;
+}
+
 /// The viewer's event loop; returns when the user closes it.
 pub fn run(control: &Path) -> std::io::Result<()> {
     // A control path outside our confined scratch directory would otherwise
@@ -1903,6 +2391,7 @@ pub fn run(control: &Path) -> std::io::Result<()> {
         rows_key: None,
         pending_src: None,
         selection: PreviewSelection::default(),
+        source: None,
     });
     let mut mode = ViewMode::Preview(doc);
     report_identity(
@@ -1934,6 +2423,7 @@ pub fn run(control: &Path) -> std::io::Result<()> {
     let mut identity_pending = false;
     let mut external_failed: Option<Request> = None;
     let mut pending_edit: Option<String> = None;
+    let mut nav = Nav::default();
     let result = loop {
         // `e`: the real editor takes over this pane; the document reloads
         // when it exits. The tab is pinned first so a click elsewhere opens
@@ -2030,10 +2520,57 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                 if doc.rendered_width.is_some() && loaded.rendered_width.is_some() {
                     loaded.scroll = doc.scroll;
                 }
+                if let Some((wanted, scroll)) = nav.restore_scroll.take()
+                    && wanted == request
+                {
+                    loaded.pending_src = None;
+                    loaded.scroll = scroll;
+                }
                 *doc = loaded;
+                nav.on_loaded(&request, doc);
+            }
+        }
+        // Language-server traffic: the handshake, progress, and replies.
+        let events = nav.collect(
+            current.as_ref(),
+            match &mode {
+                ViewMode::Preview(doc) => Some(doc),
+                ViewMode::Edit(_) => None,
+            },
+        );
+        for event in events {
+            match event {
+                NavEvent::Notice(text) => notice = Some(text),
+                NavEvent::Reply(kind, value) => {
+                    let targets = lsp::targets(&value);
+                    match (kind, targets.first()) {
+                        (NavKind::Hover | NavKind::Symbols, _) => {}
+                        (_, None) => notice = Some(format!("no {}", kind.method())),
+                        (_, Some(first)) => {
+                            go_to(
+                                &mut nav,
+                                first,
+                                &mut current,
+                                &mut mode,
+                                &mut preview_load,
+                                control,
+                                &mut identity_pending,
+                                &mut notice,
+                            );
+                            if targets.len() > 1 {
+                                notice = Some(format!(
+                                    "{} (+{} more)",
+                                    notice.as_deref().unwrap_or(""),
+                                    targets.len() - 1
+                                ));
+                            }
+                        }
+                    }
+                }
             }
         }
         let prompt_text = prompt.as_ref().map(Prompt::text);
+        let status = nav.status();
         let draw = terminal.draw(|frame| match &mut mode {
             ViewMode::Preview(doc) => {
                 (page, preview_body) = draw_doc(
@@ -2041,7 +2578,7 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                     doc,
                     theme,
                     matches!(current, Some(Request::File { .. })),
-                    notice.as_deref(),
+                    notice.as_deref().or(status.as_deref()),
                 );
             }
             ViewMode::Edit(editor) => {
@@ -2071,6 +2608,8 @@ pub fn run(control: &Path) -> std::io::Result<()> {
         let mut should_close = false;
         let poll = if preview_load.is_some() {
             LOAD_POLL
+        } else if nav.busy() {
+            NAV_POLL
         } else {
             POLL
         };
@@ -2265,6 +2804,23 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                                         doc.pending_src = Some(doc.top_src());
                                         doc.wrap = !doc.wrap;
                                     }
+                                    // Ctrl+- arrives as 0x1F, which crossterm
+                                    // reports as Ctrl+7; with Alt (ESC 0x1F)
+                                    // it is forward.
+                                    KeyCode::Char('7')
+                                        if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                                    {
+                                        history_step(
+                                            &mut nav,
+                                            key.modifiers.contains(KeyModifiers::ALT),
+                                            &mut current,
+                                            &mut mode,
+                                            &mut preview_load,
+                                            control,
+                                            &mut identity_pending,
+                                            &mut notice,
+                                        );
+                                    }
                                     _ => {}
                                 }
                             }
@@ -2325,6 +2881,25 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                             {
                                 should_close = close_own_pane(control, &current, &mut notice);
                             }
+                            // Ctrl+click: go to definition. The click never
+                            // starts a selection.
+                            MouseEventKind::Down(MouseButton::Left)
+                                if mouse.modifiers.contains(KeyModifiers::CONTROL) =>
+                            {
+                                if let Some(request) = current.as_ref()
+                                    && let Some((line, col)) = doc.source_position_at(
+                                        preview_body,
+                                        mouse.column,
+                                        mouse.row,
+                                    )
+                                {
+                                    notice =
+                                        nav.gesture(NavKind::Definition, request, doc, line, col);
+                                }
+                            }
+                            MouseEventKind::Drag(MouseButton::Left)
+                            | MouseEventKind::Up(MouseButton::Left)
+                                if mouse.modifiers.contains(KeyModifiers::CONTROL) => {}
                             _ => doc.on_mouse(&mouse, preview_body),
                         }
                     }
@@ -2387,6 +2962,13 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                         break Ok(());
                     }
                 } else {
+                    // A sidebar click is history too: Back returns to what
+                    // was being read before it.
+                    if let (Some(previous), ViewMode::Preview(doc)) = (current.as_ref(), &mode)
+                        && previous != &Request::Close
+                    {
+                        nav.history.push((previous.clone(), doc.scroll));
+                    }
                     mode = ViewMode::Preview(loading_doc(&request));
                     current = Some(request.clone());
                     preview_load = Some(start_preview_load(request));
@@ -2436,6 +3018,7 @@ pub fn run(control: &Path) -> std::io::Result<()> {
             last_diff_refresh = Instant::now();
         }
     };
+    nav.finish();
     let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
     ratatui::restore();
     result
@@ -3632,6 +4215,7 @@ mod tests {
             rows_key: None,
             pending_src: None,
             selection: PreviewSelection::default(),
+            source: None,
         }
     }
 
@@ -3783,6 +4367,71 @@ mod tests {
         assert_eq!(doc.selection.cursor, selection.cursor);
         assert_eq!(doc.rows_key, rows_key);
         assert_eq!(doc.scroll, 1);
+    }
+
+    #[test]
+    fn source_position_maps_cells_through_gutter_wrap_and_tabs() {
+        // 12 lines → a 3-cell gutter ("nn ").
+        let mut text = String::new();
+        for i in 0..11 {
+            text.push_str(&format!("line{i}\n"));
+        }
+        text.push_str("\tfn 中文 is_wide(a_long_identifier_name) {}\n");
+        let lines: Vec<Line<'static>> = text.lines().map(|l| Line::raw(l.to_string())).collect();
+        let mut doc = Doc {
+            name: "x.rs".into(),
+            context: String::new(),
+            lines,
+            numbered: true,
+            scroll: 0,
+            wrap: true,
+            rendered_width: None,
+            rows: Vec::new(),
+            rows_key: None,
+            pending_src: None,
+            selection: PreviewSelection::default(),
+            source: Some(std::sync::Arc::new(text.clone())),
+        };
+        let body = Rect::new(2, 1, 24, 40); // 21 content cells after the gutter
+        doc.relayout(body.width, body.height);
+        assert_eq!(doc.gutter(), 3);
+        let last_rows: Vec<&Row> = doc.rows.iter().filter(|r| r.src == 11).collect();
+        assert!(last_rows.len() >= 2, "the long line wraps");
+        assert_eq!(last_rows[0].start, 0);
+        assert!(last_rows[1].start > 0);
+        // Row 11 (0-based) is the first row of the long line: y = body.y + 11.
+        let y = body.y + 11;
+        // Gutter cells map to nothing.
+        assert_eq!(doc.source_position_at(body, body.x + 1, y), None);
+        // The tab occupies display 0..4: any of those cells is column 0.
+        assert_eq!(doc.source_position_at(body, body.x + 3, y), Some((11, 0)));
+        assert_eq!(doc.source_position_at(body, body.x + 6, y), Some((11, 0)));
+        // "f" of fn is at display 4 → column 1; "n" → column 2.
+        assert_eq!(doc.source_position_at(body, body.x + 7, y), Some((11, 1)));
+        assert_eq!(doc.source_position_at(body, body.x + 8, y), Some((11, 2)));
+        // 中 is 2 cells wide at display 7..9 (col 4), 文 at 9..11 (col 5).
+        assert_eq!(doc.source_position_at(body, body.x + 10, y), Some((11, 4)));
+        assert_eq!(doc.source_position_at(body, body.x + 11, y), Some((11, 4)));
+        assert_eq!(doc.source_position_at(body, body.x + 12, y), Some((11, 5)));
+        // The continuation row starts at its wrap offset.
+        let start = last_rows[1].start;
+        assert_eq!(
+            doc.source_position_at(body, body.x + 3, y + 1),
+            Some((11, start))
+        );
+        assert_eq!(
+            doc.source_position_at(body, body.x + 4, y + 1),
+            Some((11, start + 1))
+        );
+        // Past the end of a short line: the line length.
+        assert_eq!(
+            doc.source_position_at(body, body.x + 20, body.y),
+            Some((0, 5))
+        );
+        // Outside the body, and without a source.
+        assert_eq!(doc.source_position_at(body, 0, y), None);
+        doc.source = None;
+        assert_eq!(doc.source_position_at(body, body.x + 7, y), None);
     }
 
     #[test]
@@ -4942,6 +5591,7 @@ mod tests {
             rows_key: None,
             pending_src: None,
             selection: PreviewSelection::default(),
+            source: None,
         };
         assert!(
             !doc.wrap,

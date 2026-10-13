@@ -325,16 +325,8 @@ Cmd is not encoded in SGR mouse reports), so:
 
 ## Implementation order
 
-1. `programs.rs`: `[[lsp]]` table, seeded rules, `lsp_for`, Settings count text.
-2. Control request field + `Request::File { lsp }` round trip.
-3. `lsp.rs`: preflight + advice (pure, tested), transport, client with the six
-   methods, env scrubbing.
-4. Viewer: prewarm, progress footer, Ctrl+click definition with back stack.
-5. Ctrl+right-click / `m` menu, references and symbols pickers, hover box.
-6. Docs: README sections (including: your editor shares the server only if it also
-   goes through the lspmux shim with the same root and arguments; macOS Option must
-   act as Alt for forward), AGENTS.md invariants (env scrubbing, the lspmux and leaf
-   exceptions, never own a server, roots walk), this document marked implemented.
+See [lsp-navigation-plan.md](lsp-navigation-plan.md): six phases, each a reviewable
+commit, Phase 0 being the live verification list below.
 
 ## Resolved from lspmux's source (0.3.x)
 

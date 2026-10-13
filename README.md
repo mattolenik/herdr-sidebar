@@ -56,6 +56,10 @@ Use the mouse or press `1`, `2`, and `3`.
 - Per-filetype previewers (`*.md` → `dawn -P`, then `leaf --inline`: the first one on `PATH`
   renders inside the preview pane) and editors (`*.md` → `dawn`, then `nvim`, in their own tab),
   globally or per project.
+- IDE-style code navigation in code previews through a real language server: Ctrl+click a
+  symbol for its definition, Ctrl+right-click or `m` for references, hover, symbols, and
+  `Ctrl+-` / `Ctrl+Alt+-` to go back and forward. Needs the [lspmux](https://codeberg.org/p2502/lspmux)
+  service; every preview tab shares one server per workspace.
 - Press `e` in a text preview for the experimental editor with selection, find,
   clipboard actions, explicit save, and external-change protection.
 
@@ -98,6 +102,8 @@ Settings persist across tabs and restarts. Configure:
 - Material/emoji icons and VS Code/light/terminal colors
 - Tab (default), split-pane, or temporary takeover previews and optional custom editor
 - Per-filetype previewers and editors (global rules file, optional per-project rules)
+- Code navigation: shows whether the lspmux service is installed and running, with the
+  command to start it
 - Source Control list/tree view (shared across sidebars)
 - Hidden files, Git decorations, Git footer, and footer hotkeys
 - Auto-open, strict open/close toggle, focus-on-open, and live folder following
@@ -122,7 +128,10 @@ folder stays put until that pane changes directory again.
 | `1` / `2` / `3` | change view | `1` / `2` / `3` | change view |
 
 Preview: drag to select, `Ctrl/Cmd+C` to copy, arrows/PageUp/PageDown or
-Space/`b` to scroll, `w` to toggle wrapping, and `q` or Esc to close.
+Space/`b` to scroll, `w` to toggle wrapping, and `q` or Esc to close. In a code preview
+with a language server: Ctrl+click goes to the definition, `m` or Ctrl+right-click opens
+the navigation menu, `Ctrl+-` goes back and `Ctrl+Alt+-` forward (on macOS, Option must
+act as Alt: Ghostty `macos-option-as-alt = true`).
 
 Host keybindings can invoke the direct `show-explorer`, `show-search`, `show-git`, and
 `quick-open` actions. For example, bind `cmd+p` to:

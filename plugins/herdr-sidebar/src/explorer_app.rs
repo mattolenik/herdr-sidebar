@@ -295,6 +295,7 @@ enum Setting {
     CustomEditorClick,
     PreviewPrograms,
     ProjectPreviewRules,
+    CodeNavigation,
     AutoOpen,
     StrictToggle,
     FocusOnOpen,
@@ -390,6 +391,10 @@ pub struct App {
     git_footer_status: Option<Status>,
     git_footer_zones: FooterZones,
     git_syncing: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
+    /// lspmux preflight for the Settings row, run on a worker when the modal
+    /// opens (the same check the viewer makes, so the wording never differs).
+    lsp_status: Option<herdr_sidebar::lsp::Preflight>,
+    lsp_check: Option<std::sync::mpsc::Receiver<herdr_sidebar::lsp::Preflight>>,
     ignored_cache: HashMap<PathBuf, Vec<String>>,
     /// A failed/busy ignored-file scan is optional decoration data, not a
     /// reason to hammer an enormous repository again every two seconds.
@@ -514,6 +519,8 @@ impl App {
             git_footer_status: None,
             git_footer_zones: FooterZones::default(),
             git_syncing: None,
+            lsp_status: None,
+            lsp_check: None,
             ignored_cache: HashMap::new(),
             deco_backoff_until: HashMap::new(),
             quick_index: None,
@@ -543,6 +550,7 @@ impl App {
         self.collect_quick_index();
         self.collect_content_search();
         self.collect_git_sync();
+        self.collect_lsp_check();
         self.start_content_search_if_due();
         self.collect_decorations();
         if self.last_deco.elapsed() < DECO_REFRESH {
@@ -1995,12 +2003,33 @@ impl App {
         }
     }
 
+    fn collect_lsp_check(&mut self) {
+        let Some(rx) = &self.lsp_check else { return };
+        match rx.try_recv() {
+            Ok(state) => {
+                self.lsp_check = None;
+                self.lsp_status = Some(state);
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => self.lsp_check = None,
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+        }
+    }
+
     // ---- Settings modal ----
 
     fn open_settings(&mut self) {
         herdr_sidebar::updates::check();
         // The rule count row reads the loaded rules; make them current.
         self.reload_rules();
+        // `lspmux status` is a subprocess: never on the TUI thread.
+        if self.lsp_check.is_none() {
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = tx.send(herdr_sidebar::lsp::preflight());
+            });
+            self.lsp_check = Some(rx);
+            self.lsp_status = None;
+        }
         self.suspend_search_for_modal();
         self.overlay = Some(Overlay::Settings {
             selected: 0,
@@ -2611,6 +2640,14 @@ impl App {
                 true,
             ),
             (
+                Setting::CodeNavigation,
+                "Code navigation",
+                self.lsp_status
+                    .map(|state| state.label().to_string())
+                    .unwrap_or_else(|| "checking…".into()),
+                true,
+            ),
+            (
                 Setting::HiddenFiles,
                 "Hidden files",
                 if self.tree.show_hidden {
@@ -2773,6 +2810,14 @@ impl App {
                     state.project_preview_rules = !state.project_preview_rules;
                 });
                 self.reload_rules();
+            }
+            Setting::CodeNavigation => {
+                self.notice = Some(match self.lsp_status {
+                    None => "checking lspmux…".into(),
+                    Some(state) => herdr_sidebar::lsp::advice_here(state).unwrap_or_else(|| {
+                        "lspmux running — Ctrl+click a symbol in a code preview".into()
+                    }),
+                });
             }
             Setting::HiddenFiles => {
                 self.tree.show_hidden = !self.tree.show_hidden;

@@ -1,5 +1,8 @@
 # LSP code navigation — implementation plan
 
+Status: all six phases implemented (commits `bbb6a7f`, `5ffd41d`, `aea0517`, `97b073d`,
+`18a0356` and the Phase 6 commit on `feat/per-filetype-previewers`).
+
 Companion to [lsp-navigation.md](lsp-navigation.md) (the design; this file does not
 restate its decisions). Six phases, each a separately reviewable commit on
 `feat/per-filetype-previewers` (or a branch off it), each leaving `cargo test`,

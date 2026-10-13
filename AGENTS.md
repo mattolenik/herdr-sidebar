@@ -705,9 +705,55 @@ HACKING.md — budget time for that before promising a patched build.
   exit. `e` on HELD external previewer output (an image) does the same. Only with no editor
   configured anywhere does `e` fall back to the in-pane editor. Keyboard Enter never opens an editor. A line-anchored
   preview (search hit) always uses the built-in SOURCE view — rendered output has no line mapping.
-- **The plugin names no tool in code.** `programs::load` seeds `preview-programs.toml` from
-  `TEMPLATE` on first load; its three ACTIVE rules (glow for Markdown, external viu for images,
-  external pdfterm or tdf for PDFs) are suggestions the user edits. Nothing else picks a program.
+- **The plugin names no tool in code, with two decided exceptions.** `programs::load` seeds
+  `preview-programs.toml` from `TEMPLATE` on first load; its ACTIVE rules (glow for Markdown,
+  external viu for images, external pdfterm or tdf for PDFs, five `[[lsp]]` language servers) are
+  suggestions the user edits. The exceptions are `lspmux` (the shim the viewer spawns, the
+  `lspmux status` preflight and its install/start advice are lspmux-specific by nature) and
+  `leaf` for hover Markdown (a fixed inline renderer, never the user's Markdown previewer rule,
+  which may be external or slow). Both live in `src/lsp.rs` / `viewer::render_hover`.
+- **Code navigation (`src/lsp.rs`, the `Nav`/`Overlay` section of `viewer.rs`; design in
+  `docs/lsp-navigation.md`, plan in `docs/lsp-navigation-plan.md`).** Invariants:
+  - lspmux is a HARD external requirement. The plugin never starts, supervises, kills or falls
+    back to starting `lspmux server` or a language server, and never writes a service file;
+    `lsp::advice` only tells the user the command for their init system. Reaping is lspmux's
+    `instance_timeout` after the last shim disconnects.
+  - The `[[lsp]]` rule resolves in the SIDEBAR like previewers (`Kind::Lsp`, no placeholders,
+    `roots` markers). The workspace root is computed there too (`programs::workspace_root`: walk
+    up from the file for a marker, else `Git::owner_of`, else the Explorer root — NOT the git
+    root: this repo keeps its crate at `plugins/herdr-sidebar` with no root `Cargo.toml`) and
+    both ride in control fields 7 and 8 (`LspSpec`). Navigation requests the viewer writes for
+    itself copy both; the document key stays the path. Rules files seeded before the feature do
+    not gain the `[[lsp]]` rules (the template only seeds a missing file).
+  - **Scrub the shim's environment** (`lsp::shim_env`): lspmux keys an instance by server path,
+    args, environment and workspace, and every preview pane has its own `HERDR_*` values — an
+    inherited env gives every tab a private rust-analyzer. Only PATH/HOME/USER/LANG/TMPDIR/XDG_*/
+    CARGO_HOME/RUSTUP_HOME/GOPATH/GOROOT pass. The server path is passed ABSOLUTE (resolved in the
+    viewer) because the daemon's PATH is not ours. Verified live: two viewers, one rust-analyzer,
+    `lspmux status` lists two clients.
+  - Position encoding comes from the `initialize` RESULT (lspmux replays the first client's
+    negotiation; rust-analyzer answered utf-8 here), missing → UTF-16. There is no
+    `$/cancelRequest` (lspmux retags ids); staleness is "apply only while the document the gesture
+    was made on is still showing". The client ANSWERS `workspace/configuration` (nulls) and every
+    other server request (`null`) because lspmux forwards them and rust-analyzer blocks on them.
+  - `didOpen` sends exactly the on-screen text: `Doc.source` is set only for an untruncated,
+    warning-free source view, so a file over `MAX_LINES` (viewer.rs itself, at 5046 lines) gets
+    no navigation. `Row.start` + `wrap::char_width` map a clicked cell back through the gutter,
+    the wrap offset and tab expansion (`Doc::source_position_at`).
+  - The handshake, `lspmux status` and hover rendering run on workers; the UI thread only
+    `pump()`s the client once per iteration (`NAV_POLL` 50 ms while something is in flight). A
+    gesture during connect/indexing is parked in ONE slot and fires on progress `end`; `$/progress`
+    shows in the footer. Preflight failures are re-checked on the next gesture only, never on a
+    timer or a load. The session is never dropped for idle — an open preview tab is a client.
+  - Keys: `Ctrl+-` is byte 0x1F, which crossterm reports as `Char('7')`+CONTROL, and
+    `Ctrl+Alt+-` as the same with ALT (ESC 0x1F); `Ctrl+Shift+-` is byte-identical to `Ctrl+-` and
+    must not be used. Every document change pushes the previous (request, scroll) onto the back
+    history, sidebar clicks included; forward clears on push; cap 50 (`lsp::History`).
+  - Tests: `lsp::fake` is a language server over `std::io::pipe` (Rust ≥ 1.87; the crate floor is
+    1.89) that answers the six methods and issues the server→client traffic; the client is driven
+    against it hermetically. Live checks go through `pane.send_input` with SGR mouse sequences
+    (`ESC[<16;x;yM` = Ctrl+left press, `ESC[<2;x;yM` = right press, `ESC[<35;x;yM` = motion) in
+    `hs-test`; `pane send-keys` cannot send Space, Ctrl+- or mouse.
 - **`viewer::render_with` is the one spawn path** for previewers. argv[0] goes through `resolve_program_here` (absolute PATH entries only, cwd
   excluded, exec bit, PATHEXT), the child gets `COLUMNS`/`LINES`/`CLICOLOR_FORCE`/`FORCE_COLOR`/
   `COLORTERM=truecolor` with `NO_COLOR` removed and `CREATE_NO_WINDOW` on Windows, the file bytes

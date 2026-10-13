@@ -1,6 +1,8 @@
 # LSP code navigation in the preview pane — design
 
-Status: design, not implemented. Branch `feat/per-filetype-previewers` is the base.
+Status: implemented on `feat/per-filetype-previewers` (phases 1–6 of
+[lsp-navigation-plan.md](lsp-navigation-plan.md)); Phase 0 findings are under "Verified live"
+at the end.
 
 ## Goal
 
@@ -350,11 +352,22 @@ None. Decided: the plugin never reads Helix's (or any editor's) configuration; i
 borrows Helix's conventions (`roots` markers, preference lists) and seeds its own
 rules.
 
-## Verify live in `hs-test` before building
+## Verified live (`hs-test`, 2026-10-12, lspmux 0.3.0, rust-analyzer 2026-10-04)
 
-- Ctrl+left click reaches the viewer with the ctrl bit and does not start a drag
-  selection.
-- `Ctrl+-` and `Ctrl+Alt+-` arrive as distinct byte sequences from the real terminal.
-- `lspmux status` exit code with the service stopped.
-- `tsgo --lsp --stdio` and `ty server` are the right invocations for the installed
-  versions.
+- The lspmux shim answers `initialize` for this crate in ~1.2 s cold and reports
+  `positionEncoding: utf-8`; it forwards `window/workDoneProgress/create` and a full
+  `$/progress` sequence ("Fetching", "cargo check"…), both handled by the client.
+- `lspmux status` exits 0 with the service up; by its source (`ext_request` → `?` in
+  `main`), a refused connection exits non-zero. Not exercised with the service stopped,
+  to leave the user's service alone.
+- Ctrl+left click (SGR `ESC[<16;x;yM` injected with `pane.send_input`) reaches the
+  viewer with the CONTROL bit and starts no selection; `0x1F` and `ESC 0x1F` arrive as
+  `Char('7')` with CONTROL and CONTROL|ALT. **Still to confirm from a real Ghostty
+  client in the user's own terminal:** that herdr passes Ctrl+left-click through and
+  that Option-as-Alt produces `ESC 0x1F` for `Ctrl+Alt+-`.
+- Two viewers on the same crate share one rust-analyzer (one instance, two clients in
+  `lspmux status`); cross-file and same-file jumps, back with scroll restore, forward,
+  references picker (13 hits across three files), dwell hover rendered by leaf, and the
+  symbols picker (118 entries) all worked.
+- `tsgo` and `ty` are not installed on this machine; their seeded invocations
+  (`tsgo --lsp --stdio`, `ty server`) follow their READMEs and are unverified.

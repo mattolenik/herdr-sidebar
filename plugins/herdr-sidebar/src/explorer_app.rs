@@ -856,12 +856,24 @@ impl App {
         let editor = self
             .resolve_rule(path, programs::Kind::Editor)
             .map(|r| r.command);
+        let lsp = self.resolve_rule(path, programs::Kind::Lsp).map(|server| {
+            herdr_sidebar::viewer::LspSpec {
+                root: programs::workspace_root(
+                    path,
+                    &server.roots,
+                    || Git::owner_of(path).ok().map(|git| git.root().to_path_buf()),
+                    &self.tree.root_path(),
+                ),
+                command: server.command,
+            }
+        });
         let payload = herdr_sidebar::viewer::file_request(
             path,
             line,
             renderer.as_ref().map(|r| r.command.as_str()),
             editor.as_deref(),
             renderer.as_ref().is_some_and(|r| r.external),
+            lsp.as_ref(),
         );
         let doc_key = herdr_sidebar::viewer::doc_key_for_file(path);
         match herdr_sidebar::viewer::open_in_pane(

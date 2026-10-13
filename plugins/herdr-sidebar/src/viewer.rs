@@ -275,6 +275,15 @@ impl Request {
     }
 }
 
+/// The language server the sidebar resolved for a file (an `[[lsp]]` rule)
+/// and the workspace it should index. Both ride in the control request:
+/// the viewer never reads rule files.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct LspSpec {
+    pub command: String,
+    pub root: PathBuf,
+}
+
 /// What the sidebar asked the viewer to show.
 #[derive(Clone, PartialEq, Eq, Debug)]
 enum Request {
@@ -294,6 +303,9 @@ enum Request {
         /// `renderer` runs on the pane's real terminal (`mode = "external"`)
         /// rather than rendering to stdout.
         external: bool,
+        /// Language server for code navigation, when an `[[lsp]]` rule
+        /// matched and its program exists.
+        lsp: Option<LspSpec>,
     },
     Diff {
         root: PathBuf,
@@ -312,28 +324,38 @@ enum Request {
 
 /// Control-file payload for a file preview, optionally anchored to a
 /// one-based source line and carrying the resolved per-filetype previewer
-/// and editor commands (`file\t<path>\t<line>\t<renderer>\t<editor>`, each
-/// trailing field empty when absent).
+/// and editor commands plus the language server and its workspace
+/// (`file\t<path>\t<line>\t<renderer>\t<editor>\t<external>\t<server>\t<root>`,
+/// trailing fields omitted when absent, empty when a later one is present).
 pub fn file_request(
     path: &Path,
     line: Option<usize>,
     renderer: Option<&str>,
     editor: Option<&str>,
     external: bool,
+    lsp: Option<&LspSpec>,
 ) -> String {
     let mut payload = format!(
         "file\t{}\t{}",
         path.display(),
         line.map(|line| line.to_string()).unwrap_or_default()
     );
-    if renderer.is_some() || editor.is_some() {
+    if renderer.is_some() || editor.is_some() || lsp.is_some() {
         payload.push('\t');
         payload.push_str(renderer.unwrap_or(""));
         payload.push('\t');
         payload.push_str(editor.unwrap_or(""));
         if external {
             payload.push_str("\t1");
+        } else if lsp.is_some() {
+            payload.push('\t');
         }
+    }
+    if let Some(lsp) = lsp {
+        payload.push('\t');
+        payload.push_str(&lsp.command);
+        payload.push('\t');
+        payload.push_str(&lsp.root.display().to_string());
     }
     payload
 }
@@ -384,12 +406,20 @@ fn parse_request(raw: &str) -> Option<Request> {
             let renderer = optional(parts.next());
             let editor = optional(parts.next());
             let external = parts.next().map(str::trim) == Some("1");
+            let lsp = match (optional(parts.next()), optional(parts.next())) {
+                (Some(command), Some(root)) => Some(LspSpec {
+                    command,
+                    root: PathBuf::from(root),
+                }),
+                _ => None,
+            };
             Some(Request::File {
                 path,
                 line,
                 renderer,
                 editor,
                 external,
+                lsp,
             })
         }
         // Legacy: a bare path.
@@ -399,6 +429,7 @@ fn parse_request(raw: &str) -> Option<Request> {
             renderer: None,
             editor: None,
             external: false,
+            lsp: None,
         }),
     }
 }
@@ -412,12 +443,14 @@ fn request_payload(request: &Request) -> String {
             renderer,
             editor,
             external,
+            lsp,
         } => file_request(
             path,
             *line,
             renderer.as_deref(),
             editor.as_deref(),
             *external,
+            lsp.as_ref(),
         ),
         Request::Diff { root, rel, kind } => diff_request(root, rel, kind),
         Request::Show { root, spec, path } => show_request(root, spec, path.as_deref()),
@@ -1441,6 +1474,7 @@ fn start_fallback_load(
             renderer: None,
             editor: None,
             external: false,
+            lsp: None,
         },
         other => other.clone(),
     };
@@ -4632,11 +4666,12 @@ mod tests {
             renderer: None,
             editor: None,
             external: false,
+            lsp: None,
         };
-        let f = file_request(Path::new("C:/x/y.rs"), None, None, None, false);
+        let f = file_request(Path::new("C:/x/y.rs"), None, None, None, false, None);
         assert_eq!(f, "file\tC:/x/y.rs\t");
         assert_eq!(parse_request(&f), Some(plain("C:/x/y.rs", None)));
-        let f = file_request(Path::new("C:/x/y.rs"), Some(42), None, None, false);
+        let f = file_request(Path::new("C:/x/y.rs"), Some(42), None, None, false, None);
         assert_eq!(parse_request(&f), Some(plain("C:/x/y.rs", Some(42))));
         // Resolved previewer/editor commands ride along as trailing fields.
         let f = file_request(
@@ -4645,6 +4680,7 @@ mod tests {
             Some("leaf --inline ansi:{width} {file}"),
             Some("nvim {file}"),
             false,
+            None,
         );
         assert_eq!(
             parse_request(&f),
@@ -4654,6 +4690,7 @@ mod tests {
                 renderer: Some("leaf --inline ansi:{width} {file}".into()),
                 editor: Some("nvim {file}".into()),
                 external: false,
+                lsp: None,
             })
         );
         let f = file_request(
@@ -4662,6 +4699,7 @@ mod tests {
             None,
             Some("nvim {file}"),
             false,
+            None,
         );
         let parsed = parse_request(&f).unwrap();
         assert_eq!(request_payload(&parsed), f);
@@ -4675,7 +4713,14 @@ mod tests {
             }
         ));
         // External previewers carry a sixth field.
-        let f = file_request(Path::new("/r/a.png"), None, Some("viu {file}"), None, true);
+        let f = file_request(
+            Path::new("/r/a.png"),
+            None,
+            Some("viu {file}"),
+            None,
+            true,
+            None,
+        );
         assert_eq!(f, "file\t/r/a.png\t\tviu {file}\t\t1");
         let parsed = parse_request(&f).unwrap();
         assert!(matches!(
@@ -4692,10 +4737,69 @@ mod tests {
             renderer: Some("viu {file}".into()),
             editor: None,
             external,
+            lsp: None,
         };
         assert_eq!(external_command_for(&variant(None, false)), None);
         assert_eq!(external_command_for(&variant(Some(2), true)), None);
+        // The language server and its workspace are fields 7 and 8; the
+        // external flag is written empty so positions stay fixed.
+        let spec = LspSpec {
+            command: "rust-analyzer".into(),
+            root: PathBuf::from("/r/plugins/crate"),
+        };
+        let f = file_request(
+            Path::new("/r/plugins/crate/src/a.rs"),
+            None,
+            None,
+            None,
+            false,
+            Some(&spec),
+        );
+        assert_eq!(
+            f,
+            "file\t/r/plugins/crate/src/a.rs\t\t\t\t\trust-analyzer\t/r/plugins/crate"
+        );
+        let parsed = parse_request(&f).unwrap();
+        assert!(
+            matches!(&parsed, Request::File { lsp: Some(l), external: false, renderer: None, .. } if *l == spec)
+        );
+        assert_eq!(request_payload(&parsed), f);
+        assert_ne!(parsed, plain("/r/plugins/crate/src/a.rs", None));
+        let f = file_request(
+            Path::new("/r/a.png"),
+            None,
+            Some("viu {file}"),
+            Some("vi"),
+            true,
+            Some(&spec),
+        );
+        assert_eq!(
+            f,
+            "file\t/r/a.png\t\tviu {file}\tvi\t1\trust-analyzer\t/r/plugins/crate"
+        );
+        assert_eq!(request_payload(&parse_request(&f).unwrap()), f);
+        // A server without a root (a hand-written payload) is ignored.
+        assert!(matches!(
+            parse_request("file\t/r/a.rs\t\t\t\t\trust-analyzer"),
+            Some(Request::File { lsp: None, .. })
+        ));
         // Legacy forms from an older sidebar still parse.
+        assert!(matches!(
+            parse_request("file\t/r/a.md\t\tglow\tvi"),
+            Some(Request::File {
+                lsp: None,
+                editor: Some(_),
+                ..
+            })
+        ));
+        assert!(matches!(
+            parse_request("file\t/r/a.md\t\tglow\tvi\t1"),
+            Some(Request::File {
+                lsp: None,
+                external: true,
+                ..
+            })
+        ));
         assert_eq!(
             parse_request("file\tC:/x/y.rs"),
             Some(plain("C:/x/y.rs", None))
@@ -4741,6 +4845,7 @@ mod tests {
                 renderer: None,
                 editor: None,
                 external: false,
+                lsp: None,
             })
         );
         assert_eq!(parse_request("  "), None);
@@ -4934,6 +5039,7 @@ mod tests {
             renderer: None,
             editor: None,
             external: false,
+            lsp: None,
         };
         let restored = control_after_failed_close(&Some(file.clone()));
         assert_eq!(parse_request(&restored), Some(file));

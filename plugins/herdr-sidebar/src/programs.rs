@@ -395,7 +395,7 @@ impl Rule {
 pub fn workspace_root(
     file: &Path,
     roots: &[String],
-    repo_root: Option<&Path>,
+    repo_root: impl FnOnce() -> Option<PathBuf>,
     explorer_root: &Path,
 ) -> PathBuf {
     if !roots.is_empty() {
@@ -407,9 +407,7 @@ pub fn workspace_root(
             dir = candidate.parent();
         }
     }
-    repo_root
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| explorer_root.to_path_buf())
+    repo_root().unwrap_or_else(|| explorer_root.to_path_buf())
 }
 
 /// Where `program` (argv[0] of a command) lives: checked directly when it
@@ -1235,7 +1233,7 @@ mod tests {
         let file = src.join("main.rs");
         std::fs::write(&file, "").unwrap();
         let explorer = Path::new("/explorer");
-        let repo = Some(dir.as_path());
+        let repo = || Some(dir.clone());
         let markers = |m: &[&str]| m.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         assert_eq!(
             workspace_root(&file, &markers(&["Cargo.toml"]), repo, explorer),
@@ -1247,7 +1245,7 @@ mod tests {
             dir
         );
         assert_eq!(workspace_root(&file, &[], repo, explorer), dir);
-        assert_eq!(workspace_root(&file, &[], None, explorer), explorer);
+        assert_eq!(workspace_root(&file, &[], || None, explorer), explorer);
         // The marker next to the file itself counts.
         std::fs::write(src.join("go.mod"), "").unwrap();
         assert_eq!(

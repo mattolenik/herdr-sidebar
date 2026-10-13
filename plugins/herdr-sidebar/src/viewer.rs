@@ -20,7 +20,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Style, Stylize};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::Paragraph;
+use ratatui::widgets::{Block, Clear, List, ListItem, Paragraph};
 use unicode_width::UnicodeWidthChar;
 
 use crate::ansi;
@@ -28,7 +28,7 @@ use crate::editor::{EditAction, Editor, SaveOutcome};
 use crate::icons::{IconTheme, icon};
 use crate::ipc;
 use crate::lsp;
-use crate::ui::{icon_style as ui_icon_style, palette};
+use crate::ui::{draw_scrollbar, icon_style as ui_icon_style, palette, selection_style};
 
 /// Metadata source/token that marks the viewer pane, so the sidebar can find
 /// and reuse it (distinct from the sidebar's own identity tokens).
@@ -1918,7 +1918,6 @@ const INIT_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// What a navigation gesture asks the server.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[allow(dead_code)] // the menu (next phase) issues the rest
 enum NavKind {
     Definition,
     TypeDefinition,
@@ -1929,6 +1928,17 @@ enum NavKind {
 }
 
 impl NavKind {
+    fn label(self) -> &'static str {
+        match self {
+            NavKind::Definition => "Go to Definition",
+            NavKind::TypeDefinition => "Go to Type Definition",
+            NavKind::Implementation => "Go to Implementation",
+            NavKind::References => "Find References",
+            NavKind::Hover => "Hover",
+            NavKind::Symbols => "Document Symbols",
+        }
+    }
+
     fn method(self) -> &'static str {
         match self {
             NavKind::Definition => "definition",
@@ -1953,6 +1963,8 @@ struct Inflight {
     /// The document the gesture was made on; a reply is applied only while
     /// it is still showing.
     doc: Request,
+    /// The screen cell the gesture was made at (where a hover box goes).
+    at: (u16, u16),
     started: Instant,
     receiver: std::sync::mpsc::Receiver<Result<serde_json::Value, String>>,
 }
@@ -1960,8 +1972,8 @@ struct Inflight {
 /// Something the event loop must act on after [`Nav::collect`].
 enum NavEvent {
     Notice(String),
-    /// A reply for `kind` on the document it was asked about.
-    Reply(NavKind, serde_json::Value),
+    /// A reply for `kind` on the document it was asked about, made at a cell.
+    Reply(NavKind, serde_json::Value, (u16, u16)),
 }
 
 /// Code-navigation state for the pane: one language-server session (through
@@ -1983,7 +1995,9 @@ struct Nav {
     history: lsp::History<(Request, usize)>,
     inflight: Option<Inflight>,
     /// One gesture parked while the server connects or indexes.
-    queued: Option<(NavKind, usize, usize)>,
+    queued: Option<(NavKind, usize, usize, (u16, u16))>,
+    /// The last cell the pointer clicked or rested on: where `m` acts.
+    last_cell: Option<(u16, u16)>,
     /// Scroll to restore once the load for a history entry lands.
     restore_scroll: Option<(Request, usize)>,
 }
@@ -2111,6 +2125,7 @@ impl Nav {
         doc: &Doc,
         line: usize,
         col: usize,
+        at: (u16, u16),
     ) -> Option<String> {
         self.drop_dead();
         let Some(spec) = nav_spec(request).cloned() else {
@@ -2123,7 +2138,7 @@ impl Nav {
             return Some("code navigation needs the plain source view".into());
         }
         if self.session.is_none() {
-            self.queued = Some((kind, line, col));
+            self.queued = Some((kind, line, col, at));
             if self.connecting.is_none() {
                 let advice = self.preflight_failed.take();
                 self.start_connect(spec.clone());
@@ -2135,14 +2150,33 @@ impl Nav {
             self.open_current(request, doc);
         }
         if self.status().is_some() {
-            self.queued = Some((kind, line, col));
+            self.queued = Some((kind, line, col, at));
             return Some("waiting for the server to finish indexing…".into());
         }
-        self.send(kind, request, doc, line, col);
+        self.send(kind, request, doc, line, col, at);
         None
     }
 
-    fn send(&mut self, kind: NavKind, request: &Request, doc: &Doc, line: usize, col: usize) {
+    /// Whether a server is connected and idle (a hover is worth asking for).
+    fn ready(&self) -> bool {
+        self.session.is_some() && self.inflight.is_none() && self.status().is_none()
+    }
+
+    fn supports(&self, provider: &str) -> bool {
+        self.session
+            .as_ref()
+            .is_some_and(|(_, client)| client.supports(provider))
+    }
+
+    fn send(
+        &mut self,
+        kind: NavKind,
+        request: &Request,
+        doc: &Doc,
+        line: usize,
+        col: usize,
+        at: (u16, u16),
+    ) {
         let (Request::File { path, .. }, Some(source), Some((_, client))) =
             (request, &doc.source, &mut self.session)
         else {
@@ -2158,6 +2192,7 @@ impl Nav {
         self.inflight = Some(Inflight {
             kind,
             doc: request.clone(),
+            at,
             started: Instant::now(),
             receiver,
         });
@@ -2212,10 +2247,10 @@ impl Nav {
         if let Some(inflight) = &self.inflight {
             match inflight.receiver.try_recv() {
                 Ok(outcome) => {
-                    let Inflight { kind, doc, .. } = self.inflight.take().expect("checked");
+                    let Inflight { kind, doc, at, .. } = self.inflight.take().expect("checked");
                     if current == Some(&doc) {
                         match outcome {
-                            Ok(value) => events.push(NavEvent::Reply(kind, value)),
+                            Ok(value) => events.push(NavEvent::Reply(kind, value, at)),
                             Err(error) => events.push(NavEvent::Notice(error)),
                         }
                     }
@@ -2235,7 +2270,7 @@ impl Nav {
             }
         }
         // A parked gesture fires once the server is connected and idle.
-        if let Some((kind, line, col)) = self.queued
+        if let Some((kind, line, col, at)) = self.queued
             && self.session.is_some()
             && self.status().is_none()
             && let (Some(request), Some(doc)) = (current, doc)
@@ -2244,7 +2279,7 @@ impl Nav {
             if self.open.is_none() {
                 self.open_current(request, doc);
             }
-            self.send(kind, request, doc, line, col);
+            self.send(kind, request, doc, line, col, at);
         }
         events
     }
@@ -2255,6 +2290,667 @@ impl Nav {
             client.shutdown();
         }
     }
+}
+
+/// How long the pointer rests on one cell before a hover is requested.
+const HOVER_DWELL: Duration = Duration::from_millis(500);
+/// A hover box closes by itself after this long (terminals send no
+/// "pointer left the pane" event).
+const HOVER_TTL: Duration = Duration::from_secs(8);
+/// Widest hover box; leaf wraps the Markdown to it.
+const HOVER_MAX_WIDTH: u16 = 60;
+/// Pickers list at most this many locations.
+const PICKER_CAP: usize = 500;
+
+/// A floating element over the preview body: the navigation menu, a result
+/// picker, or a hover box. Input goes to the overlay first.
+enum Overlay {
+    Menu {
+        at: (u16, u16),
+        /// Source position the entries act on.
+        pos: (usize, usize),
+        entries: Vec<MenuAction>,
+        selected: usize,
+        rect: Rect,
+    },
+    Picker {
+        title: String,
+        items: Vec<PickItem>,
+        selected: usize,
+        scroll: usize,
+        rect: Rect,
+    },
+    Hover {
+        lines: Vec<Line<'static>>,
+        at: (u16, u16),
+        shown: Instant,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MenuAction {
+    Nav(NavKind),
+    Back,
+    Forward,
+}
+
+impl MenuAction {
+    fn label(self) -> &'static str {
+        match self {
+            MenuAction::Nav(kind) => kind.label(),
+            MenuAction::Back => "Back",
+            MenuAction::Forward => "Forward",
+        }
+    }
+}
+
+/// One picker row: a navigable location, or a file header (`target: None`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PickItem {
+    label: String,
+    target: Option<lsp::Target>,
+}
+
+/// The menu for a server with these capabilities (`supports` answers
+/// `<name>Provider` questions).
+fn menu_entries(supports: impl Fn(&str) -> bool) -> Vec<MenuAction> {
+    let mut entries = vec![MenuAction::Nav(NavKind::Definition)];
+    if supports("typeDefinitionProvider") {
+        entries.push(MenuAction::Nav(NavKind::TypeDefinition));
+    }
+    if supports("implementationProvider") {
+        entries.push(MenuAction::Nav(NavKind::Implementation));
+    }
+    entries.extend([
+        MenuAction::Nav(NavKind::References),
+        MenuAction::Nav(NavKind::Hover),
+        MenuAction::Nav(NavKind::Symbols),
+        MenuAction::Back,
+        MenuAction::Forward,
+    ]);
+    entries
+}
+
+/// Picker rows for a list of locations: grouped by file (header rows show
+/// the path relative to `root`), each location with its trimmed line text
+/// from `read`, capped at [`PICKER_CAP`] with a `+N more` footer.
+fn location_items(
+    targets: &[lsp::Target],
+    root: &Path,
+    read: impl Fn(&Path) -> Option<String>,
+) -> Vec<PickItem> {
+    let mut sorted: Vec<&lsp::Target> = targets.iter().take(PICKER_CAP).collect();
+    sorted.sort_by(|a, b| (&a.path, a.line, a.character).cmp(&(&b.path, b.line, b.character)));
+    let mut items = Vec::new();
+    let mut current_file: Option<&Path> = None;
+    let mut text: Option<String> = None;
+    for target in sorted {
+        if current_file != Some(target.path.as_path()) {
+            current_file = Some(&target.path);
+            text = read(&target.path);
+            let shown = target
+                .path
+                .strip_prefix(root)
+                .unwrap_or(&target.path)
+                .display()
+                .to_string();
+            items.push(PickItem {
+                label: shown,
+                target: None,
+            });
+        }
+        let snippet = text
+            .as_deref()
+            .and_then(|t| t.lines().nth(target.line))
+            .map(str::trim)
+            .unwrap_or("");
+        let snippet: String = snippet.chars().take(120).collect();
+        items.push(PickItem {
+            label: format!("  {}: {snippet}", target.line + 1),
+            target: Some(target.clone()),
+        });
+    }
+    if targets.len() > PICKER_CAP {
+        items.push(PickItem {
+            label: format!("+{} more", targets.len() - PICKER_CAP),
+            target: None,
+        });
+    }
+    items
+}
+
+fn read_snippet_source(path: &Path) -> Option<String> {
+    let metadata = std::fs::metadata(path).ok()?;
+    if metadata.len() > MAX_BYTES as u64 {
+        return None;
+    }
+    std::fs::read_to_string(path).ok()
+}
+
+fn symbol_kind_label(kind: u64) -> &'static str {
+    match kind {
+        2 => "mod",
+        3 => "ns",
+        5 => "class",
+        6 => "fn",
+        7 => "prop",
+        8 => "field",
+        9 => "new",
+        10 => "enum",
+        11 => "trait",
+        12 => "fn",
+        13 => "var",
+        14 => "const",
+        22 => "variant",
+        23 => "struct",
+        26 => "type",
+        _ => "",
+    }
+}
+
+/// Picker rows for a `textDocument/documentSymbol` result: nested
+/// `DocumentSymbol`s flattened with two spaces per depth, or the flat
+/// `SymbolInformation` form. `path` is the document (DocumentSymbol carries
+/// no URI).
+fn symbol_items(result: &serde_json::Value, path: &Path) -> Vec<PickItem> {
+    fn push(items: &mut Vec<PickItem>, symbols: &[serde_json::Value], depth: usize, path: &Path) {
+        for symbol in symbols {
+            let name = symbol.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+            let kind = symbol
+                .get("kind")
+                .and_then(|v| v.as_u64())
+                .map(symbol_kind_label)
+                .unwrap_or("");
+            let (target, nested) = if let Some(location) = symbol.get("location") {
+                (lsp::targets(location).into_iter().next(), false)
+            } else {
+                let range = symbol.get("selectionRange").or_else(|| symbol.get("range"));
+                let start = range.and_then(|r| r.get("start"));
+                let line = start.and_then(|s| s.get("line")).and_then(|v| v.as_u64());
+                (
+                    line.map(|line| lsp::Target {
+                        path: path.to_path_buf(),
+                        line: line as usize,
+                        character: start
+                            .and_then(|s| s.get("character"))
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0) as u32,
+                    }),
+                    true,
+                )
+            };
+            let label = if kind.is_empty() {
+                format!("{}{name}", "  ".repeat(depth))
+            } else {
+                format!("{}{name}  {kind}", "  ".repeat(depth))
+            };
+            items.push(PickItem { label, target });
+            if nested && let Some(children) = symbol.get("children").and_then(|v| v.as_array()) {
+                push(items, children, depth + 1, path);
+            }
+        }
+    }
+    let mut items = Vec::new();
+    if let Some(symbols) = result.as_array() {
+        push(&mut items, symbols, 0, path);
+    }
+    items
+}
+
+/// One Markdown string from a hover result's `contents`: `MarkupContent`,
+/// a `MarkedString` (plain or `{language, value}`), or an array of them.
+fn hover_markdown(result: &serde_json::Value) -> Option<String> {
+    fn one(value: &serde_json::Value) -> Option<String> {
+        match value {
+            serde_json::Value::String(text) => Some(text.clone()),
+            serde_json::Value::Object(map) => {
+                let text = map.get("value")?.as_str()?;
+                match map.get("language").and_then(|l| l.as_str()) {
+                    Some(language) => Some(format!("```{language}\n{text}\n```")),
+                    None => Some(text.to_string()),
+                }
+            }
+            _ => None,
+        }
+    }
+    let contents = result.get("contents")?;
+    let parts: Vec<String> = match contents {
+        serde_json::Value::Array(items) => items.iter().filter_map(one).collect(),
+        other => one(other).into_iter().collect(),
+    };
+    let joined = parts.join("\n\n");
+    (!joined.trim().is_empty()).then_some(joined)
+}
+
+/// Plain-text fallback for hover Markdown: fence markers dropped.
+fn strip_fences(markdown: &str) -> Vec<Line<'static>> {
+    markdown
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("```"))
+        .map(|line| Line::raw(line.to_string()))
+        .collect()
+}
+
+/// Render hover Markdown with `leaf --inline ansi:<width>` on stdin — a
+/// fixed renderer, never the user's Markdown previewer rule (that may be an
+/// external viewer or slow; a tooltip must be instant and inline). Without
+/// leaf, the plain text with fences stripped.
+fn render_hover(markdown: &str, width: u16) -> Vec<Line<'static>> {
+    let Some(leaf) = crate::programs::resolve_program_here("leaf") else {
+        return strip_fences(markdown);
+    };
+    let mut command = std::process::Command::new(leaf);
+    command
+        .arg("--inline")
+        .arg(format!("ansi:{width}"))
+        .env("COLUMNS", width.to_string())
+        .env("CLICOLOR_FORCE", "1")
+        .env("FORCE_COLOR", "1")
+        .env("COLORTERM", "truecolor")
+        .env_remove("NO_COLOR");
+    match run_captured(
+        command,
+        markdown.as_bytes().to_vec(),
+        MAX_RENDER_BYTES,
+        RENDER_TIMEOUT,
+    ) {
+        Ok(output) if output.status.success() && !output.stdout.is_empty() => {
+            let text = String::from_utf8_lossy(&output.stdout);
+            let mut lines = ansi::to_lines(&text);
+            while lines.last().is_some_and(|l| l.width() == 0) {
+                lines.pop();
+            }
+            lines
+        }
+        _ => strip_fences(markdown),
+    }
+}
+
+/// Draw the overlay over the body; menu and picker remember their rect for
+/// mouse hit-testing.
+fn draw_overlay(frame: &mut Frame, overlay: &mut Overlay, body: Rect) {
+    let area = frame.area();
+    match overlay {
+        Overlay::Menu {
+            at,
+            entries,
+            selected,
+            rect,
+            ..
+        } => {
+            let label_width = entries
+                .iter()
+                .map(|e| e.label().chars().count())
+                .max()
+                .unwrap_or(0) as u16;
+            let width = (label_width + 4).min(area.width);
+            let height = (entries.len() as u16 + 2).min(area.height);
+            let px = at.0.min(area.width.saturating_sub(width));
+            let py = (at.1 + 1).min(area.height.saturating_sub(height));
+            *rect = Rect::new(px, py, width, height);
+            let items: Vec<ListItem> = entries
+                .iter()
+                .enumerate()
+                .map(|(i, entry)| {
+                    let line = Line::raw(format!(" {}", entry.label()));
+                    if i == *selected {
+                        ListItem::new(line).style(selection_style(true))
+                    } else {
+                        ListItem::new(line)
+                    }
+                })
+                .collect();
+            frame.render_widget(Clear, *rect);
+            frame.render_widget(
+                List::new(items).block(Block::bordered().border_style(Style::default().dim())),
+                *rect,
+            );
+        }
+        Overlay::Picker {
+            title,
+            items,
+            selected,
+            scroll,
+            rect,
+        } => {
+            let width = area.width.saturating_sub(2).clamp(10, 90);
+            let visible = usize::from(area.height.saturating_sub(4))
+                .min(items.len())
+                .max(1);
+            let height = (visible as u16 + 2).min(area.height).max(3);
+            *rect = Rect::new(
+                area.width.saturating_sub(width) / 2,
+                area.height.saturating_sub(height) / 4,
+                width,
+                height,
+            );
+            let inner = rect.inner(ratatui::layout::Margin::new(1, 1));
+            let rows = usize::from(inner.height).max(1);
+            if *selected < *scroll {
+                *scroll = *selected;
+            } else if *selected >= *scroll + rows {
+                *scroll = *selected + 1 - rows;
+            }
+            let list: Vec<ListItem> = items
+                .iter()
+                .enumerate()
+                .skip(*scroll)
+                .take(rows)
+                .map(|(i, item)| {
+                    let label: String = item
+                        .label
+                        .chars()
+                        .take(usize::from(inner.width).saturating_sub(2))
+                        .collect();
+                    let line = if item.target.is_none() {
+                        Line::from(Span::styled(
+                            format!(" {label}"),
+                            Style::default().bold().fg(palette().header_accent),
+                        ))
+                    } else {
+                        Line::raw(format!(" {label}"))
+                    };
+                    if i == *selected {
+                        ListItem::new(line).style(selection_style(true))
+                    } else {
+                        ListItem::new(line)
+                    }
+                })
+                .collect();
+            frame.render_widget(Clear, *rect);
+            frame.render_widget(
+                List::new(list).block(
+                    Block::bordered()
+                        .title(format!(" {title} "))
+                        .border_style(Style::default().fg(palette().accent)),
+                ),
+                *rect,
+            );
+            draw_scrollbar(
+                frame,
+                Rect::new(rect.right().saturating_sub(1), inner.y, 1, inner.height),
+                items.len(),
+                rows,
+                *scroll,
+            );
+        }
+        Overlay::Hover { lines, at, .. } => {
+            let text_width = lines.iter().map(Line::width).max().unwrap_or(0) as u16;
+            let width = (text_width + 2)
+                .min(HOVER_MAX_WIDTH + 2)
+                .min(area.width)
+                .max(3);
+            let height = (lines.len() as u16 + 2)
+                .min(body.height / 2)
+                .min(area.height)
+                .max(3);
+            let px = at.0.min(area.width.saturating_sub(width));
+            let below = at.1 + 1;
+            let py = if below + height <= area.height {
+                below
+            } else {
+                at.1.saturating_sub(height)
+            };
+            let rect = Rect::new(px, py, width, height);
+            frame.render_widget(Clear, rect);
+            frame.render_widget(
+                Paragraph::new(lines.clone())
+                    .block(Block::bordered().border_style(Style::default().dim())),
+                rect,
+            );
+        }
+    }
+}
+
+/// Picker/menu row under a screen cell, if inside the overlay's inner area.
+fn overlay_row_at(rect: Rect, scroll: usize, column: u16, row: u16) -> Option<usize> {
+    let inner = rect.inner(ratatui::layout::Margin::new(1, 1));
+    (column >= inner.x && column < inner.right() && row >= inner.y && row < inner.bottom())
+        .then(|| scroll + usize::from(row - inner.y))
+}
+
+/// Move a picker selection to the next selectable row in `direction`.
+fn picker_step(items: &[PickItem], selected: usize, direction: isize) -> usize {
+    let mut index = selected;
+    loop {
+        let next = index as isize + direction;
+        if next < 0 || next >= items.len() as isize {
+            return selected;
+        }
+        index = next as usize;
+        if items[index].target.is_some() {
+            return index;
+        }
+        if index == 0 || index + 1 == items.len() {
+            // Only headers that way: stay.
+            return selected;
+        }
+    }
+}
+
+fn first_selectable(items: &[PickItem]) -> usize {
+    items
+        .iter()
+        .position(|item| item.target.is_some())
+        .unwrap_or(0)
+}
+
+/// A hover box being rendered on a worker, and the cell it belongs to.
+type HoverRender = (std::sync::mpsc::Receiver<Vec<Line<'static>>>, (u16, u16));
+
+/// What the loop does after an overlay handled an input event.
+enum OverlayOutcome {
+    Keep(Overlay),
+    Close,
+    /// Run a navigation gesture at a source position, from a cell.
+    Nav(NavKind, (usize, usize), (u16, u16)),
+    /// Back (`false`) or forward (`true`).
+    History(bool),
+    GoTo(lsp::Target),
+}
+
+fn activate_menu(
+    entries: &[MenuAction],
+    index: usize,
+    pos: (usize, usize),
+    at: (u16, u16),
+) -> OverlayOutcome {
+    match entries.get(index) {
+        Some(MenuAction::Nav(kind)) => OverlayOutcome::Nav(*kind, pos, at),
+        Some(MenuAction::Back) => OverlayOutcome::History(false),
+        Some(MenuAction::Forward) => OverlayOutcome::History(true),
+        None => OverlayOutcome::Close,
+    }
+}
+
+fn activate_picker(items: &[PickItem], index: usize) -> OverlayOutcome {
+    match items.get(index).and_then(|item| item.target.clone()) {
+        Some(target) => OverlayOutcome::GoTo(target),
+        None => OverlayOutcome::Keep(Overlay::Picker {
+            title: String::new(),
+            items: Vec::new(),
+            selected: 0,
+            scroll: 0,
+            rect: Rect::default(),
+        }),
+    }
+}
+
+/// A key while a menu or picker is up. (A hover box is closed by the loop
+/// before any key reaches here.)
+fn overlay_key(overlay: Overlay, key: KeyCode, page: usize) -> OverlayOutcome {
+    match overlay {
+        Overlay::Menu {
+            at,
+            pos,
+            entries,
+            mut selected,
+            rect,
+        } => match key {
+            KeyCode::Esc | KeyCode::Char('q') => OverlayOutcome::Close,
+            KeyCode::Enter => activate_menu(&entries, selected, pos, at),
+            KeyCode::Up | KeyCode::Char('k') => {
+                selected = selected.saturating_sub(1);
+                OverlayOutcome::Keep(Overlay::Menu {
+                    at,
+                    pos,
+                    entries,
+                    selected,
+                    rect,
+                })
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                selected = (selected + 1).min(entries.len().saturating_sub(1));
+                OverlayOutcome::Keep(Overlay::Menu {
+                    at,
+                    pos,
+                    entries,
+                    selected,
+                    rect,
+                })
+            }
+            _ => OverlayOutcome::Keep(Overlay::Menu {
+                at,
+                pos,
+                entries,
+                selected,
+                rect,
+            }),
+        },
+        Overlay::Picker {
+            title,
+            items,
+            mut selected,
+            scroll,
+            rect,
+        } => {
+            match key {
+                KeyCode::Esc | KeyCode::Char('q') => return OverlayOutcome::Close,
+                KeyCode::Enter => {
+                    if let OverlayOutcome::GoTo(target) = activate_picker(&items, selected) {
+                        return OverlayOutcome::GoTo(target);
+                    }
+                }
+                KeyCode::Up | KeyCode::Char('k') => selected = picker_step(&items, selected, -1),
+                KeyCode::Down | KeyCode::Char('j') => selected = picker_step(&items, selected, 1),
+                KeyCode::PageUp | KeyCode::Char('b') => {
+                    for _ in 0..page {
+                        selected = picker_step(&items, selected, -1);
+                    }
+                }
+                KeyCode::PageDown | KeyCode::Char(' ') => {
+                    for _ in 0..page {
+                        selected = picker_step(&items, selected, 1);
+                    }
+                }
+                KeyCode::Home | KeyCode::Char('g') => selected = first_selectable(&items),
+                KeyCode::End | KeyCode::Char('G') => {
+                    selected = items
+                        .iter()
+                        .rposition(|item| item.target.is_some())
+                        .unwrap_or(selected)
+                }
+                _ => {}
+            }
+            OverlayOutcome::Keep(Overlay::Picker {
+                title,
+                items,
+                selected,
+                scroll,
+                rect,
+            })
+        }
+        hover @ Overlay::Hover { .. } => OverlayOutcome::Keep(hover),
+    }
+}
+
+/// A mouse event while a menu or picker is up: clicks inside pick, clicks
+/// outside close, the wheel scrolls a picker, motion highlights.
+fn overlay_mouse(overlay: Overlay, mouse: &MouseEvent) -> OverlayOutcome {
+    match overlay {
+        Overlay::Menu {
+            at,
+            pos,
+            entries,
+            mut selected,
+            rect,
+        } => {
+            let hit =
+                overlay_row_at(rect, 0, mouse.column, mouse.row).filter(|row| *row < entries.len());
+            match (mouse.kind, hit) {
+                (MouseEventKind::Down(_), Some(row)) => activate_menu(&entries, row, pos, at),
+                (MouseEventKind::Down(_), None) => OverlayOutcome::Close,
+                (MouseEventKind::Moved, Some(row)) => {
+                    selected = row;
+                    OverlayOutcome::Keep(Overlay::Menu {
+                        at,
+                        pos,
+                        entries,
+                        selected,
+                        rect,
+                    })
+                }
+                _ => OverlayOutcome::Keep(Overlay::Menu {
+                    at,
+                    pos,
+                    entries,
+                    selected,
+                    rect,
+                }),
+            }
+        }
+        Overlay::Picker {
+            title,
+            items,
+            mut selected,
+            mut scroll,
+            rect,
+        } => {
+            let hit = overlay_row_at(rect, scroll, mouse.column, mouse.row)
+                .filter(|row| *row < items.len());
+            match (mouse.kind, hit) {
+                (MouseEventKind::Down(MouseButton::Left), Some(row)) => {
+                    if let OverlayOutcome::GoTo(target) = activate_picker(&items, row) {
+                        return OverlayOutcome::GoTo(target);
+                    }
+                }
+                (MouseEventKind::Down(_), None) => return OverlayOutcome::Close,
+                (MouseEventKind::Moved, Some(row)) if items[row].target.is_some() => {
+                    selected = row;
+                }
+                (MouseEventKind::ScrollUp, _) => scroll = scroll.saturating_sub(3),
+                (MouseEventKind::ScrollDown, _) => {
+                    scroll = (scroll + 3).min(items.len().saturating_sub(1));
+                }
+                _ => {}
+            }
+            OverlayOutcome::Keep(Overlay::Picker {
+                title,
+                items,
+                selected,
+                scroll,
+                rect,
+            })
+        }
+        hover @ Overlay::Hover { .. } => OverlayOutcome::Keep(hover),
+    }
+}
+
+/// The navigation menu at `cell`, acting on the source position under it.
+fn open_menu(nav: &Nav, doc: &Doc, body: Rect, cell: (u16, u16)) -> Result<Overlay, String> {
+    if doc.source.is_none() {
+        return Err("code navigation needs the plain source view".into());
+    }
+    let pos = doc
+        .source_position_at(body, cell.0, cell.1)
+        .ok_or_else(|| "no code under the pointer".to_string())?;
+    Ok(Overlay::Menu {
+        at: cell,
+        pos,
+        entries: menu_entries(|provider| nav.supports(provider)),
+        selected: 0,
+        rect: Rect::default(),
+    })
 }
 
 /// Show `target` in this pane: a jump within the current file scrolls and
@@ -2424,6 +3120,10 @@ pub fn run(control: &Path) -> std::io::Result<()> {
     let mut external_failed: Option<Request> = None;
     let mut pending_edit: Option<String> = None;
     let mut nav = Nav::default();
+    let mut overlay: Option<Overlay> = None;
+    let mut hover_render: Option<HoverRender> = None;
+    let mut last_motion: Option<((u16, u16), Instant)> = None;
+    let mut hovered_cell: Option<(u16, u16)> = None;
     let result = loop {
         // `e`: the real editor takes over this pane; the document reloads
         // when it exits. The tab is pinned first so a click elsewhere opens
@@ -2514,6 +3214,8 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                 });
         if let Some((request, loaded)) = loaded {
             preview_load = None;
+            overlay = None;
+            hover_render = None;
             if current.as_ref() == Some(&request)
                 && let (ViewMode::Preview(doc), Some(mut loaded)) = (&mut mode, loaded)
             {
@@ -2541,32 +3243,118 @@ pub fn run(control: &Path) -> std::io::Result<()> {
         for event in events {
             match event {
                 NavEvent::Notice(text) => notice = Some(text),
-                NavEvent::Reply(kind, value) => {
-                    let targets = lsp::targets(&value);
-                    match (kind, targets.first()) {
-                        (NavKind::Hover | NavKind::Symbols, _) => {}
-                        (_, None) => notice = Some(format!("no {}", kind.method())),
-                        (_, Some(first)) => {
-                            go_to(
-                                &mut nav,
-                                first,
-                                &mut current,
-                                &mut mode,
-                                &mut preview_load,
-                                control,
-                                &mut identity_pending,
-                                &mut notice,
-                            );
-                            if targets.len() > 1 {
-                                notice = Some(format!(
-                                    "{} (+{} more)",
-                                    notice.as_deref().unwrap_or(""),
-                                    targets.len() - 1
-                                ));
-                            }
-                        }
+                NavEvent::Reply(NavKind::Hover, value, at) => match hover_markdown(&value) {
+                    None => notice = Some("no hover information".into()),
+                    Some(markdown) => {
+                        let width = HOVER_MAX_WIDTH
+                            .min(preview_body.width.saturating_sub(4))
+                            .max(10);
+                        let (sender, receiver) = std::sync::mpsc::channel();
+                        std::thread::spawn(move || {
+                            let _ = sender.send(render_hover(&markdown, width));
+                        });
+                        hover_render = Some((receiver, at));
+                    }
+                },
+                NavEvent::Reply(NavKind::Symbols, value, _) => {
+                    let Some(Request::File { path, .. }) = current.as_ref() else {
+                        continue;
+                    };
+                    let items = symbol_items(&value, path);
+                    if items.is_empty() {
+                        notice = Some("no symbols".into());
+                    } else {
+                        overlay = Some(Overlay::Picker {
+                            title: format!("Symbols ({})", items.len()),
+                            selected: first_selectable(&items),
+                            items,
+                            scroll: 0,
+                            rect: Rect::default(),
+                        });
                     }
                 }
+                NavEvent::Reply(kind, value, _) => {
+                    let targets = lsp::targets(&value);
+                    let root = current
+                        .as_ref()
+                        .and_then(nav_spec)
+                        .map(|spec| spec.root.clone())
+                        .unwrap_or_default();
+                    match (kind, targets.as_slice()) {
+                        (_, []) => {
+                            notice = Some(format!(
+                                "no {}",
+                                kind.label()
+                                    .to_lowercase()
+                                    .trim_start_matches("go to ")
+                                    .trim_start_matches("find ")
+                            ))
+                        }
+                        (NavKind::References, _) | (_, [_, _, ..]) => {
+                            let items = location_items(&targets, &root, read_snippet_source);
+                            overlay = Some(Overlay::Picker {
+                                title: format!(
+                                    "{} ({})",
+                                    kind.label()
+                                        .trim_start_matches("Go to ")
+                                        .trim_start_matches("Find "),
+                                    targets.len()
+                                ),
+                                selected: first_selectable(&items),
+                                items,
+                                scroll: 0,
+                                rect: Rect::default(),
+                            });
+                        }
+                        (_, [only]) => go_to(
+                            &mut nav,
+                            only,
+                            &mut current,
+                            &mut mode,
+                            &mut preview_load,
+                            control,
+                            &mut identity_pending,
+                            &mut notice,
+                        ),
+                    }
+                }
+            }
+        }
+        if let Some((receiver, at)) = &hover_render {
+            match receiver.try_recv() {
+                Ok(lines) => {
+                    let at = *at;
+                    hover_render = None;
+                    if !lines.is_empty() && overlay.is_none() {
+                        overlay = Some(Overlay::Hover {
+                            lines,
+                            at,
+                            shown: Instant::now(),
+                        });
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => hover_render = None,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        // A hover box times out on its own; a pointer resting on a cell asks
+        // for one once the server is idle.
+        if let Some(Overlay::Hover { shown, .. }) = &overlay
+            && shown.elapsed() > HOVER_TTL
+        {
+            overlay = None;
+        }
+        if overlay.is_none()
+            && hover_render.is_none()
+            && nav.ready()
+            && let Some((cell, since)) = last_motion
+            && since.elapsed() >= HOVER_DWELL
+            && hovered_cell != Some(cell)
+            && let (Some(request), ViewMode::Preview(doc)) = (current.as_ref(), &mode)
+        {
+            hovered_cell = Some(cell);
+            if let Some((line, col)) = doc.source_position_at(preview_body, cell.0, cell.1) {
+                nav.gesture(NavKind::Hover, request, doc, line, col, cell);
             }
         }
         let prompt_text = prompt.as_ref().map(Prompt::text);
@@ -2580,6 +3368,9 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                     matches!(current, Some(Request::File { .. })),
                     notice.as_deref().or(status.as_deref()),
                 );
+                if let Some(active) = overlay.as_mut() {
+                    draw_overlay(frame, active, preview_body);
+                }
             }
             ViewMode::Edit(editor) => {
                 (page, edit_width, edit_body) = draw_editor(frame, editor, theme, prompt_text);
@@ -2718,6 +3509,43 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                             }
                             (active, _) => prompt = Some(active),
                         }
+                    } else if let Some(active) = overlay
+                        .take()
+                        .filter(|o| !matches!(o, Overlay::Hover { .. }))
+                    {
+                        // A menu or picker owns the keyboard; a hover box is
+                        // simply gone (`take`) and the key goes on below.
+                        match overlay_key(active, key.code, page) {
+                            OverlayOutcome::Keep(kept) => overlay = Some(kept),
+                            OverlayOutcome::Close => {}
+                            OverlayOutcome::Nav(kind, (line, col), at) => {
+                                if let (Some(request), ViewMode::Preview(doc)) =
+                                    (current.as_ref(), &mode)
+                                {
+                                    notice = nav.gesture(kind, request, doc, line, col, at);
+                                }
+                            }
+                            OverlayOutcome::History(forward) => history_step(
+                                &mut nav,
+                                forward,
+                                &mut current,
+                                &mut mode,
+                                &mut preview_load,
+                                control,
+                                &mut identity_pending,
+                                &mut notice,
+                            ),
+                            OverlayOutcome::GoTo(target) => go_to(
+                                &mut nav,
+                                &target,
+                                &mut current,
+                                &mut mode,
+                                &mut preview_load,
+                                control,
+                                &mut identity_pending,
+                                &mut notice,
+                            ),
+                        }
                     } else {
                         match &mut mode {
                             ViewMode::Preview(doc) => {
@@ -2804,6 +3632,16 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                                         doc.pending_src = Some(doc.top_src());
                                         doc.wrap = !doc.wrap;
                                     }
+                                    KeyCode::Char('m') => {
+                                        let cell = nav.last_cell.unwrap_or((
+                                            preview_body.x + doc.gutter() as u16,
+                                            preview_body.y,
+                                        ));
+                                        match open_menu(&nav, doc, preview_body, cell) {
+                                            Ok(menu) => overlay = Some(menu),
+                                            Err(why) => notice = Some(why),
+                                        }
+                                    }
                                     // Ctrl+- arrives as 0x1F, which crossterm
                                     // reports as Ctrl+7; with Alt (ESC 0x1F)
                                     // it is forward.
@@ -2873,6 +3711,54 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                 Event::Mouse(mouse) => match &mut mode {
                     ViewMode::Preview(doc) => {
                         let max = doc.rows.len().saturating_sub(1);
+                        let cell = (mouse.column, mouse.row);
+                        if mouse.kind == MouseEventKind::Moved {
+                            if last_motion.is_none_or(|(c, _)| c != cell) {
+                                last_motion = Some((cell, Instant::now()));
+                            }
+                            if matches!(&overlay, Some(Overlay::Hover { at, .. }) if *at != cell) {
+                                overlay = None;
+                            }
+                        } else {
+                            // A click or the wheel dismisses a hover box.
+                            if matches!(overlay, Some(Overlay::Hover { .. })) {
+                                overlay = None;
+                            }
+                            last_motion = None;
+                            hovered_cell = None;
+                        }
+                        if let Some(active) = overlay.take() {
+                            match overlay_mouse(active, &mouse) {
+                                OverlayOutcome::Keep(kept) => overlay = Some(kept),
+                                OverlayOutcome::Close => {}
+                                OverlayOutcome::Nav(kind, (line, col), at) => {
+                                    if let Some(request) = current.as_ref() {
+                                        notice = nav.gesture(kind, request, doc, line, col, at);
+                                    }
+                                }
+                                OverlayOutcome::History(forward) => history_step(
+                                    &mut nav,
+                                    forward,
+                                    &mut current,
+                                    &mut mode,
+                                    &mut preview_load,
+                                    control,
+                                    &mut identity_pending,
+                                    &mut notice,
+                                ),
+                                OverlayOutcome::GoTo(target) => go_to(
+                                    &mut nav,
+                                    &target,
+                                    &mut current,
+                                    &mut mode,
+                                    &mut preview_load,
+                                    control,
+                                    &mut identity_pending,
+                                    &mut notice,
+                                ),
+                            }
+                            continue;
+                        }
                         match mouse.kind {
                             MouseEventKind::ScrollUp => doc.scroll = doc.scroll.saturating_sub(3),
                             MouseEventKind::ScrollDown => doc.scroll = (doc.scroll + 3).min(max),
@@ -2893,13 +3779,32 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                                         mouse.row,
                                     )
                                 {
-                                    notice =
-                                        nav.gesture(NavKind::Definition, request, doc, line, col);
+                                    notice = nav.gesture(
+                                        NavKind::Definition,
+                                        request,
+                                        doc,
+                                        line,
+                                        col,
+                                        cell,
+                                    );
                                 }
                             }
                             MouseEventKind::Drag(MouseButton::Left)
                             | MouseEventKind::Up(MouseButton::Left)
                                 if mouse.modifiers.contains(KeyModifiers::CONTROL) => {}
+                            // Right-click (herdr passes it through only with
+                            // its configured modifier): the navigation menu.
+                            MouseEventKind::Down(MouseButton::Right) => {
+                                nav.last_cell = Some(cell);
+                                match open_menu(&nav, doc, preview_body, cell) {
+                                    Ok(menu) => overlay = Some(menu),
+                                    Err(why) => notice = Some(why),
+                                }
+                            }
+                            MouseEventKind::Down(MouseButton::Left) => {
+                                nav.last_cell = Some(cell);
+                                doc.on_mouse(&mouse, preview_body);
+                            }
                             _ => doc.on_mouse(&mouse, preview_body),
                         }
                     }
@@ -4367,6 +5272,180 @@ mod tests {
         assert_eq!(doc.selection.cursor, selection.cursor);
         assert_eq!(doc.rows_key, rows_key);
         assert_eq!(doc.scroll, 1);
+    }
+
+    #[test]
+    fn menu_entries_are_gated_by_capabilities() {
+        let all = menu_entries(|_| true);
+        assert_eq!(
+            all,
+            vec![
+                MenuAction::Nav(NavKind::Definition),
+                MenuAction::Nav(NavKind::TypeDefinition),
+                MenuAction::Nav(NavKind::Implementation),
+                MenuAction::Nav(NavKind::References),
+                MenuAction::Nav(NavKind::Hover),
+                MenuAction::Nav(NavKind::Symbols),
+                MenuAction::Back,
+                MenuAction::Forward,
+            ]
+        );
+        let basic = menu_entries(|_| false);
+        assert_eq!(basic.len(), 6);
+        assert!(!basic.contains(&MenuAction::Nav(NavKind::TypeDefinition)));
+        assert_eq!(
+            MenuAction::Nav(NavKind::References).label(),
+            "Find References"
+        );
+    }
+
+    #[test]
+    fn location_items_group_by_file_with_snippets_and_a_cap() {
+        let target = |path: &str, line: usize| lsp::Target {
+            path: PathBuf::from(path),
+            line,
+            character: 0,
+        };
+        let targets = vec![
+            target("/r/src/b.rs", 4),
+            target("/r/src/a.rs", 9),
+            target("/r/src/b.rs", 1),
+            target("/elsewhere/c.rs", 0),
+        ];
+        let read = |path: &Path| {
+            Some(match path.to_str().unwrap() {
+                "/r/src/a.rs" => "0\n1\n2\n3\n4\n5\n6\n7\n8\n   let nine = 9;  \n".to_string(),
+                "/r/src/b.rs" => "zero\n\tone\ntwo\nthree\nfour\n".to_string(),
+                _ => return None,
+            })
+        };
+        let items = location_items(&targets, Path::new("/r"), read);
+        let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            vec![
+                "/elsewhere/c.rs",
+                "  1: ",
+                "src/a.rs",
+                "  10: let nine = 9;",
+                "src/b.rs",
+                "  2: one",
+                "  5: four",
+            ]
+        );
+        assert!(items[0].target.is_none());
+        assert_eq!(items[3].target.as_ref().unwrap().line, 9);
+        assert_eq!(first_selectable(&items), 1);
+        assert_eq!(picker_step(&items, 1, 1), 3);
+        assert_eq!(picker_step(&items, 3, 1), 5);
+        assert_eq!(picker_step(&items, 5, -1), 3);
+        assert_eq!(picker_step(&items, 1, -1), 1);
+        assert_eq!(picker_step(&items, 6, 1), 6);
+
+        let many: Vec<lsp::Target> = (0..PICKER_CAP + 7).map(|i| target("/r/x.rs", i)).collect();
+        let items = location_items(&many, Path::new("/r"), |_| None);
+        assert_eq!(items.len(), PICKER_CAP + 2);
+        assert_eq!(items.last().unwrap().label, "+7 more");
+        assert!(items.last().unwrap().target.is_none());
+    }
+
+    #[test]
+    fn symbol_items_flatten_both_result_shapes() {
+        let nested = serde_json::json!([
+            {"name": "Doc", "kind": 23, "range": {"start": {"line": 10, "character": 0}, "end": {"line": 30, "character": 1}},
+             "selectionRange": {"start": {"line": 10, "character": 7}, "end": {"line": 10, "character": 10}},
+             "children": [
+                {"name": "relayout", "kind": 6, "selectionRange": {"start": {"line": 12, "character": 7}, "end": {"line": 12, "character": 15}}, "range": {"start": {"line": 12, "character": 0}, "end": {"line": 14, "character": 1}}}
+             ]},
+            {"name": "run", "kind": 12, "selectionRange": {"start": {"line": 40, "character": 7}, "end": {"line": 40, "character": 10}}, "range": {"start": {"line": 40, "character": 0}, "end": {"line": 90, "character": 1}}}
+        ]);
+        let items = symbol_items(&nested, Path::new("/r/a.rs"));
+        let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(labels, vec!["Doc  struct", "  relayout  fn", "run  fn"]);
+        assert_eq!(items[1].target.as_ref().unwrap().line, 12);
+        assert_eq!(
+            items[1].target.as_ref().unwrap().path,
+            PathBuf::from("/r/a.rs")
+        );
+        let flat = serde_json::json!([
+            {"name": "main", "kind": 12, "location": {"uri": "file:///r/b.rs", "range": {"start": {"line": 3, "character": 0}, "end": {"line": 3, "character": 4}}}},
+            {"name": "X", "kind": 99, "location": {"uri": "file:///r/b.rs", "range": {"start": {"line": 8, "character": 0}, "end": {"line": 8, "character": 1}}}}
+        ]);
+        let items = symbol_items(&flat, Path::new("/r/a.rs"));
+        assert_eq!(items[0].label, "main  fn");
+        assert_eq!(
+            items[0].target.as_ref().unwrap().path,
+            PathBuf::from("/r/b.rs")
+        );
+        assert_eq!(items[1].label, "X");
+        assert!(symbol_items(&serde_json::Value::Null, Path::new("/r/a.rs")).is_empty());
+    }
+
+    #[test]
+    fn hover_contents_normalise_to_markdown_and_fences_strip() {
+        let markup = serde_json::json!({"contents": {"kind": "markdown", "value": "```rust\nfn a()\n```\n\nDoc."}});
+        assert_eq!(
+            hover_markdown(&markup).unwrap(),
+            "```rust\nfn a()\n```\n\nDoc."
+        );
+        let marked =
+            serde_json::json!({"contents": [{"language": "rust", "value": "fn a()"}, "Doc."]});
+        assert_eq!(
+            hover_markdown(&marked).unwrap(),
+            "```rust\nfn a()\n```\n\nDoc."
+        );
+        let plain = serde_json::json!({"contents": "just text"});
+        assert_eq!(hover_markdown(&plain).unwrap(), "just text");
+        assert_eq!(hover_markdown(&serde_json::json!({"contents": []})), None);
+        assert_eq!(hover_markdown(&serde_json::Value::Null), None);
+        let lines = strip_fences("```rust\nfn a()\n```\n\nDoc.");
+        let texts: Vec<String> = lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        assert_eq!(texts, vec!["fn a()", "", "Doc."]);
+    }
+
+    #[test]
+    fn overlay_menu_keys_and_clicks() {
+        let menu = || Overlay::Menu {
+            at: (5, 5),
+            pos: (3, 4),
+            entries: menu_entries(|_| false),
+            selected: 0,
+            rect: Rect::new(5, 6, 24, 8),
+        };
+        assert!(matches!(
+            overlay_key(menu(), KeyCode::Esc, 10),
+            OverlayOutcome::Close
+        ));
+        let OverlayOutcome::Keep(moved) = overlay_key(menu(), KeyCode::Char('j'), 10) else {
+            panic!()
+        };
+        let OverlayOutcome::Nav(kind, pos, at) = overlay_key(moved, KeyCode::Enter, 10) else {
+            panic!()
+        };
+        assert_eq!((kind, pos, at), (NavKind::References, (3, 4), (5, 5)));
+        // Click on the last row (Forward), inside the border.
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 7,
+            row: 6 + 1 + 5,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert!(matches!(
+            overlay_mouse(menu(), &click),
+            OverlayOutcome::History(true)
+        ));
+        let outside = MouseEvent {
+            column: 1,
+            row: 1,
+            ..click
+        };
+        assert!(matches!(
+            overlay_mouse(menu(), &outside),
+            OverlayOutcome::Close
+        ));
     }
 
     #[test]

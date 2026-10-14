@@ -749,6 +749,13 @@ HACKING.md — budget time for that before promising a patched build.
     `Ctrl+Alt+-` as the same with ALT (ESC 0x1F); `Ctrl+Shift+-` is byte-identical to `Ctrl+-` and
     must not be used. Every document change pushes the previous (request, scroll) onto the back
     history, sidebar clicks included; forward clears on push; cap 50 (`lsp::History`).
+    **Mouse back/forward buttons (xterm buttons 8/9, SGR `cb` 128/129) cannot be bound** (asked
+    2026-10-13, checked from source): Ghostty 1.3.1 does emit them (macOS buttonNumber 3/4 →
+    `.eight`/`.nine` → 128/129), but herdr 0.9.3's client parser `raw_input.rs::parse_mouse_cb`
+    returns `None` for a press of button 8/9 and its wire `ClientMouseButton` has only
+    Left/Right/Middle, so the pane never sees them; and crossterm 0.29 (master too) `parse_cb`
+    errors on any button > 7 and the unix reader clears the buffer, so even `pane.send_input`
+    `ESC[<128;x;yM` is swallowed before the app. Needs herdr + crossterm changes first.
   - Tests: `lsp::fake` is a language server over `std::io::pipe` (Rust ≥ 1.87; the crate floor is
     1.89) that answers the six methods and issues the server→client traffic; the client is driven
     against it hermetically. Live checks go through `pane.send_input` with SGR mouse sequences

@@ -54,6 +54,7 @@ image = { version = "0.25", default-features = false, features = [
     "tiff",
     "webp",
 ] }
+notify = "8.2.0"
 
 # Raw euid() for scoping private runtime directories (rundir.rs) to the
 # owning user; already present transitively, so this adds no new download.

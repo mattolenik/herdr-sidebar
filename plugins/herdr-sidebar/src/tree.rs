@@ -1,10 +1,16 @@
 //! Filesystem tree model: which directories are expanded, and the flat list of
-//! visible rows the UI renders. Directory listings are cached and re-read only on
-//! explicit refresh, so redraws never touch the disk.
+//! visible rows the UI renders. Directory listings are cached so redraws never
+//! touch the disk; a non-recursive `notify` watch on the root and every expanded
+//! directory evicts a listing when something inside it is created, removed or
+//! renamed (`drain_events`).
 
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Receiver};
+
+use notify::event::{EventKind, ModifyKind};
+use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Entry {
@@ -29,16 +35,85 @@ pub struct Tree {
     expanded: BTreeSet<PathBuf>,
     cache: HashMap<PathBuf, Vec<Entry>>,
     pub show_hidden: bool,
+    /// `None` when the platform watcher could not be created; the tree then
+    /// only re-reads on explicit refresh and when a folder is opened.
+    watcher: Option<RecommendedWatcher>,
+    events: Receiver<notify::Result<notify::Event>>,
+    /// Directories currently watched: the root plus the expanded set.
+    watched: BTreeSet<PathBuf>,
 }
 
 impl Tree {
     pub fn new(root: PathBuf) -> Self {
-        Self {
+        let (tx, events) = mpsc::channel();
+        let watcher = notify::recommended_watcher(tx).ok();
+        let mut tree = Self {
             root,
             expanded: BTreeSet::new(),
             cache: HashMap::new(),
             show_hidden: true,
+            watcher,
+            events,
+            watched: BTreeSet::new(),
+        };
+        tree.sync_watches();
+        tree
+    }
+
+    /// Keep the OS watch set equal to root + expanded. Non-recursive on
+    /// purpose: a recursive watch would walk `target/`/`node_modules/` and
+    /// exhaust inotify's per-user watch budget across preview-tab sidebars.
+    fn sync_watches(&mut self) {
+        let Some(watcher) = self.watcher.as_mut() else {
+            return;
+        };
+        let mut wanted = self.expanded.clone();
+        wanted.insert(self.root.clone());
+        for gone in self.watched.difference(&wanted) {
+            let _ = watcher.unwatch(gone);
         }
+        self.watched.retain(|dir| wanted.contains(dir));
+        for dir in wanted
+            .difference(&self.watched)
+            .cloned()
+            .collect::<Vec<_>>()
+        {
+            // Failures (deleted dir, watch limit) are retried on the next
+            // expansion change; the folder still re-reads when reopened.
+            if watcher.watch(&dir, RecursiveMode::NonRecursive).is_ok() {
+                self.watched.insert(dir);
+            }
+        }
+    }
+
+    /// Apply queued filesystem events: evict the listing of every directory
+    /// whose entries changed. Returns whether any listing was dropped, i.e.
+    /// whether the rows need rebuilding. Cheap when idle, so call it every tick.
+    pub fn drain_events(&mut self) -> bool {
+        let mut changed = false;
+        for event in self.events.try_iter().flatten() {
+            if !changes_listing(&event.kind) {
+                continue;
+            }
+            for path in &event.paths {
+                // The entry's parent lists it; the path itself may be a
+                // directory whose own listing is now gone.
+                let hit = path
+                    .parent()
+                    .is_some_and(|dir| self.cache.remove(dir).is_some())
+                    | self.cache.remove(path).is_some();
+                if hit {
+                    changed = true;
+                } else if !path.starts_with(&self.root) && !self.cache.is_empty() {
+                    // FSEvents reports canonical paths (`/private/tmp` for
+                    // `/tmp`); when they do not map onto our keys, re-read
+                    // everything displayed rather than miss the change.
+                    self.cache.clear();
+                    changed = true;
+                }
+            }
+        }
+        changed
     }
 
     /// The workspace root directory the tree is rooted at.
@@ -78,24 +153,37 @@ impl Tree {
             .filter(|p| p.starts_with(&self.root))
             .collect();
         self.cache.clear();
+        self.sync_watches();
     }
 
+    /// Opening a folder always re-reads it: collapsed folders are not watched,
+    /// so a listing cached from an earlier expansion may be stale.
     pub fn expand(&mut self, path: &Path) {
-        self.expanded.insert(path.to_path_buf());
+        if self.expanded.insert(path.to_path_buf()) {
+            self.cache.remove(path);
+            self.sync_watches();
+        }
     }
 
     pub fn collapse(&mut self, path: &Path) {
-        self.expanded.remove(path);
+        if self.expanded.remove(path) {
+            self.cache.remove(path);
+            self.sync_watches();
+        }
     }
 
     /// Collapse every expanded directory (the title bar's Collapse All).
     pub fn collapse_all(&mut self) {
         self.expanded.clear();
+        self.cache.clear();
+        self.sync_watches();
     }
 
     pub fn toggle(&mut self, path: &Path) {
-        if !self.expanded.remove(path) {
-            self.expanded.insert(path.to_path_buf());
+        if self.expanded.contains(path) {
+            self.collapse(path);
+        } else {
+            self.expand(path);
         }
     }
 
@@ -160,6 +248,19 @@ impl Tree {
 }
 
 /// VS Code Explorer order: directories first, then files, each case-insensitive.
+/// Only events that add, remove or rename an entry change a listing; content
+/// saves and metadata touches are far more frequent and change nothing shown.
+fn changes_listing(kind: &EventKind) -> bool {
+    matches!(
+        kind,
+        EventKind::Create(_)
+            | EventKind::Remove(_)
+            | EventKind::Modify(ModifyKind::Name(_) | ModifyKind::Any)
+            | EventKind::Any
+            | EventKind::Other
+    )
+}
+
 pub fn sort_entries(entries: &mut [Entry]) {
     entries.sort_by(|a, b| {
         b.is_dir
@@ -303,6 +404,68 @@ mod tests {
         assert_eq!(tree.rows().len(), 1, "cached listing must not re-read disk");
         tree.refresh();
         assert_eq!(tree.rows().len(), 2);
+    }
+
+    #[test]
+    fn reopening_a_folder_rereads_it() {
+        let tmp = TempDir::new("reopen");
+        tmp.mkdir("src");
+        let src = tmp.0.join("src");
+        let mut tree = Tree::new(tmp.0.clone());
+        tree.toggle(&src);
+        assert_eq!(tree.rows().len(), 1);
+        tree.toggle(&src);
+        fs::File::create(src.join("new.rs")).unwrap();
+        tree.toggle(&src);
+        assert_eq!(tree.rows().len(), 2, "reopened folder shows the new file");
+    }
+
+    /// Poll `drain_events` until it reports a change or the deadline passes.
+    fn wait_for_change(tree: &mut Tree) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            if tree.drain_events() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        false
+    }
+
+    #[test]
+    fn watcher_picks_up_creates_and_deletes_in_expanded_dirs() {
+        let tmp = TempDir::new("watch");
+        tmp.mkdir("src");
+        let src = tmp.0.join("src");
+        let mut tree = Tree::new(tmp.0.clone());
+        tree.expand(&src);
+        assert_eq!(tree.rows().len(), 1);
+        assert!(!tree.drain_events(), "idle tree reports no change");
+
+        fs::File::create(src.join("new.rs")).unwrap();
+        assert!(wait_for_change(&mut tree), "create in expanded dir");
+        assert_eq!(tree.rows().len(), 2);
+
+        fs::remove_file(src.join("new.rs")).unwrap();
+        assert!(wait_for_change(&mut tree), "delete in expanded dir");
+        assert_eq!(tree.rows().len(), 1);
+
+        tmp.touch("root.txt");
+        assert!(wait_for_change(&mut tree), "create in root");
+        assert_eq!(tree.rows().len(), 2);
+    }
+
+    #[test]
+    fn collapsed_dirs_are_not_watched() {
+        let tmp = TempDir::new("unwatched");
+        tmp.mkdir("src");
+        let src = tmp.0.join("src");
+        let mut tree = Tree::new(tmp.0.clone());
+        tree.expand(&src);
+        tree.collapse(&src);
+        let _ = tree.rows();
+        let _ = tree.drain_events();
+        assert_eq!(tree.watched.len(), 1, "only the root stays watched");
     }
 
     #[cfg(unix)]

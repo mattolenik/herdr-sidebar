@@ -592,6 +592,18 @@ HACKING.md — budget time for that before promising a patched build.
   List AUTO-SCROLLS to keep its selection visible, which fights wheel-scrolling — both
   views therefore window their rows manually (selected/scroll/snap fields) and render
   a plain List of the visible slice.
+- Explorer directory listings are cached (`tree.rs`) and kept current by a `notify` watcher
+  (inotify / FSEvents / ReadDirectoryChangesW) with NON-recursive watches on the root plus every
+  expanded directory — the same set as the cache. `Tree::drain_events` runs on every tick and
+  evicts the listing of each affected directory; only create/remove/rename kinds count, content
+  saves are ignored. Opening a folder always re-reads it because collapsed folders are unwatched.
+  Before this, the tree only refreshed when something else happened to clear the cache (an
+  expansion change synced from another tab), so it "sometimes" updated. Not recursive on purpose:
+  inotify's per-user watch budget is shared across every preview-tab sidebar. Known gaps: SMB/NFS
+  and WSL-mounted Windows paths emit no events (use Refresh / reopen the folder); a Windows watch
+  holds a handle on the directory, so deleting a watched folder's parent from outside may fail —
+  verify live on Windows before a release. FSEvents reports canonical paths (`/private/tmp`); a
+  path that maps onto no cache key clears the whole cache instead of being dropped.
 - A single left-click anywhere on an Explorer folder row expands/collapses it; the chevron is
   not the only mouse target. Suppress the second click on the folder name inside the 450ms
   double-click window so the first toggle is not immediately undone, while repeated explicit

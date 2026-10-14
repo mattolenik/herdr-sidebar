@@ -57,7 +57,7 @@ struct DecorationRefresh {
 }
 
 fn ignored_scan_due(backoff_until: Option<std::time::Instant>, now: std::time::Instant) -> bool {
-    !backoff_until.is_some_and(|until| now < until)
+    backoff_until.is_none_or(|until| now >= until)
 }
 
 /// Handle for resizing our own pane through the herdr socket API.
@@ -532,6 +532,10 @@ impl App {
     /// the sidebar (an agent editing files, a commit in another pane) show up
     /// on their own. Self-throttling, so the event loop may call it freely.
     pub fn tick(&mut self) {
+        if self.tree.drain_events() {
+            self.invalidate_quick_index();
+            self.rebuild();
+        }
         self.sync_shared_settings();
         self.sync_shared_tree();
         self.collect_quick_index();

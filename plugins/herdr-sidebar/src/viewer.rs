@@ -3801,6 +3801,21 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                                     Err(why) => notice = Some(why),
                                 }
                             }
+                            // The mouse's side buttons (xterm 8/9) step the
+                            // navigation history like Ctrl+- / Ctrl+Alt+-.
+                            MouseEventKind::Down(MouseButton::Back)
+                            | MouseEventKind::Down(MouseButton::Forward) => history_step(
+                                &mut nav,
+                                mouse.kind == MouseEventKind::Down(MouseButton::Forward),
+                                &mut current,
+                                &mut mode,
+                                &mut preview_load,
+                                control,
+                                &mut identity_pending,
+                                &mut notice,
+                            ),
+                            MouseEventKind::Up(MouseButton::Back)
+                            | MouseEventKind::Up(MouseButton::Forward) => {}
                             MouseEventKind::Down(MouseButton::Left) => {
                                 nav.last_cell = Some(cell);
                                 doc.on_mouse(&mouse, preview_body);

@@ -83,6 +83,7 @@ A code preview talks to a real language server, so navigation is semantic:
 | Ctrl+right click, or `m` | Menu: Go to Definition, Type Definition / Implementation (when the server has them), Find References, Hover, Document Symbols, Back, Forward |
 | pointer resting on a symbol | Hover documentation in a floating box (rendered by `leaf` when installed) |
 | `Ctrl+-` / `Ctrl+Alt+-` | Back / forward through everything the pane showed, sidebar clicks included |
+| mouse back / forward buttons | The same history steps (xterm buttons 8/9; the terminal and herdr must forward them) |
 
 Jumps stay in the same preview pane, whatever file they land in. Results are only available on
 the plain source view (not on rendered previews, diffs, or files over the viewer's size caps).

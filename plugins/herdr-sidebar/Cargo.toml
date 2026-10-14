@@ -66,3 +66,11 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_JobObjects",
     "Win32_System_Threading",
 ] }
+
+# crossterm 0.29 drops xterm mouse buttons 8/9 (a mouse's side "back" and
+# "forward" buttons) inside its parser, so the app never sees an event. This
+# is the 0.29 tag plus `MouseButton::Back` / `MouseButton::Forward`, which the
+# preview viewer binds to navigation history. Drop the patch once a crossterm
+# release carries the change.
+[patch.crates-io]
+crossterm = { git = "https://github.com/mattolenik/crossterm", rev = "3d380843ff31f915aefc2c43967ad9d4edc9335d" }

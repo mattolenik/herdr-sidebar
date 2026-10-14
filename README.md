@@ -58,7 +58,7 @@ Use the mouse or press `1`, `2`, and `3`.
   globally or per project.
 - IDE-style code navigation in code previews through a real language server: Ctrl+click a
   symbol for its definition, Ctrl+right-click or `m` for references, hover, symbols, and
-  `Ctrl+-` / `Ctrl+Alt+-` to go back and forward. Needs the [lspmux](https://codeberg.org/p2502/lspmux)
+  `Ctrl+-` / `Ctrl+Alt+-` or the mouse's back/forward buttons to step through history. Needs the [lspmux](https://codeberg.org/p2502/lspmux)
   service; every preview tab shares one server per workspace.
 - Press `e` in a text preview for the experimental editor with selection, find,
   clipboard actions, explicit save, and external-change protection.
@@ -131,7 +131,8 @@ Preview: drag to select, `Ctrl/Cmd+C` to copy, arrows/PageUp/PageDown or
 Space/`b` to scroll, `w` to toggle wrapping, and `q` or Esc to close. In a code preview
 with a language server: Ctrl+click goes to the definition, `m` or Ctrl+right-click opens
 the navigation menu, `Ctrl+-` goes back and `Ctrl+Alt+-` forward (on macOS, Option must
-act as Alt: Ghostty `macos-option-as-alt = true`).
+act as Alt: Ghostty `macos-option-as-alt = true`). A mouse's side back/forward buttons do
+the same when the terminal and herdr forward them.
 
 Host keybindings can invoke the direct `show-explorer`, `show-search`, `show-git`, and
 `quick-open` actions. For example, bind `cmd+p` to:

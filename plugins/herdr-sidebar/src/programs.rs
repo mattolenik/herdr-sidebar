@@ -102,7 +102,7 @@ roots = ["compile_commands.json", ".clangd"]
 command = "clangd --background-index"
 
 [[lsp]]
-patterns = ["*.ts", "*.tsx", "*.js", "*.jsx"]
+patterns = ["*.ts", "*.tsx", "*.mts", "*.js", "*.jsx", "*.mjs"]
 roots = ["tsconfig.json", "package.json"]
 command = ["tsgo --lsp --stdio", "typescript-language-server --stdio"]
 

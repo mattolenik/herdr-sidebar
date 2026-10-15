@@ -738,7 +738,9 @@ HACKING.md — budget time for that before promising a patched build.
     response** (`instance.rs` "first server message was not initialize response"); TypeScript 7's
     native `tsc --lsp --stdio` sends a `window/logMessage` first and an initialize ERROR response
     counts as "not a response" too, so both hang the shim (no reply ever, our 60 s timeout) rather
-    than failing. lspmux `main` already ignores pre-response messages; until a release ships it,
+    than failing. lspmux `main` already ignores pre-response messages (verified 2026-10-14 with a
+    `main` build on a private socket: `tsc --lsp --stdio` initialized; an initialize ERROR
+    response still hangs; `main` still calls itself 0.3.0); until a release ships it,
     TypeScript needs lspmux built from source. Homebrew `typescript` 7.x ships no `tsserver.js`,
     so `typescript-language-server` cannot work against it — hence `tsc --lsp --stdio` is seeded
     between `tsgo` and `typescript-language-server`.

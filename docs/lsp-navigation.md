@@ -385,6 +385,8 @@ rules.
   handshake, which demands that the FIRST server message be the initialize response: `tsc`
   sends a `window/logMessage` notification first, and the error response is not a success.
   lspmux `main` (post-0.3.0, `instance.rs` "ignoring message while waiting for initialize
-  response") tolerates the notification, so TypeScript needs lspmux built from `main` until the
-  next release. lspmux then leaves the shim connected without a reply, so the viewer reports
+  response") tolerates the notification — verified with a `main` build on a private socket:
+  `tsc --lsp --stdio` initialized (server "typescript-go" 7.0.2, utf-16) while the error
+  response from typescript-language-server was still ignored forever. `main` still reports
+  version 0.3.0. TypeScript needs lspmux built from `main` until the next release. lspmux then leaves the shim connected without a reply, so the viewer reports
   "no answer after 60 s" rather than a failure.

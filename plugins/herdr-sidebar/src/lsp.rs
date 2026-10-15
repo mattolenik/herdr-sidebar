@@ -543,7 +543,10 @@ impl Client {
             .unwrap_or_default();
         let params = json!({
             "processId": std::process::id(),
-            "clientInfo": {"name": "herdr-sidebar"},
+            // Always send a version: lspmux re-serialises clientInfo with
+            // `version: null` when it is absent, and typescript-go's strict
+            // JSON decoder rejects null for that string (InvalidParams).
+            "clientInfo": {"name": "herdr-sidebar", "version": env!("CARGO_PKG_VERSION")},
             "rootUri": root_uri,
             "workspaceFolders": [{"uri": root_uri, "name": name}],
             "capabilities": {

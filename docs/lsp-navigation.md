@@ -388,5 +388,11 @@ rules.
   response") tolerates the notification — verified with a `main` build on a private socket:
   `tsc --lsp --stdio` initialized (server "typescript-go" 7.0.2, utf-16) while the error
   response from typescript-language-server was still ignored forever. `main` still reports
-  version 0.3.0. TypeScript needs lspmux built from `main` until the next release. lspmux then leaves the shim connected without a reply, so the viewer reports
+  version 0.3.0. TypeScript needs lspmux built from `main` until the next release.
+  With `main` live, `tsc` then rejected our `initialize` with InvalidParams at
+  `/clientInfo/version`: we sent `clientInfo: {name}` and lspmux re-serialised it with
+  `version: null`, which typescript-go's strict decoder refuses. The client now always sends
+  `version` (verified: initialize ok through a private `main` server, InvalidParams without
+  it). A hung handshake also wedges lspmux for every other client, because the daemon holds its
+  instance lock while waiting (its own FIXME); restart the service to clear one. lspmux then leaves the shim connected without a reply, so the viewer reports
   "no answer after 60 s" rather than a failure.

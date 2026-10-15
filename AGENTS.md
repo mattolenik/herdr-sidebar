@@ -741,7 +741,12 @@ HACKING.md — budget time for that before promising a patched build.
     than failing. lspmux `main` already ignores pre-response messages (verified 2026-10-14 with a
     `main` build on a private socket: `tsc --lsp --stdio` initialized; an initialize ERROR
     response still hangs; `main` still calls itself 0.3.0); until a release ships it,
-    TypeScript needs lspmux built from source. Homebrew `typescript` 7.x ships no `tsserver.js`,
+    TypeScript needs lspmux built from source (`brew install --HEAD lspmux` after uninstalling
+    stable; the service runs `opt_bin`, so no service edit). **Always send
+    `clientInfo.version`**: lspmux re-serialises the first client's `clientInfo` with
+    `version: null` when absent, typescript-go rejects that with InvalidParams, and because lspmux
+    holds its instance lock for the whole handshake the hung instance then blocks EVERY new
+    client until the daemon restarts (verified both ways against a private `main` server). Homebrew `typescript` 7.x ships no `tsserver.js`,
     so `typescript-language-server` cannot work against it — hence `tsc --lsp --stdio` is seeded
     between `tsgo` and `typescript-language-server`.
   - Position encoding comes from the `initialize` RESULT (lspmux replays the first client's

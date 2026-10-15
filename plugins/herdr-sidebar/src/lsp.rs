@@ -226,11 +226,29 @@ pub struct Transport {
     writer: Box<dyn Write + Send>,
     incoming: Receiver<Value>,
     child: Option<std::process::Child>,
+    /// The shim's last stderr lines (bounded), so a connection that closes
+    /// during the handshake can say why instead of just "closed".
+    stderr: std::sync::Arc<std::sync::Mutex<String>>,
+}
+
+/// How much of the shim's stderr to keep.
+const STDERR_TAIL: usize = 2048;
+
+/// The shim's argument vector after `lspmux client`: the absolute server path,
+/// then `--` so clap hands the server's own flags (`--stdio`,
+/// `--background-index`) through instead of rejecting them as its own.
+fn shim_args(server: &Path, server_args: &[String]) -> Vec<std::ffi::OsString> {
+    let mut args: Vec<std::ffi::OsString> = vec!["--server-path".into(), server.into()];
+    if !server_args.is_empty() {
+        args.push("--".into());
+        args.extend(server_args.iter().map(Into::into));
+    }
+    args
 }
 
 impl Transport {
-    /// Spawn `lspmux client --server-path <server> <args…>` for `spec`, cwd
-    /// at the workspace root, with the scrubbed environment.
+    /// Spawn `lspmux client --server-path <server> -- <args…>` for `spec`,
+    /// cwd at the workspace root, with the scrubbed environment.
     pub fn spawn(spec: &LspSpec) -> io::Result<Transport> {
         let argv = crate::actions::split_editor_command(&spec.command)?;
         let Some(server) = argv.first() else {
@@ -248,15 +266,13 @@ impl Transport {
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "lspmux is not on PATH"))?;
         let mut child = std::process::Command::new(lspmux)
             .arg("client")
-            .arg("--server-path")
-            .arg(&server)
-            .args(&argv[1..])
+            .args(shim_args(&server, &argv[1..]))
             .current_dir(&spec.root)
             .env_clear()
             .envs(shim_env())
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
             .spawn()?;
         let stdin = child
             .stdin
@@ -266,7 +282,38 @@ impl Transport {
             .stdout
             .take()
             .ok_or_else(|| io::Error::other("stdout unavailable"))?;
-        Ok(Self::from_io(stdout, stdin, Some(child)))
+        let stderr = child.stderr.take();
+        let transport = Self::from_io(stdout, stdin, Some(child));
+        if let Some(stderr) = stderr {
+            let tail = transport.stderr.clone();
+            std::thread::spawn(move || {
+                for line in io::BufReader::new(stderr).lines().map_while(Result::ok) {
+                    let mut tail = tail.lock().unwrap_or_else(|e| e.into_inner());
+                    tail.push_str(line.trim_end());
+                    tail.push('\n');
+                    // Drop whole leading lines until the tail fits.
+                    while tail.len() > STDERR_TAIL {
+                        match tail.find('\n') {
+                            Some(end) => {
+                                tail.drain(..=end);
+                            }
+                            None => tail.clear(),
+                        }
+                    }
+                }
+            });
+        }
+        Ok(transport)
+    }
+
+    /// "connection closed", plus the shim's last stderr line when it said
+    /// anything (clap rejecting a server flag, lspmux refusing a server).
+    fn closed_reason(&self) -> String {
+        let tail = self.stderr.lock().unwrap_or_else(|e| e.into_inner());
+        match tail.lines().rev().find(|line| !line.trim().is_empty()) {
+            Some(line) => format!("language server connection closed: {line}"),
+            None => "language server connection closed".into(),
+        }
     }
 
     /// Build a transport over any reader/writer pair (tests use
@@ -293,6 +340,7 @@ impl Transport {
             writer: Box::new(writer),
             incoming,
             child,
+            stderr: Default::default(),
         }
     }
 
@@ -467,6 +515,12 @@ impl Client {
         self.dead
     }
 
+    /// Why the connection is closed, with the shim's last stderr line when
+    /// it left one.
+    pub fn closed_reason(&self) -> String {
+        self.transport.closed_reason()
+    }
+
     /// The most recent progress item still running, for the footer.
     pub fn progress(&self) -> Option<&Progress> {
         self.progress.values().next()
@@ -535,7 +589,7 @@ impl Client {
                 Err(mpsc::TryRecvError::Empty) => {}
             }
             if self.dead {
-                return Err("language server connection closed".into());
+                return Err(self.transport.closed_reason());
             }
             if Instant::now() >= deadline {
                 return Err(format!("no answer after {} s", timeout.as_secs()));
@@ -583,7 +637,7 @@ impl Client {
         let message = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
         if self.transport.send(&message).is_err() {
             self.dead = true;
-            let _ = sender.send(Err("language server connection closed".into()));
+            let _ = sender.send(Err(self.transport.closed_reason()));
         } else {
             self.pending.insert(id, sender);
         }
@@ -649,8 +703,9 @@ impl Client {
                 Err(mpsc::TryRecvError::Empty) => return,
                 Err(mpsc::TryRecvError::Disconnected) => {
                     self.dead = true;
+                    let reason = self.transport.closed_reason();
                     for (_, sender) in self.pending.drain() {
-                        let _ = sender.send(Err("language server connection closed".into()));
+                        let _ = sender.send(Err(reason.clone()));
                     }
                     return;
                 }
@@ -974,6 +1029,25 @@ pub(crate) mod fake {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shim_args_separate_server_flags_from_lspmux_flags() {
+        let server = Path::new("/opt/homebrew/bin/typescript-language-server");
+        assert_eq!(
+            shim_args(server, &["--stdio".to_string()]),
+            ["--server-path", server.to_str().unwrap(), "--", "--stdio"]
+                .map(std::ffi::OsString::from)
+                .to_vec(),
+            "clap would otherwise reject --stdio as an unknown lspmux flag"
+        );
+        assert_eq!(
+            shim_args(server, &[]),
+            ["--server-path", server.to_str().unwrap()]
+                .map(std::ffi::OsString::from)
+                .to_vec(),
+            "no separator without server arguments keeps the instance key as before"
+        );
+    }
 
     const WAIT: Duration = Duration::from_secs(5);
 

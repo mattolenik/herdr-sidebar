@@ -87,7 +87,7 @@ command = "clangd --background-index"
 [[lsp]]
 patterns = ["*.ts", "*.tsx", "*.mts", "*.js", "*.jsx", "*.mjs"]
 roots = ["tsconfig.json", "package.json"]
-command = ["tsgo --lsp --stdio", "typescript-language-server --stdio"]
+command = ["tsgo --lsp --stdio", "tsc --lsp --stdio", "typescript-language-server --stdio"]
 
 [[lsp]]
 patterns = ["*.py"]
@@ -97,7 +97,8 @@ command = ["ty server", "basedpyright-langserver --stdio", "pyright-langserver -
 
 - `command` is a string or a preference-ordered list; the first program on PATH wins
   (`programs::resolve_program`, unchanged). The resolved entry is the language server,
-  never the shim: the viewer wraps it as `lspmux client --server-path <argv0> <args…>`.
+  never the shim: the viewer wraps it as `lspmux client --server-path <argv0> -- <args…>` (the `--` keeps
+  clap from claiming server flags such as `--stdio`).
   (Verify during implementation that `lspmux client` forwards trailing arguments to
   the server; its README wrapper example passes `$@`, so it should.)
 - Placeholders: none. Servers take no file argument; the workspace is sent in
@@ -336,7 +337,9 @@ commit, Phase 0 being the live verification list below.
 
 ## Resolved from lspmux's source (0.3.x)
 
-- `lspmux client --server-path X args…` forwards trailing arguments to the server
+- `lspmux client --server-path X -- args…` forwards trailing arguments to the server; without
+  the `--`, clap rejects `--stdio` as an unknown lspmux flag and the shim exits 2 (bit live
+  with typescript-language-server: the viewer saw only "connection closed")
   (`SERVER_ARGS`), so rules may carry `--background-index` / `--stdio`. Server path,
   arguments, environment and workspace root form the instance key.
 - Server→client requests are not dropped: `window/workDoneProgress/create` and
@@ -375,3 +378,13 @@ rules.
   symbols picker (118 entries) all worked.
 - `tsgo` and `ty` are not installed on this machine; their seeded invocations
   (`tsgo --lsp --stdio`, `ty server`) follow their READMEs and are unverified.
+- TypeScript, probed 2026-10-14 on this host: Homebrew `typescript` is 7.0.2, whose binary is
+  the native `tsc` (no `tsserver.js` anywhere), so `typescript-language-server` 6.0.2 answers
+  `initialize` with the error "Could not find a valid TypeScript installation" and `tsc --lsp
+  --stdio` (now the second seeded candidate) is the working server. Both trip lspmux 0.3.0's
+  handshake, which demands that the FIRST server message be the initialize response: `tsc`
+  sends a `window/logMessage` notification first, and the error response is not a success.
+  lspmux `main` (post-0.3.0, `instance.rs` "ignoring message while waiting for initialize
+  response") tolerates the notification, so TypeScript needs lspmux built from `main` until the
+  next release. lspmux then leaves the shim connected without a reply, so the viewer reports
+  "no answer after 60 s" rather than a failure.

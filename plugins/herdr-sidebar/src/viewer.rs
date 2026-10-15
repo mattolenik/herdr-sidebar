@@ -2237,15 +2237,16 @@ impl Nav {
         if let Some((_, client)) = &mut self.session {
             client.pump();
         }
-        let was_dead = self
+        let closed = self
             .session
             .as_ref()
-            .is_some_and(|(_, client)| client.is_dead());
-        if was_dead {
+            .filter(|(_, client)| client.is_dead())
+            .map(|(_, client)| client.closed_reason());
+        if let Some(reason) = closed {
             self.drop_dead();
             self.inflight = None;
             self.queued = None;
-            events.push(NavEvent::Notice("language server connection closed".into()));
+            events.push(NavEvent::Notice(reason));
         }
         if let Some(inflight) = &self.inflight {
             match inflight.receiver.try_recv() {

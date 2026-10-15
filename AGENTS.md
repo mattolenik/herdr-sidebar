@@ -729,8 +729,19 @@ HACKING.md — budget time for that before promising a patched build.
     args, environment and workspace, and every preview pane has its own `HERDR_*` values — an
     inherited env gives every tab a private rust-analyzer. Only PATH/HOME/USER/LANG/TMPDIR/XDG_*/
     CARGO_HOME/RUSTUP_HOME/GOPATH/GOROOT pass. The server path is passed ABSOLUTE (resolved in the
-    viewer) because the daemon's PATH is not ours. Verified live: two viewers, one rust-analyzer,
-    `lspmux status` lists two clients.
+    viewer) because the daemon's PATH is not ours. Server arguments follow a `--`
+    (`lsp::shim_args`): lspmux's clap parser otherwise rejects `--stdio` as an unknown flag and
+    the shim exits 2 — bit live with typescript-language-server, where the viewer saw only
+    "connection closed"; the shim's stderr tail now rides in that message
+    (`Transport::closed_reason`). Verified live: two viewers, one rust-analyzer, `lspmux status`
+    lists two clients. **lspmux 0.3.0 requires the server's FIRST message to be the initialize
+    response** (`instance.rs` "first server message was not initialize response"); TypeScript 7's
+    native `tsc --lsp --stdio` sends a `window/logMessage` first and an initialize ERROR response
+    counts as "not a response" too, so both hang the shim (no reply ever, our 60 s timeout) rather
+    than failing. lspmux `main` already ignores pre-response messages; until a release ships it,
+    TypeScript needs lspmux built from source. Homebrew `typescript` 7.x ships no `tsserver.js`,
+    so `typescript-language-server` cannot work against it — hence `tsc --lsp --stdio` is seeded
+    between `tsgo` and `typescript-language-server`.
   - Position encoding comes from the `initialize` RESULT (lspmux replays the first client's
     negotiation; rust-analyzer answered utf-8 here), missing → UTF-16. There is no
     `$/cancelRequest` (lspmux retags ids); staleness is "apply only while the document the gesture

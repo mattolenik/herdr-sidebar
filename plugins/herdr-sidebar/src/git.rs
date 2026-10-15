@@ -1586,7 +1586,19 @@ mod tests {
             "a second process must skip an outstanding scan"
         );
         drop(first);
-        IgnoredScanLock::acquire(&root).unwrap();
+        // flock locks live on the open file description, which a sibling
+        // test's child process shares between fork and exec; retry briefly
+        // so a concurrent `git` spawn cannot make the release look late.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            match IgnoredScanLock::acquire(&root) {
+                Ok(_) => break,
+                Err(_) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(err) => panic!("lock not released after drop: {err}"),
+            }
+        }
     }
 
     #[test]

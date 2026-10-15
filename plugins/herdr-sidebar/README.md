@@ -108,7 +108,7 @@ command = "rust-analyzer"
 [[lsp]]
 patterns = ["*.ts", "*.tsx", "*.mts", "*.js", "*.jsx", "*.mjs"]
 roots = ["tsconfig.json", "package.json"]
-command = ["tsgo --lsp --stdio", "typescript-language-server --stdio"]
+command = ["tsgo --lsp --stdio", "tsc --lsp --stdio", "typescript-language-server --stdio"]
 ```
 
 `command` works like the other tables (a string or a preference-ordered list; the first program

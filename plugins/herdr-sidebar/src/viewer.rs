@@ -2129,8 +2129,11 @@ impl Nav {
     ) -> Option<String> {
         self.drop_dead();
         let Some(spec) = nav_spec(request).cloned() else {
+            // The sidebar resolves the rule; it sends no server when no
+            // [[lsp]] rule matches OR none of the rule's commands is on its
+            // PATH (its footer names what it tried).
             return Some(format!(
-                "no [[lsp]] rule for {} (Settings → Preview programs…)",
+                "no language server for {}: no matching [[lsp]] rule, or its command is not on PATH (Settings → Preview programs…)",
                 doc.name
             ));
         };

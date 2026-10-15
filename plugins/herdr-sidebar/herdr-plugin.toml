@@ -140,6 +140,39 @@ title = "Quick Open"
 description = "Open or focus the sidebar and show the file picker."
 command = [".\\target\\release\\herdr-sidebar-ensure.exe", "--quick-open"]
 
+# Browser-style tab history, recorded by the focus hooks above. Bind these to
+# host keys (`[[keys.command]]`, type "plugin_action") for shells and agents;
+# sidebar and preview panes also take Ctrl+-, F7/F8 and a mouse's side
+# buttons directly. A focused code preview steps its own navigation history
+# first and falls through to the tab history when that is empty.
+[[actions]]
+id = "tab-back"
+platforms = ["linux", "macos"]
+title = "Back (tab history)"
+description = "Return to the previously focused tab; in a code preview, step its navigation history first."
+command = ["./target/release/herdr-sidebar", "--tab-back"]
+
+[[actions]]
+id = "tab-back-windows"
+platforms = ["windows"]
+title = "Back (tab history)"
+description = "Return to the previously focused tab; in a code preview, step its navigation history first."
+command = [".\\target\\release\\herdr-sidebar-ensure.exe", "--tab-back"]
+
+[[actions]]
+id = "tab-forward"
+platforms = ["linux", "macos"]
+title = "Forward (tab history)"
+description = "Undo a Back through the tab history; in a code preview, step its navigation history first."
+command = ["./target/release/herdr-sidebar", "--tab-forward"]
+
+[[actions]]
+id = "tab-forward-windows"
+platforms = ["windows"]
+title = "Forward (tab history)"
+description = "Undo a Back through the tab history; in a code preview, step its navigation history first."
+command = [".\\target\\release\\herdr-sidebar-ensure.exe", "--tab-forward"]
+
 # Refresh every workspace onto the latest builds after a rebuild.
 [[actions]]
 id = "redeploy"

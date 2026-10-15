@@ -132,7 +132,9 @@ Space/`b` to scroll, `w` to toggle wrapping, and `q` or Esc to close. In a code 
 with a language server: Ctrl+click goes to the definition, `m` or Ctrl+right-click opens
 the navigation menu, `Ctrl+-` goes back and `Ctrl+Alt+-` forward (on macOS, Option must
 act as Alt: Ghostty `macos-option-as-alt = true`). A mouse's side back/forward buttons do
-the same when the terminal and herdr forward them.
+the same when the terminal and herdr forward them. When the document history runs out, the
+same gestures step through the tabs you focused, browser-style; the `tab-back` /
+`tab-forward` actions make that available from any pane through herdr key bindings.
 
 Host keybindings can invoke the direct `show-explorer`, `show-search`, `show-git`, and
 `quick-open` actions. For example, bind `cmd+p` to:

@@ -3017,7 +3017,10 @@ fn history_step(
     identity_pending: &mut bool,
     notice: &mut Option<String>,
 ) {
+    // No in-pane history to step (nothing showing, edit mode, or the end of
+    // the list): fall through to the tab history, browser-style.
     let (Some(here), ViewMode::Preview(doc)) = (current.clone(), &mut *mode) else {
+        *notice = crate::tabnav::step_notice(forward);
         return;
     };
     let now = (here.clone(), doc.scroll);
@@ -3027,14 +3030,7 @@ fn history_step(
         nav.history.back(now)
     };
     let Some((request, scroll)) = step else {
-        *notice = Some(
-            if forward {
-                "nothing ahead"
-            } else {
-                "nothing to go back to"
-            }
-            .into(),
-        );
+        *notice = crate::tabnav::step_notice(forward);
         return;
     };
     if request == here {
@@ -3648,13 +3644,26 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                                     }
                                     // Ctrl+- arrives as 0x1F, which crossterm
                                     // reports as Ctrl+7; with Alt (ESC 0x1F)
-                                    // it is forward.
+                                    // it is forward. F7/F8 are the transport
+                                    // keys the tab-back/forward actions send.
                                     KeyCode::Char('7')
                                         if key.modifiers.contains(KeyModifiers::CONTROL) =>
                                     {
                                         history_step(
                                             &mut nav,
                                             key.modifiers.contains(KeyModifiers::ALT),
+                                            &mut current,
+                                            &mut mode,
+                                            &mut preview_load,
+                                            control,
+                                            &mut identity_pending,
+                                            &mut notice,
+                                        );
+                                    }
+                                    KeyCode::F(step @ (7 | 8)) => {
+                                        history_step(
+                                            &mut nav,
+                                            step == 8,
                                             &mut current,
                                             &mut mode,
                                             &mut preview_load,

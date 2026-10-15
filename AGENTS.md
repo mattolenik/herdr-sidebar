@@ -790,6 +790,24 @@ HACKING.md — budget time for that before promising a patched build.
     `mattolenik/crossterm`, branch `mouse-buttons-8-9`, 0.29 tag + the two variants). Drop the
     patch when a crossterm release carries the change. Headless check: `pane.send_input`
     `ESC[<128;x;yM` (back) / `ESC[<129;x;yM` (forward) into a viewer with history.
+  - **Tab history (`src/tabnav.rs`)**: browser-style back/forward over herdr TABS, layered under
+    the in-pane history. The focus hooks (`ensure::run`, BEFORE the auto-open check and the
+    launch lock, which focus hooks may yield) record `(tab, focused pane)` per event into a
+    per-session journal (`rundir::dir("tabs")`, keyed by the socket path: tab ids are per server
+    and change on restart; no event fires on restore, so history starts empty then). A step sets
+    a `navigating` marker so the focus event it causes is deduped instead of pushed — without it
+    back/forward collapse into a two-tab loop. Dead tabs are pruned against `pane.list` on every
+    use; cap 50. Moving the client is `viewer::focus_tab_for_client(tab, Some(pane))` — plain
+    `tab.focus` only updates the server record. The `tab-back`/`tab-forward` actions send a
+    focused preview viewer the F7/F8 transport keys (like F9–F12 for activities) so its in-pane
+    history goes first and `history_step` falls through to `tabnav::step` when empty; any other
+    pane steps directly. Sidebars and the viewer also take Ctrl+- (0x1F = Ctrl+`7`) and the
+    mouse side buttons themselves; the sidebars do NOT claim Ctrl+Alt+- (CONTROL|ALT chars are
+    AltGr text in their fields). For shells and agents bind the actions in herdr's
+    `[[keys.command]]` (`type = "plugin_action"`). Do not read the focused pane with
+    `launch::focused_pane_in`: it answers "where to root a sidebar" and yields "" for a pane
+    without a cwd, i.e. a viewer. Verified in hs-test: journal fills from switches, back/forward
+    from a sidebar, a shell and a fresh viewer, and a return lands on the recorded pane.
   - Tests: `lsp::fake` is a language server over `std::io::pipe` (Rust ≥ 1.87; the crate floor is
     1.89) that answers the six methods and issues the server→client traffic; the client is driven
     against it hermetically. Live checks go through `pane.send_input` with SGR mouse sequences

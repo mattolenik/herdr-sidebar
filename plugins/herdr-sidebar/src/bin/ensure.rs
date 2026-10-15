@@ -20,6 +20,10 @@ fn main() {
             }
             return;
         }
+        Some(flag @ ("--tab-back" | "--tab-forward")) => {
+            let _ = herdr_sidebar::tabnav::action(flag == "--tab-forward");
+            return;
+        }
         _ => {}
     }
     let mode = match std::env::args().nth(1).as_deref() {

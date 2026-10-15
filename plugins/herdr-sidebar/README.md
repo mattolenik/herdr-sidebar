@@ -85,6 +85,31 @@ A code preview talks to a real language server, so navigation is semantic:
 | `Ctrl+-` / `Ctrl+Alt+-` | Back / forward through everything the pane showed, sidebar clicks included |
 | mouse back / forward buttons | The same history steps (xterm buttons 8/9; the terminal and herdr must forward them) |
 
+#### Tab history
+
+Back and forward keep going when the document history runs out: the plugin remembers the order
+you focused herdr tabs in, so Back from a freshly opened preview returns to the tab you came
+from, and Forward undoes that. Sidebar and preview panes take `Ctrl+-`, F7/F8 and the mouse's
+side buttons directly. For shells and agents bind the `tab-back` / `tab-forward` actions in
+herdr's config:
+
+```toml
+[[keys.command]]
+key = "ctrl+minus"
+type = "plugin_action"
+command = "herdr-sidebar.tab-back"
+description = "back (tab history)"
+
+[[keys.command]]
+key = "ctrl+alt+minus"
+type = "plugin_action"
+command = "herdr-sidebar.tab-forward"
+description = "forward (tab history)"
+```
+
+A focused code preview steps its own navigation history first. History is per herdr session
+and starts empty after a server restart; closed tabs drop out of it.
+
 Jumps stay in the same preview pane, whatever file they land in. Results are only available on
 the plain source view (not on rendered previews, diffs, or files over the viewer's size caps).
 

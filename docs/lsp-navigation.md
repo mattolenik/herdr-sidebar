@@ -242,7 +242,7 @@ Cmd is not encoded in SGR mouse reports), so:
 | Ctrl+left click on a symbol | Go to definition. One result: jump. Several: picker overlay. None: notice `no definition`. |
 | Ctrl+right click | Menu at the pointer: Go to Definition, Go to Type Definition / Implementation (capability-gated), Find References, Hover, Document Symbols, Back. Acts on the position under the pointer. |
 | `m` (existing keyboard menu key) | Same menu, acting on the last clicked position (the selection anchor). |
-| `Ctrl+-` | Back: pop the history (request + scroll). `Ctrl+Alt+-` forward. The mouse's side back/forward buttons (xterm 8/9) do the same. |
+| `Ctrl+-` | Back: pop the history (request + scroll). `Ctrl+Alt+-` forward. The mouse's side back/forward buttons (xterm 8/9) do the same. An empty in-pane history falls through to the tab history (`tabnav.rs`: back returns to the tab you came from). |
 | Pointer dwell (~500 ms on one cell) or the menu's Hover | `textDocument/hover` for that position; the result is shown in a floating box at the pointer (see **Hover** below), dismissed by motion off the cell, any key, click or scroll, and by a timer since terminals send no "pointer left the pane" event. |
 
 - **Cell → text position.** Rows are tagged with their source line (`Row` in

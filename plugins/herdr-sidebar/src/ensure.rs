@@ -407,12 +407,17 @@ pub fn run(mode: Mode) -> std::io::Result<()> {
         Mode::Toggle(view) => view,
         Mode::Activate(target) => target.pane_view(state.merged),
     };
+    let event_json = std::env::var("HERDR_PLUGIN_EVENT_JSON").unwrap_or_default();
+    // Tab history rides on the focus hooks and must not depend on auto-open
+    // or on winning the launch lock below (focus hooks may yield it).
+    if !explicit {
+        crate::tabnav::record_event(&event_json);
+    }
     // Auto-open off (⚙ Settings): hooks leave closed tabs alone; the user's
     // explicit toggle still works.
     if !explicit && !state.auto_open {
         return Ok(());
     }
-    let event_json = std::env::var("HERDR_PLUGIN_EVENT_JSON").unwrap_or_default();
     let creation_event = !explicit
         && matches!(
             launch::event_kind(&event_json).as_str(),

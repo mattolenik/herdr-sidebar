@@ -1609,6 +1609,11 @@ impl App {
             return None;
         }
         self.flash = None;
+        // Tab history: Ctrl+- back, F7/F8 from the tab-back/forward actions.
+        if let Some(forward) = herdr_sidebar::tabnav::key_direction(&key) {
+            self.flash = herdr_sidebar::tabnav::step_notice(forward).map(|text| (text, false));
+            return None;
+        }
         if ((key.code == KeyCode::Char('p')
             && key.modifiers.contains(KeyModifiers::CONTROL)
             && !key.modifiers.contains(KeyModifiers::ALT))
@@ -1767,6 +1772,14 @@ impl App {
         // hover title-bar buttons until the linger expires.
         self.last_mouse = Some(std::time::Instant::now());
         self.mouse_pos = Some((mouse.column, mouse.row));
+        // A mouse's side buttons step the tab history (xterm buttons 8/9).
+        if let Some(forward) = herdr_sidebar::tabnav::mouse_direction(mouse.kind) {
+            self.flash = herdr_sidebar::tabnav::step_notice(forward).map(|text| (text, false));
+            return None;
+        }
+        if herdr_sidebar::tabnav::is_side_release(mouse.kind) {
+            return None;
+        }
         if self.overlay.is_some() {
             self.overlay_mouse(mouse);
             return None;

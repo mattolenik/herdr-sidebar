@@ -23,6 +23,7 @@ use herdr_sidebar::git::{Git, Status};
 use herdr_sidebar::gitdeco::{Decorations, RepoStatus};
 use herdr_sidebar::icons::{IconTheme, icon};
 use herdr_sidebar::ipc;
+use herdr_sidebar::programs;
 use herdr_sidebar::state::{self as sidebar, View};
 use herdr_sidebar::tree::{Row, Tree};
 use herdr_sidebar::ui::{
@@ -292,6 +293,9 @@ enum Setting {
     PreviewPlacement,
     CustomEditorCommand,
     CustomEditorClick,
+    PreviewPrograms,
+    ProjectPreviewRules,
+    CodeNavigation,
     AutoOpen,
     StrictToggle,
     FocusOnOpen,
@@ -356,6 +360,8 @@ pub struct App {
     mouse_pos: Option<(u16, u16)>,
     /// Last left-click (row index, when) for double-click detection.
     last_click: Option<(usize, std::time::Instant)>,
+    /// Per-filetype preview program rules for this root (`programs.rs`).
+    programs: programs::Rules,
     /// Where the most recent preview landed, with its document key — so a
     /// double click pins that exact tab instead of re-opening it.
     last_preview: Option<(String, herdr_sidebar::viewer::PreviewTarget)>,
@@ -385,6 +391,10 @@ pub struct App {
     git_footer_status: Option<Status>,
     git_footer_zones: FooterZones,
     git_syncing: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
+    /// lspmux preflight for the Settings row, run on a worker when the modal
+    /// opens (the same check the viewer makes, so the wording never differs).
+    lsp_status: Option<herdr_sidebar::lsp::Preflight>,
+    lsp_check: Option<std::sync::mpsc::Receiver<herdr_sidebar::lsp::Preflight>>,
     ignored_cache: HashMap<PathBuf, Vec<String>>,
     /// A failed/busy ignored-file scan is optional decoration data, not a
     /// reason to hammer an enormous repository again every two seconds.
@@ -495,6 +505,7 @@ impl App {
             last_mouse: None,
             mouse_pos: None,
             last_click: None,
+            programs: programs::Rules::default(),
             last_preview: None,
             last_beat: std::time::Instant::now(),
             picking: None,
@@ -508,6 +519,8 @@ impl App {
             git_footer_status: None,
             git_footer_zones: FooterZones::default(),
             git_syncing: None,
+            lsp_status: None,
+            lsp_check: None,
             ignored_cache: HashMap::new(),
             deco_backoff_until: HashMap::new(),
             quick_index: None,
@@ -541,6 +554,7 @@ impl App {
         self.collect_quick_index();
         self.collect_content_search();
         self.collect_git_sync();
+        self.collect_lsp_check();
         self.start_content_search_if_due();
         self.collect_decorations();
         if self.last_deco.elapsed() < DECO_REFRESH {
@@ -562,6 +576,7 @@ impl App {
         self.sidebar_state.strict_toggle = shared.strict_toggle;
         self.sidebar_state.focus_on_open = shared.focus_on_open;
         self.sidebar_state.custom_editor_on_click = shared.custom_editor_on_click;
+        self.sidebar_state.project_preview_rules = shared.project_preview_rules;
         let old_git_footer = self.sidebar_state.show_git_footer;
         self.sidebar_state.show_git_footer = shared.show_git_footer;
         if shared.color_theme != self.sidebar_state.color_theme {
@@ -847,9 +862,31 @@ impl App {
             self.notice = Some("preview needs a herdr pane".into());
             return;
         };
-        let payload = line
-            .map(|line| herdr_sidebar::viewer::file_request_at(path, line))
-            .unwrap_or_else(|| herdr_sidebar::viewer::file_request(path));
+        // The sidebar owns the rules (root + trust gate); the viewer only
+        // runs what it is handed.
+        let renderer = self.resolve_rule(path, programs::Kind::Preview);
+        let editor = self
+            .resolve_rule(path, programs::Kind::Editor)
+            .map(|r| r.command);
+        let lsp = self.resolve_rule(path, programs::Kind::Lsp).map(|server| {
+            herdr_sidebar::viewer::LspSpec {
+                root: programs::workspace_root(
+                    path,
+                    &server.roots,
+                    || Git::owner_of(path).ok().map(|git| git.root().to_path_buf()),
+                    &self.tree.root_path(),
+                ),
+                command: server.command,
+            }
+        });
+        let payload = herdr_sidebar::viewer::file_request(
+            path,
+            line,
+            renderer.as_ref().map(|r| r.command.as_str()),
+            editor.as_deref(),
+            renderer.as_ref().is_some_and(|r| r.external),
+            lsp.as_ref(),
+        );
         let doc_key = herdr_sidebar::viewer::doc_key_for_file(path);
         match herdr_sidebar::viewer::open_in_pane(
             &pane_id,
@@ -1257,10 +1294,13 @@ impl App {
                         self.toggle();
                     }
                 } else if self.sidebar_state.custom_editor_on_click
-                    && actions::configured_editor().is_some()
+                    && let Some(command) = self.editor_for(&path)
                 {
+                    // "Use editor on click": the file's editor rule, else the
+                    // global custom editor. The second click of a double is
+                    // ignored so the tab is not requested twice.
                     if !double {
-                        self.open_custom_editor(&path);
+                        self.open_custom_editor(&path, &command, None);
                     }
                 } else if double {
                     // Pin the tab the first click just opened. Re-opening
@@ -1368,7 +1408,19 @@ impl App {
         let in_repo = target
             .as_ref()
             .is_some_and(|(path, _)| Git::owner_of(path).is_ok());
-        let entries = actions::menu_entries(target.as_ref().map(|(_, is_dir)| *is_dir), in_repo);
+        // Resolve here so the label names the editor that will actually run
+        // ("Edit with nvim" on a machine without dawn).
+        let program = match &target {
+            Some((path, false)) => self
+                .resolve_rule(&path.clone(), programs::Kind::Editor)
+                .map(|r| r.name),
+            _ => None,
+        };
+        let entries = actions::menu_entries(
+            target.as_ref().map(|(_, is_dir)| *is_dir),
+            in_repo,
+            program.as_deref(),
+        );
         let selected = entries
             .iter()
             .position(|e| matches!(e, MenuEntry::Action(..)))
@@ -1955,10 +2007,33 @@ impl App {
         }
     }
 
+    fn collect_lsp_check(&mut self) {
+        let Some(rx) = &self.lsp_check else { return };
+        match rx.try_recv() {
+            Ok(state) => {
+                self.lsp_check = None;
+                self.lsp_status = Some(state);
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => self.lsp_check = None,
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+        }
+    }
+
     // ---- Settings modal ----
 
     fn open_settings(&mut self) {
         herdr_sidebar::updates::check();
+        // The rule count row reads the loaded rules; make them current.
+        self.reload_rules();
+        // `lspmux status` is a subprocess: never on the TUI thread.
+        if self.lsp_check.is_none() {
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = tx.send(herdr_sidebar::lsp::preflight());
+            });
+            self.lsp_check = Some(rx);
+            self.lsp_status = None;
+        }
         self.suspend_search_for_modal();
         self.overlay = Some(Overlay::Settings {
             selected: 0,
@@ -2258,7 +2333,17 @@ impl App {
         match cmd {
             Cmd::Nothing => {}
             Cmd::Search => self.start_content_search(),
-            Cmd::Open(path, line) => self.open_preview_at(&path, Some(line)),
+            // A mouse click on a hit follows the same routing as a tree
+            // click, carrying the hit's line for `{line}`.
+            Cmd::Open(path, line) => {
+                if self.sidebar_state.custom_editor_on_click
+                    && let Some(command) = self.editor_for(&path)
+                {
+                    self.open_custom_editor(&path, &command, Some(line));
+                } else {
+                    self.open_preview_at(&path, Some(line));
+                }
+            }
             Cmd::Scroll(delta) => {
                 self.search_snap = false;
                 self.search_scroll = if delta < 0 {
@@ -2387,7 +2472,9 @@ impl App {
         }
     }
 
-    fn open_custom_editor(&mut self, path: &Path) {
+    /// Open `path` in its own tab running `command` (a resolved
+    /// `[[editor]]` rule or the global custom editor).
+    fn open_custom_editor(&mut self, path: &Path, command: &str, line: Option<usize>) {
         let Some(pane_id) = self
             .pane_ctl
             .as_ref()
@@ -2400,12 +2487,68 @@ impl App {
             .file_name()
             .unwrap_or(path.as_os_str())
             .to_string_lossy();
+        let program = programs::display_name(command);
         self.notice = Some(
-            match actions::open_in_editor_tab(&pane_id, &self.tree.root_path(), path) {
-                Ok(()) => format!("opened in custom editor: {name}"),
-                Err(error) => format!("custom editor failed: {error}"),
+            match actions::open_in_editor_tab_with(
+                &pane_id,
+                &self.tree.root_path(),
+                path,
+                command,
+                line,
+            ) {
+                Ok(()) => format!("opened with {program}: {name}"),
+                Err(error) => format!("{program} failed: {error}"),
             },
         );
+    }
+
+    /// The `[[preview]]` / `[[editor]]` program for `path`, if a rule
+    /// matches AND one of its candidates exists on this machine. Rule-file
+    /// problems and a rule with nothing installed become notices; neither
+    /// applies the rule.
+    fn resolve_rule(&mut self, path: &Path, kind: programs::Kind) -> Option<programs::Resolved> {
+        let root = self.tree.root_path();
+        self.reload_rules();
+        if let Some(error) = self.programs.first_error() {
+            self.notice = Some(format!("preview programs: {error}"));
+        }
+        let rule = self.programs.rule_for(kind, &root, path)?;
+        match rule.resolve() {
+            Ok(resolved) => Some(resolved),
+            Err(tried) => {
+                let name = path
+                    .file_name()
+                    .unwrap_or(path.as_os_str())
+                    .to_string_lossy();
+                let what = match kind {
+                    programs::Kind::Preview => "preview program",
+                    programs::Kind::Editor => "editor",
+                    programs::Kind::Lsp => "language server",
+                };
+                self.notice = Some(format!(
+                    "no {what} for {name} on PATH (tried {})",
+                    tried.join(", ")
+                ));
+                None
+            }
+        }
+    }
+
+    /// The rule files are tiny: re-read them whenever rules are consulted so
+    /// an edit to either file applies on the next click.
+    fn reload_rules(&mut self) {
+        self.programs = programs::load(
+            &self.tree.root_path(),
+            self.sidebar_state.project_preview_rules,
+        );
+    }
+
+    /// What "Use editor on click" opens: the file's editor rule, else the
+    /// global custom editor.
+    fn editor_for(&mut self, path: &Path) -> Option<String> {
+        self.resolve_rule(path, programs::Kind::Editor)
+            .map(|resolved| resolved.command)
+            .or_else(actions::configured_editor)
     }
 
     /// The modal's rows for the current state.
@@ -2482,6 +2625,31 @@ impl App {
                 }
                 .to_string(),
                 actions::configured_editor().is_some(),
+            ),
+            (
+                Setting::PreviewPrograms,
+                "Preview programs...",
+                self.programs.summary(),
+                programs::global_path().is_some(),
+            ),
+            (
+                Setting::ProjectPreviewRules,
+                "Project preview rules",
+                if self.sidebar_state.project_preview_rules {
+                    "on"
+                } else {
+                    "off"
+                }
+                .to_string(),
+                true,
+            ),
+            (
+                Setting::CodeNavigation,
+                "Code navigation",
+                self.lsp_status
+                    .map(|state| state.label().to_string())
+                    .unwrap_or_else(|| "checking…".into()),
+                true,
             ),
             (
                 Setting::HiddenFiles,
@@ -2626,6 +2794,35 @@ impl App {
                     state.custom_editor_on_click = !state.custom_editor_on_click;
                 });
             }
+            Setting::PreviewPrograms => {
+                // Opening the preview moves focus to its tab; a modal left
+                // behind would strand the sidebar, as with Change Folder.
+                self.overlay = None;
+                match programs::ensure_global_file() {
+                    Ok(path) => {
+                        self.open_preview(&path);
+                        self.notice =
+                            Some("preview programs: press e to edit; rules apply on save".into());
+                    }
+                    Err(error) => {
+                        self.notice = Some(format!("preview programs: {error}"));
+                    }
+                }
+            }
+            Setting::ProjectPreviewRules => {
+                self.sidebar_state = sidebar::update_state(|state| {
+                    state.project_preview_rules = !state.project_preview_rules;
+                });
+                self.reload_rules();
+            }
+            Setting::CodeNavigation => {
+                self.notice = Some(match self.lsp_status {
+                    None => "checking lspmux…".into(),
+                    Some(state) => herdr_sidebar::lsp::advice_here(state).unwrap_or_else(|| {
+                        "lspmux running — Ctrl+click a symbol in a code preview".into()
+                    }),
+                });
+            }
             Setting::HiddenFiles => {
                 self.tree.show_hidden = !self.tree.show_hidden;
                 self.invalidate_quick_index();
@@ -2761,9 +2958,10 @@ impl App {
         else {
             return;
         };
-        let MenuEntry::Action(action, _) = entries[selected] else {
+        let Some(MenuEntry::Action(action, _)) = entries.get(selected) else {
             return;
         };
+        let action = *action;
         // Creation targets: the folder itself, a file's parent, or the root.
         let create_dir = match &target {
             Some((path, true)) => path.clone(),
@@ -2821,6 +3019,13 @@ impl App {
             MenuAction::Delete => {
                 let Some((path, is_dir)) = target else { return };
                 self.overlay = Some(Overlay::ConfirmDelete { path, is_dir });
+            }
+            MenuAction::EditWith => {
+                let Some((path, _)) = target else { return };
+                // `resolve_rule` already set the notice when nothing applies.
+                if let Some(resolved) = self.resolve_rule(&path, programs::Kind::Editor) {
+                    self.open_custom_editor(&path, &resolved.command, None);
+                }
             }
             MenuAction::OpenExternal => {
                 let Some((path, _)) = target else { return };
@@ -3431,9 +3636,10 @@ impl App {
 
     /// Esc: close the preview pane in this tab, if one is open.
     fn close_preview(&mut self) {
-        if let Some(pane_id) = self.pane_ctl.as_ref().map(|c| c.pane_id.clone())
-            && let Some(notice) = herdr_sidebar::viewer::close_in_tab(&pane_id)
-        {
+        let Some(pane_id) = self.pane_ctl.as_ref().map(|c| c.pane_id.clone()) else {
+            return;
+        };
+        if let Some(notice) = herdr_sidebar::viewer::close_in_tab(&pane_id) {
             self.notice = Some(notice);
         }
     }
@@ -4802,7 +5008,7 @@ mod tests {
 
     #[test]
     fn menu_navigation_skips_separators_and_clamps() {
-        let entries = actions::menu_entries(Some(false), true);
+        let entries = actions::menu_entries(Some(false), true, None);
         // First entry is an action; stepping up from it stays put.
         assert_eq!(step_menu(&entries, 0, -1), 0);
         // Stepping down over a separator lands on the next action.

@@ -4786,9 +4786,10 @@ impl App {
 
     /// Esc: close the preview pane beside us, if one is open.
     fn close_preview(&mut self) {
-        if let Some(pane_id) = self.pane_ctl.as_ref().map(|c| c.pane_id.clone())
-            && let Some(notice) = herdr_sidebar::viewer::close_in_tab(&pane_id)
-        {
+        let Some(pane_id) = self.pane_ctl.as_ref().map(|c| c.pane_id.clone()) else {
+            return;
+        };
+        if let Some(notice) = herdr_sidebar::viewer::close_in_tab(&pane_id) {
             self.flash = Some((notice, true));
         }
     }

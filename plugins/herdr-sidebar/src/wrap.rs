@@ -21,8 +21,17 @@ const TAB_WIDTH: usize = 4;
 /// Leading indentation is never trimmed, so wrapped code stays readable.
 /// A `width` of 0 is meaningless — the line comes back whole.
 pub fn wrap_line(line: &Line<'static>, width: usize) -> Vec<Line<'static>> {
+    wrap_line_with_starts(line, width)
+        .into_iter()
+        .map(|(_, row)| row)
+        .collect()
+}
+
+/// [`wrap_line`] plus, per row, the index of the source character its
+/// first cell shows — what maps a clicked cell back to a source column.
+pub fn wrap_line_with_starts(line: &Line<'static>, width: usize) -> Vec<(usize, Line<'static>)> {
     if width == 0 {
-        return vec![line.clone()];
+        return vec![(0, line.clone())];
     }
     // One flat run of (char, display width, style): a break may fall
     // anywhere, including mid-span, so per-span wrapping won't do.
@@ -35,10 +44,10 @@ pub fn wrap_line(line: &Line<'static>, width: usize) -> Vec<Line<'static>> {
         })
         .collect();
     if cells.is_empty() {
-        return vec![line.clone()];
+        return vec![(0, line.clone())];
     }
 
-    let mut rows: Vec<Line<'static>> = Vec::new();
+    let mut rows: Vec<(usize, Line<'static>)> = Vec::new();
     let mut start = 0usize;
     while start < cells.len() {
         let mut end = start;
@@ -65,7 +74,7 @@ pub fn wrap_line(line: &Line<'static>, width: usize) -> Vec<Line<'static>> {
             Some(b) if end < cells.len() && cells[end].0 != ' ' && b > start => b,
             _ => end,
         };
-        rows.push(row_from(&cells[start..cut], line.style));
+        rows.push((start, row_from(&cells[start..cut], line.style)));
         start = cut;
     }
     rows
@@ -92,7 +101,8 @@ fn row_from(cells: &[(char, Style)], line_style: Style) -> Line<'static> {
     row
 }
 
-fn char_width(c: char, x: usize) -> usize {
+/// Display width of `c` at row column `x` (a tab runs to the next stop).
+pub(crate) fn char_width(c: char, x: usize) -> usize {
     if c == '\t' {
         TAB_WIDTH - (x % TAB_WIDTH)
     } else {
@@ -109,6 +119,23 @@ mod tests {
         rows.iter()
             .map(|r| r.spans.iter().map(|s| s.content.as_ref()).collect())
             .collect()
+    }
+
+    #[test]
+    fn starts_are_source_char_offsets() {
+        let line = Line::raw("\tabc def ghi");
+        let rows = wrap_line_with_starts(&line, 8);
+        let starts: Vec<usize> = rows.iter().map(|(s, _)| *s).collect();
+        // "    abc " fits 8 cells (tab = 4), then "def ghi".
+        assert_eq!(starts, vec![0, 5]);
+        assert_eq!(
+            texts(&rows.into_iter().map(|(_, r)| r).collect::<Vec<_>>()),
+            vec!["    abc ", "def ghi"]
+        );
+        assert_eq!(
+            wrap_line_with_starts(&Line::raw(""), 8),
+            vec![(0, Line::raw(""))]
+        );
     }
 
     #[test]

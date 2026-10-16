@@ -2,6 +2,7 @@
 //! and the filesystem/clipboard/shell operations behind them. UI-free so it is
 //! unit-testable; `app.rs` owns the popup rendering and input routing.
 
+use std::borrow::Cow;
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -15,16 +16,24 @@ pub enum MenuAction {
     Delete,
     /// `git add` the target — the Explorer's staging entry (issue #20).
     Stage,
+    /// Open the file in the editor its `[[editor]]` rule resolved to
+    /// (`programs.rs`); offered only when a rule matches AND a candidate
+    /// exists on this machine.
+    EditWith,
     OpenExternal,
     Reveal,
     ChangeFolder,
     ChangeFolderTyped,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub enum MenuEntry {
-    Action(MenuAction, &'static str),
+    Action(MenuAction, Cow<'static, str>),
     Separator,
+}
+
+fn item(action: MenuAction, label: &'static str) -> MenuEntry {
+    MenuEntry::Action(action, Cow::Borrowed(label))
 }
 
 /// VS Code-style context menu for a tree row (`target` = `Some(is_dir)` for a
@@ -34,40 +43,45 @@ pub enum MenuEntry {
 /// "Reveal in File Explorer" already does. `in_repo` adds "Stage Changes"
 /// (issue #20) — it stays out of the menu entirely when the target is not
 /// inside a git repository, so the entry never offers an action that can only
-/// fail.
-pub fn menu_entries(target: Option<bool>, in_repo: bool) -> Vec<MenuEntry> {
+/// fail. `editor` is the resolved per-filetype editor name for a file row
+/// ("Edit with nvim"), which precedes the default-app entry.
+pub fn menu_entries(target: Option<bool>, in_repo: bool, editor: Option<&str>) -> Vec<MenuEntry> {
     let mut entries = vec![
-        MenuEntry::Action(MenuAction::NewFile, "New File…"),
-        MenuEntry::Action(MenuAction::NewFolder, "New Folder…"),
+        item(MenuAction::NewFile, "New File…"),
+        item(MenuAction::NewFolder, "New Folder…"),
     ];
     if target == Some(false) {
-        entries.extend([
-            MenuEntry::Separator,
-            MenuEntry::Action(MenuAction::OpenExternal, "Open with Default App"),
-        ]);
+        entries.push(MenuEntry::Separator);
+        if let Some(name) = editor {
+            entries.push(MenuEntry::Action(
+                MenuAction::EditWith,
+                Cow::Owned(format!("Edit with {name}")),
+            ));
+        }
+        entries.push(item(MenuAction::OpenExternal, "Open with Default App"));
     }
     if target.is_some() && in_repo {
         entries.extend([
             MenuEntry::Separator,
-            MenuEntry::Action(MenuAction::Stage, "Stage Changes"),
+            item(MenuAction::Stage, "Stage Changes"),
         ]);
     }
     if target.is_some() {
         entries.extend([
             MenuEntry::Separator,
-            MenuEntry::Action(MenuAction::CopyPath, "Copy Path"),
-            MenuEntry::Action(MenuAction::CopyRelativePath, "Copy Relative Path"),
+            item(MenuAction::CopyPath, "Copy Path"),
+            item(MenuAction::CopyRelativePath, "Copy Relative Path"),
             MenuEntry::Separator,
-            MenuEntry::Action(MenuAction::Rename, "Rename…"),
-            MenuEntry::Action(MenuAction::Delete, "Delete"),
+            item(MenuAction::Rename, "Rename…"),
+            item(MenuAction::Delete, "Delete"),
         ]);
     }
     entries.extend([
         MenuEntry::Separator,
-        MenuEntry::Action(MenuAction::Reveal, "Reveal in File Explorer"),
+        item(MenuAction::Reveal, "Reveal in File Explorer"),
         MenuEntry::Separator,
-        MenuEntry::Action(MenuAction::ChangeFolder, "Change Folder…"),
-        MenuEntry::Action(MenuAction::ChangeFolderTyped, "Change Folder (Type Path)…"),
+        item(MenuAction::ChangeFolder, "Change Folder…"),
+        item(MenuAction::ChangeFolderTyped, "Change Folder (Type Path)…"),
     ]);
     entries
 }
@@ -400,6 +414,8 @@ pub fn open_external(path: &Path) -> io::Result<()> {
 const EDITOR_COMMAND_ENV: &str = "HERDR_SIDEBAR_EDITOR";
 const EDITOR_FILE_ENV: &str = "HERDR_SIDEBAR_EDITOR_FILE";
 const EDITOR_FILE_TOKEN_ENV: &str = "HERDR_SIDEBAR_EDITOR_FILE_TOKEN";
+/// Optional 1-based line for `{line}` (a search hit); absent → `1`.
+const EDITOR_LINE_ENV: &str = "HERDR_SIDEBAR_EDITOR_LINE";
 const EDITOR_METADATA_SOURCE: &str = "herdr-sidebar-editor";
 const EDITOR_PATH_TOKEN: &str = "hs-editor-path";
 const EDITOR_HEARTBEAT_EVERY: std::time::Duration = std::time::Duration::from_secs(5);
@@ -417,17 +433,31 @@ pub fn configured_editor() -> Option<String> {
     })
 }
 
-fn editor_argv(command: &str, file: &Path) -> io::Result<Vec<String>> {
+/// Split `command` without a shell and substitute placeholders: every
+/// `{key}` in `subs` (`line`, `width`, `height`, `theme`, …) and then
+/// `{file}`, which is appended as the last argument when no argument
+/// mentions it. Shared by the editor wrapper and the viewer's previewers.
+pub(crate) fn command_argv(
+    command: &str,
+    file: &Path,
+    subs: &[(&str, String)],
+) -> io::Result<Vec<String>> {
     let mut argv = split_editor_command(command)?;
     if argv.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "editor command is empty",
+            "command is empty",
         ));
     }
     let file = file.display().to_string();
     let mut replaced = false;
     for arg in &mut argv {
+        for (key, value) in subs {
+            let token = format!("{{{key}}}");
+            if arg.contains(&token) {
+                *arg = arg.replace(&token, value);
+            }
+        }
         if arg.contains("{file}") {
             *arg = arg.replace("{file}", &file);
             replaced = true;
@@ -439,7 +469,7 @@ fn editor_argv(command: &str, file: &Path) -> io::Result<Vec<String>> {
     Ok(argv)
 }
 
-fn split_editor_command(command: &str) -> io::Result<Vec<String>> {
+pub(crate) fn split_editor_command(command: &str) -> io::Result<Vec<String>> {
     let mut argv = Vec::new();
     let mut current = String::new();
     let mut quote = None;
@@ -504,7 +534,14 @@ pub fn run_configured_editor() -> io::Result<()> {
     let file = std::env::var_os(EDITOR_FILE_ENV)
         .map(PathBuf::from)
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "editor file is missing"))?;
-    let argv = editor_argv(&command, &file)?;
+    let line = std::env::var(EDITOR_LINE_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok());
+    let argv = command_argv(
+        &command,
+        &file,
+        &[("line", line.unwrap_or(1).max(1).to_string())],
+    )?;
     let pane_id = std::env::var("HERDR_PANE_ID").unwrap_or_default();
     let file_token = std::env::var(EDITOR_FILE_TOKEN_ENV).unwrap_or_default();
     let heartbeat = if pane_id.is_empty() || file_token.is_empty() {
@@ -542,6 +579,7 @@ pub fn run_configured_editor() -> io::Result<()> {
     }
 }
 
+/// Open `file` in a new tab running the global custom editor.
 pub fn open_in_editor_tab(my_pane_id: &str, root: &Path, file: &Path) -> io::Result<()> {
     let command = configured_editor().ok_or_else(|| {
         io::Error::new(
@@ -549,6 +587,20 @@ pub fn open_in_editor_tab(my_pane_id: &str, root: &Path, file: &Path) -> io::Res
             "set HERDR_SIDEBAR_EDITOR, VISUAL, or EDITOR",
         )
     })?;
+    open_in_editor_tab_with(my_pane_id, root, file, &command, None)
+}
+
+/// Open `file` in a new tab running `command` (a global custom editor or a
+/// per-filetype program). The tab is keyed by FILE: a live tab for the same
+/// file is focused instead, whatever command it runs and whatever `line` was
+/// requested this time.
+pub fn open_in_editor_tab_with(
+    my_pane_id: &str,
+    root: &Path,
+    file: &Path,
+    command: &str,
+    line: Option<usize>,
+) -> io::Result<()> {
     let panes = crate::ipc::call_text("pane.list", serde_json::json!({}))?;
     let workspace_id = crate::launch::workspace_of(&panes, my_pane_id);
     if workspace_id.is_empty() {
@@ -575,7 +627,7 @@ pub fn open_in_editor_tab(my_pane_id: &str, root: &Path, file: &Path) -> io::Res
         .unwrap_or_default();
     env.insert(
         EDITOR_COMMAND_ENV.into(),
-        serde_json::Value::String(command),
+        serde_json::Value::String(command.to_string()),
     );
     env.insert(
         EDITOR_FILE_ENV.into(),
@@ -585,6 +637,12 @@ pub fn open_in_editor_tab(my_pane_id: &str, root: &Path, file: &Path) -> io::Res
         EDITOR_FILE_TOKEN_ENV.into(),
         serde_json::Value::String(file_token.clone()),
     );
+    if let Some(line) = line {
+        env.insert(
+            EDITOR_LINE_ENV.into(),
+            serde_json::Value::String(line.to_string()),
+        );
+    }
     let label = file
         .file_name()
         .unwrap_or(file.as_os_str())
@@ -676,17 +734,19 @@ fn editor_tab_for_file(
     })
 }
 
+/// Stamp (or, with `None`, clear) the editor pane's identity.
 fn report_editor_identity(pane_id: &str, file_token: Option<&str>) -> io::Result<()> {
     let heartbeat = file_token.map(|_| crate::state::unix_now().to_string());
+    let tokens = serde_json::json!({
+        EDITOR_METADATA_SOURCE: heartbeat,
+        EDITOR_PATH_TOKEN: file_token,
+    });
     crate::ipc::call_text(
         "pane.report_metadata",
         serde_json::json!({
             "pane_id": pane_id,
             "source": EDITOR_METADATA_SOURCE,
-            "tokens": {
-                EDITOR_METADATA_SOURCE: heartbeat,
-                EDITOR_PATH_TOKEN: file_token,
-            },
+            "tokens": tokens,
         }),
     )?;
     Ok(())
@@ -788,10 +848,10 @@ mod tests {
 
     #[test]
     fn menu_shape_for_rows_and_root() {
-        let row = menu_entries(Some(false), true);
+        let row = menu_entries(Some(false), true, None);
         assert!(matches!(row[0], MenuEntry::Action(MenuAction::NewFile, _)));
         assert!(has(&row, MenuAction::Delete));
-        let root = menu_entries(None, true);
+        let root = menu_entries(None, true, None);
         assert!(!has(&root, MenuAction::Rename));
         assert!(has(&root, MenuAction::Reveal));
     }
@@ -799,40 +859,52 @@ mod tests {
     #[test]
     fn open_external_is_offered_for_files_only() {
         assert!(
-            has(&menu_entries(Some(false), true), MenuAction::OpenExternal),
+            has(
+                &menu_entries(Some(false), true, None),
+                MenuAction::OpenExternal
+            ),
             "file row"
         );
         assert!(
-            !has(&menu_entries(Some(true), true), MenuAction::OpenExternal),
+            !has(
+                &menu_entries(Some(true), true, None),
+                MenuAction::OpenExternal
+            ),
             "directory row"
         );
         assert!(
-            !has(&menu_entries(None, true), MenuAction::OpenExternal),
+            !has(&menu_entries(None, true, None), MenuAction::OpenExternal),
             "empty space"
         );
         // Directories keep everything else they had.
-        assert!(has(&menu_entries(Some(true), true), MenuAction::Rename));
+        assert!(has(
+            &menu_entries(Some(true), true, None),
+            MenuAction::Rename
+        ));
     }
 
     #[test]
     fn stage_is_offered_for_rows_inside_a_repo_only() {
         assert!(
-            has(&menu_entries(Some(false), true), MenuAction::Stage),
+            has(&menu_entries(Some(false), true, None), MenuAction::Stage),
             "file row"
         );
         assert!(
-            has(&menu_entries(Some(true), true), MenuAction::Stage),
+            has(&menu_entries(Some(true), true, None), MenuAction::Stage),
             "directory row"
         );
         assert!(
-            !has(&menu_entries(None, true), MenuAction::Stage),
+            !has(&menu_entries(None, true, None), MenuAction::Stage),
             "empty space"
         );
         assert!(
-            !has(&menu_entries(Some(false), false), MenuAction::Stage),
+            !has(&menu_entries(Some(false), false, None), MenuAction::Stage),
             "outside a repo"
         );
-        assert!(!has(&menu_entries(Some(true), false), MenuAction::Stage));
+        assert!(!has(
+            &menu_entries(Some(true), false, None),
+            MenuAction::Stage
+        ));
     }
 
     #[test]
@@ -860,15 +932,15 @@ mod tests {
     fn editor_command_is_split_without_a_shell_and_substitutes_the_file() {
         let file = Path::new("C:/work/my project/main.rs");
         assert_eq!(
-            editor_argv("nvim -f", file).unwrap(),
+            command_argv("nvim -f", file, &[]).unwrap(),
             vec!["nvim", "-f", "C:/work/my project/main.rs"]
         );
         assert_eq!(
-            editor_argv("code --goto \"{file}:12\"", file).unwrap(),
+            command_argv("code --goto \"{file}:12\"", file, &[]).unwrap(),
             vec!["code", "--goto", "C:/work/my project/main.rs:12"]
         );
         assert_eq!(
-            editor_argv(r#"C:\Tools\Code\code.exe --wait"#, file).unwrap(),
+            command_argv(r#"C:\Tools\Code\code.exe --wait"#, file, &[]).unwrap(),
             vec![
                 r#"C:\Tools\Code\code.exe"#,
                 "--wait",
@@ -876,14 +948,82 @@ mod tests {
             ]
         );
         assert_eq!(
-            editor_argv(r#""C:\Program Files\Code\code.exe" --wait"#, file).unwrap(),
+            command_argv(r#""C:\Program Files\Code\code.exe" --wait"#, file, &[]).unwrap(),
             vec![
                 r#"C:\Program Files\Code\code.exe"#,
                 "--wait",
                 "C:/work/my project/main.rs"
             ]
         );
-        assert!(editor_argv("\"unterminated", file).is_err());
+        assert!(command_argv("\"unterminated", file, &[]).is_err());
+    }
+
+    #[test]
+    fn command_argv_substitutes_placeholders_and_still_appends_the_file() {
+        let file = Path::new("/p/f.rs");
+        let subs = |pairs: &[(&'static str, &str)]| -> Vec<(&'static str, String)> {
+            pairs.iter().map(|(k, v)| (*k, v.to_string())).collect()
+        };
+        assert_eq!(
+            command_argv("nvim +{line} {file}", file, &subs(&[("line", "12")])).unwrap(),
+            vec!["nvim", "+12", "/p/f.rs"]
+        );
+        // `{line}` without `{file}`: the file is still appended last.
+        assert_eq!(
+            command_argv("less +{line}", file, &subs(&[("line", "7")])).unwrap(),
+            vec!["less", "+7", "/p/f.rs"]
+        );
+        assert_eq!(
+            command_argv(
+                "code --goto \"{file}:{line}\"",
+                file,
+                &subs(&[("line", "3")])
+            )
+            .unwrap(),
+            vec!["code", "--goto", "/p/f.rs:3"]
+        );
+        // Previewer placeholders; an unknown one is left literally.
+        assert_eq!(
+            command_argv(
+                "viu -b -w {width} -h {height} -s {file} {nope}",
+                file,
+                &subs(&[("width", "80"), ("height", "24"), ("theme", "dark")])
+            )
+            .unwrap(),
+            vec![
+                "viu", "-b", "-w", "80", "-h", "24", "-s", "/p/f.rs", "{nope}"
+            ]
+        );
+    }
+
+    #[test]
+    fn edit_with_is_offered_only_for_files_with_a_resolved_editor() {
+        let entries = menu_entries(Some(false), true, Some("leaf"));
+        let open_with = entries
+            .iter()
+            .position(|e| matches!(e, MenuEntry::Action(MenuAction::EditWith, _)))
+            .expect("Edit with entry");
+        assert_eq!(
+            entries[open_with],
+            MenuEntry::Action(MenuAction::EditWith, Cow::Owned("Edit with leaf".into()))
+        );
+        let external = entries
+            .iter()
+            .position(|e| matches!(e, MenuEntry::Action(MenuAction::OpenExternal, _)))
+            .unwrap();
+        assert_eq!(external, open_with + 1, "precedes the default-app entry");
+        assert!(!has(
+            &menu_entries(Some(false), true, None),
+            MenuAction::EditWith
+        ));
+        assert!(!has(
+            &menu_entries(Some(true), true, Some("leaf")),
+            MenuAction::EditWith
+        ));
+        assert!(!has(
+            &menu_entries(None, true, Some("leaf")),
+            MenuAction::EditWith
+        ));
     }
 
     #[test]

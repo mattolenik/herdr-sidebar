@@ -315,6 +315,10 @@ pub struct State {
     pub custom_editor_on_click: bool,
     /// View mode in Source Control: true for hierarchical tree view, false for flat list view.
     pub scm_tree_view: bool,
+    /// Honor a `.herdr-sidebar.toml` at the Explorer root (per-project preview
+    /// programs). Off by default: a cloned repository must not be able to run
+    /// arbitrary commands on a click until the user opts in.
+    pub project_preview_rules: bool,
 }
 
 impl Default for State {
@@ -338,6 +342,7 @@ impl Default for State {
             preview_placement: PreviewPlacement::Tab,
             custom_editor_on_click: false,
             scm_tree_view: false,
+            project_preview_rules: false,
         }
     }
 }
@@ -503,7 +508,7 @@ fn write_state(path: &Path, state: State) {
         None => String::new(),
     };
     let json = format!(
-        "{{\"merged\":{},\"active\":\"{}\",\"search_active\":{},\"hotkeys\":{},\"git_footer\":{},\"font_prompt\":{},\"auto_open\":{},\"strict_toggle\":{},\"focus_on_open\":{},\"follow_cwd\":{},\"git_deco\":{},\"dock_right\":{},\"sidebar_width\":{},\"colors\":\"{}\",\"preview_placement\":\"{}\",\"custom_editor_on_click\":{},\"scm_tree_view\":{}{icons}}}",
+        "{{\"merged\":{},\"active\":\"{}\",\"search_active\":{},\"hotkeys\":{},\"git_footer\":{},\"font_prompt\":{},\"auto_open\":{},\"strict_toggle\":{},\"focus_on_open\":{},\"follow_cwd\":{},\"git_deco\":{},\"dock_right\":{},\"sidebar_width\":{},\"colors\":\"{}\",\"preview_placement\":\"{}\",\"custom_editor_on_click\":{},\"scm_tree_view\":{},\"project_preview_rules\":{}{icons}}}",
         state.merged,
         state.active.state_name(),
         state.search_active,
@@ -520,7 +525,8 @@ fn write_state(path: &Path, state: State) {
         state.color_theme.label(),
         state.preview_placement.label(),
         state.custom_editor_on_click,
-        state.scm_tree_view
+        state.scm_tree_view,
+        state.project_preview_rules
     );
     let _ = std::fs::write(path, json);
 }
@@ -969,6 +975,10 @@ pub fn parse_state(json: &str) -> State {
             .get("scm_tree_view")
             .and_then(|v| v.as_bool())
             .unwrap_or(default.scm_tree_view),
+        project_preview_rules: value
+            .get("project_preview_rules")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(default.project_preview_rules),
     }
 }
 
@@ -1114,9 +1124,12 @@ mod tests {
             preview_placement: PreviewPlacement::Pane,
             custom_editor_on_click: true,
             scm_tree_view: true,
+            project_preview_rules: true,
         };
-        let json = "{\"merged\":true,\"active\":\"source-control\",\"search_active\":true,\"hotkeys\":true,\"git_footer\":false,\"font_prompt\":true,\"auto_open\":false,\"strict_toggle\":true,\"focus_on_open\":false,\"follow_cwd\":false,\"git_deco\":false,\"dock_right\":true,\"sidebar_width\":44,\"colors\":\"terminal\",\"preview_placement\":\"pane\",\"custom_editor_on_click\":true,\"scm_tree_view\":true,\"icons\":\"emoji\"}";
+        let json = "{\"merged\":true,\"active\":\"source-control\",\"search_active\":true,\"hotkeys\":true,\"git_footer\":false,\"font_prompt\":true,\"auto_open\":false,\"strict_toggle\":true,\"focus_on_open\":false,\"follow_cwd\":false,\"git_deco\":false,\"dock_right\":true,\"sidebar_width\":44,\"colors\":\"terminal\",\"preview_placement\":\"pane\",\"custom_editor_on_click\":true,\"scm_tree_view\":true,\"project_preview_rules\":true,\"icons\":\"emoji\"}";
         assert_eq!(parse_state(json), state);
+        // Files written before per-project rules existed keep them OFF.
+        assert!(!parse_state("{\"merged\":true}").project_preview_rules);
         assert!(parse_state("\u{feff}{\"merged\":true}").merged);
         // Files written before the flag existed keep auto-open AND the git
         // decorations on.

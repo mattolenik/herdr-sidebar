@@ -18,16 +18,17 @@ use crossterm::event::{
 };
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Color, Style, Stylize};
+use ratatui::style::{Style, Stylize};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::Paragraph;
+use ratatui::widgets::{Block, Clear, List, ListItem, Paragraph};
 use unicode_width::UnicodeWidthChar;
 
 use crate::ansi;
 use crate::editor::{EditAction, Editor, SaveOutcome};
 use crate::icons::{IconTheme, icon};
 use crate::ipc;
-use crate::ui::{icon_style as ui_icon_style, palette};
+use crate::lsp;
+use crate::ui::{draw_scrollbar, icon_style as ui_icon_style, palette, selection_style};
 
 /// Metadata source/token that marks the viewer pane, so the sidebar can find
 /// and reuse it (distinct from the sidebar's own identity tokens).
@@ -47,6 +48,7 @@ const MAX_LINES: usize = 5000;
 /// a worker before layout is available, so glow uses this snapshot and the
 /// event loop reloads a glow document if its actual body width differs.
 static LAST_BODY_WIDTH: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(80);
+static LAST_BODY_HEIGHT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(24);
 
 /// Directory for the sidebar's private scratch files (viewer control files).
 /// Lives in the plugin's per-user state dir (see `rundir`) rather than the
@@ -274,6 +276,15 @@ impl Request {
     }
 }
 
+/// The language server the sidebar resolved for a file (an `[[lsp]]` rule)
+/// and the workspace it should index. Both ride in the control request:
+/// the viewer never reads rule files.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct LspSpec {
+    pub command: String,
+    pub root: PathBuf,
+}
+
 /// What the sidebar asked the viewer to show.
 #[derive(Clone, PartialEq, Eq, Debug)]
 enum Request {
@@ -284,6 +295,18 @@ enum Request {
         path: PathBuf,
         /// One-based source line to place at the top of the preview.
         line: Option<usize>,
+        /// A `[[preview]]` command the sidebar resolved for this file; its
+        /// stdout is what the pane shows (when `line` is `None`).
+        renderer: Option<String>,
+        /// An `[[editor]]` command the sidebar resolved for this file; `e`
+        /// opens it in its own tab instead of the in-pane editor.
+        editor: Option<String>,
+        /// `renderer` runs on the pane's real terminal (`mode = "external"`)
+        /// rather than rendering to stdout.
+        external: bool,
+        /// Language server for code navigation, when an `[[lsp]]` rule
+        /// matched and its program exists.
+        lsp: Option<LspSpec>,
     },
     Diff {
         root: PathBuf,
@@ -300,14 +323,42 @@ enum Request {
     },
 }
 
-/// Control-file payload for a file preview.
-pub fn file_request(path: &Path) -> String {
-    format!("file\t{}", path.display())
-}
-
-/// Control-file payload for a file preview anchored to a one-based source line.
-pub fn file_request_at(path: &Path, line: usize) -> String {
-    format!("file\t{}\t{line}", path.display())
+/// Control-file payload for a file preview, optionally anchored to a
+/// one-based source line and carrying the resolved per-filetype previewer
+/// and editor commands plus the language server and its workspace
+/// (`file\t<path>\t<line>\t<renderer>\t<editor>\t<external>\t<server>\t<root>`,
+/// trailing fields omitted when absent, empty when a later one is present).
+pub fn file_request(
+    path: &Path,
+    line: Option<usize>,
+    renderer: Option<&str>,
+    editor: Option<&str>,
+    external: bool,
+    lsp: Option<&LspSpec>,
+) -> String {
+    let mut payload = format!(
+        "file\t{}\t{}",
+        path.display(),
+        line.map(|line| line.to_string()).unwrap_or_default()
+    );
+    if renderer.is_some() || editor.is_some() || lsp.is_some() {
+        payload.push('\t');
+        payload.push_str(renderer.unwrap_or(""));
+        payload.push('\t');
+        payload.push_str(editor.unwrap_or(""));
+        if external {
+            payload.push_str("\t1");
+        } else if lsp.is_some() {
+            payload.push('\t');
+        }
+    }
+    if let Some(lsp) = lsp {
+        payload.push('\t');
+        payload.push_str(&lsp.command);
+        payload.push('\t');
+        payload.push_str(&lsp.root.display().to_string());
+    }
+    payload
 }
 
 /// Control-file payload for a git diff (`kind`: staged | worktree | untracked).
@@ -341,17 +392,45 @@ fn parse_request(raw: &str) -> Option<Request> {
             let path = parts.next().filter(|p| !p.is_empty()).map(str::to_string);
             Some(Request::Show { root, spec, path })
         }
-        Some("file") => Some(Request::File {
-            path: PathBuf::from(parts.next()?),
-            line: parts
+        Some("file") => {
+            let path = PathBuf::from(parts.next()?);
+            let line = parts
                 .next()
                 .and_then(|line| line.parse().ok())
-                .filter(|line| *line > 0),
-        }),
+                .filter(|line| *line > 0);
+            let optional = |field: Option<&str>| {
+                field
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string)
+            };
+            let renderer = optional(parts.next());
+            let editor = optional(parts.next());
+            let external = parts.next().map(str::trim) == Some("1");
+            let lsp = match (optional(parts.next()), optional(parts.next())) {
+                (Some(command), Some(root)) => Some(LspSpec {
+                    command,
+                    root: PathBuf::from(root),
+                }),
+                _ => None,
+            };
+            Some(Request::File {
+                path,
+                line,
+                renderer,
+                editor,
+                external,
+                lsp,
+            })
+        }
         // Legacy: a bare path.
         _ => Some(Request::File {
             path: PathBuf::from(raw),
             line: None,
+            renderer: None,
+            editor: None,
+            external: false,
+            lsp: None,
         }),
     }
 }
@@ -359,9 +438,21 @@ fn parse_request(raw: &str) -> Option<Request> {
 fn request_payload(request: &Request) -> String {
     match request {
         Request::Close => "close".into(),
-        Request::File { path, line } => line
-            .map(|line| file_request_at(path, line))
-            .unwrap_or_else(|| file_request(path)),
+        Request::File {
+            path,
+            line,
+            renderer,
+            editor,
+            external,
+            lsp,
+        } => file_request(
+            path,
+            *line,
+            renderer.as_deref(),
+            editor.as_deref(),
+            *external,
+            lsp.as_ref(),
+        ),
         Request::Diff { root, rel, kind } => diff_request(root, rel, kind),
         Request::Show { root, spec, path } => show_request(root, spec, path.as_deref()),
     }
@@ -373,18 +464,16 @@ struct Doc {
     lines: Vec<Line<'static>>,
     /// File previews get a line-number gutter; diffs carry their own +/-.
     numbered: bool,
-    /// Decoded raster media, rendered portably with true-color half blocks.
-    /// Video files carry the poster frame extracted by ffmpeg.
-    media: Option<MediaPreview>,
     /// Offset into [`Doc::rows`] — RENDERED rows, not source lines, so a
     /// wrapped line's continuations are scrolled to like anything else.
     scroll: usize,
     /// Long lines wrap unless the user toggles them off (`w`). Per document:
     /// a newly loaded one starts wrapped again.
     wrap: bool,
-    /// Width glow formatted this markdown document for. A mismatch with the
-    /// live body triggers one background reload instead of generic rewrap.
-    glow_width: Option<u16>,
+    /// Width an external renderer (glow, viu, a `[[preview]]` rule) laid this
+    /// document out for. A mismatch with the live body triggers one
+    /// background re-render instead of generic rewrap.
+    rendered_width: Option<u16>,
     /// `lines` laid out for the pane, rebuilt only when the width or the
     /// wrap toggle changes (see [`Doc::relayout`]).
     rows: Vec<Row>,
@@ -395,19 +484,18 @@ struct Doc {
     /// row index underneath them changed.
     pending_src: Option<usize>,
     selection: PreviewSelection,
-}
-
-struct MediaPreview {
-    pixels: image::RgbaImage,
-    source_width: u32,
-    source_height: u32,
-    video_poster: bool,
+    /// The exact text on screen when this is a navigable source view (not
+    /// truncated, no warning line prepended): what `didOpen` sends and what
+    /// clicked cells map into. `None` turns code navigation off.
+    source: Option<std::sync::Arc<String>>,
 }
 
 /// One rendered row of the body: the source line it came from (so scroll
-/// position survives a relayout) and the styled row itself.
+/// position survives a relayout), the source character its first cell
+/// shows (wrapped continuations start later), and the styled row itself.
 struct Row {
     src: usize,
+    start: usize,
     line: Line<'static>,
 }
 
@@ -429,11 +517,7 @@ impl Doc {
     /// then honour any pending source-line scroll request.
     fn relayout(&mut self, width: u16, height: u16) {
         if self.rows_key != Some((width, height, self.wrap)) {
-            self.rows = if let Some(media) = &self.media {
-                render_media_rows(media, width, height)
-            } else {
-                build_rows(&self.lines, self.numbered, self.wrap, width)
-            };
+            self.rows = build_rows(&self.lines, self.numbered, self.wrap, width);
             self.rows_key = Some((width, height, self.wrap));
             self.selection = PreviewSelection::default();
         }
@@ -461,9 +545,6 @@ impl Doc {
     }
 
     fn on_mouse(&mut self, mouse: &MouseEvent, body: Rect) {
-        if self.media.is_some() {
-            return;
-        }
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 let Some(position) = self.text_position_at(body, mouse.column, mouse.row) else {
@@ -499,6 +580,28 @@ impl Doc {
         }
     }
 
+    /// The source line and Unicode-scalar column under a cell, for code
+    /// navigation: through the gutter, the wrap offset and tab expansion.
+    /// `None` outside the body, on the gutter, or without a source text.
+    fn source_position_at(&self, body: Rect, column: u16, row: u16) -> Option<(usize, usize)> {
+        let source = self.source.as_ref()?;
+        if column < body.x || column >= body.right() || row < body.y || row >= body.bottom() {
+            return None;
+        }
+        let rendered = self.rows.get(self.scroll + usize::from(row - body.y))?;
+        let x = usize::from(column - body.x).checked_sub(self.gutter())?;
+        let line = source.lines().nth(rendered.src)?;
+        let mut display = 0;
+        for (index, c) in line.chars().enumerate().skip(rendered.start) {
+            let width = crate::wrap::char_width(c, display);
+            if display + width > x {
+                return Some((rendered.src, index));
+            }
+            display += width;
+        }
+        Some((rendered.src, line.chars().count()))
+    }
+
     fn text_position_at(&self, body: Rect, column: u16, row: u16) -> Option<RenderPos> {
         if column < body.x || column >= body.right() || row < body.y || row >= body.bottom() {
             return None;
@@ -526,9 +629,6 @@ impl Doc {
     }
 
     fn select_all(&mut self) {
-        if self.media.is_some() {
-            return;
-        }
         let Some(last) = self.rows.last() else { return };
         let last_col = row_text_without_gutter(last, self.gutter()).chars().count();
         self.selection.anchor = Some(RenderPos::default());
@@ -630,80 +730,6 @@ fn selected_row(
     rendered
 }
 
-fn media_pixel(pixel: image::Rgba<u8>) -> Option<(u8, u8, u8)> {
-    let alpha = u16::from(pixel[3]);
-    if alpha < 8 {
-        return None;
-    }
-    let base = if crate::ui::is_light() { 255 } else { 0 };
-    let blend = |channel: u8| ((u16::from(channel) * alpha + base * (255 - alpha)) / 255) as u8;
-    Some((blend(pixel[0]), blend(pixel[1]), blend(pixel[2])))
-}
-
-/// Render raster media without relying on terminal-specific image protocols.
-/// One `▀` cell carries an upper pixel in its foreground and a lower pixel in
-/// its background, giving the pane two vertical pixels per terminal row.
-fn render_media_rows(media: &MediaPreview, width: u16, height: u16) -> Vec<Row> {
-    if width == 0 || height == 0 || media.source_width == 0 || media.source_height == 0 {
-        return Vec::new();
-    }
-    let max_pixel_height = u32::from(height).saturating_mul(2);
-    let scale = (f64::from(width) / f64::from(media.source_width))
-        .min(f64::from(max_pixel_height) / f64::from(media.source_height));
-    let target_width = (f64::from(media.source_width) * scale).round().max(1.0) as u32;
-    let target_height = (f64::from(media.source_height) * scale).round().max(1.0) as u32;
-    let pixels = image::imageops::resize(
-        &media.pixels,
-        target_width,
-        target_height,
-        image::imageops::FilterType::Triangle,
-    );
-    let rendered_height = target_height.div_ceil(2) as u16;
-    let top_pad = height.saturating_sub(rendered_height) / 2;
-    let left_pad = usize::from(width.saturating_sub(target_width as u16) / 2);
-    let mut rows = Vec::with_capacity(usize::from(top_pad + rendered_height));
-    for src in 0..usize::from(top_pad) {
-        rows.push(Row {
-            src,
-            line: Line::default(),
-        });
-    }
-    for pixel_y in (0..target_height).step_by(2) {
-        let mut spans = Vec::with_capacity(target_width as usize + 1);
-        if left_pad > 0 {
-            spans.push(Span::raw(" ".repeat(left_pad)));
-        }
-        for pixel_x in 0..target_width {
-            let upper = media_pixel(*pixels.get_pixel(pixel_x, pixel_y));
-            let lower = (pixel_y + 1 < target_height)
-                .then(|| media_pixel(*pixels.get_pixel(pixel_x, pixel_y + 1)))
-                .flatten();
-            let span = match (upper, lower) {
-                (Some(top), Some(bottom)) => Span::styled(
-                    "▀",
-                    Style::default()
-                        .fg(Color::Rgb(top.0, top.1, top.2))
-                        .bg(Color::Rgb(bottom.0, bottom.1, bottom.2)),
-                ),
-                (Some(top), None) => {
-                    Span::styled("▀", Style::default().fg(Color::Rgb(top.0, top.1, top.2)))
-                }
-                (None, Some(bottom)) => Span::styled(
-                    "▄",
-                    Style::default().fg(Color::Rgb(bottom.0, bottom.1, bottom.2)),
-                ),
-                (None, None) => Span::raw(" "),
-            };
-            spans.push(span);
-        }
-        rows.push(Row {
-            src: rows.len(),
-            line: Line::from(spans),
-        });
-    }
-    rows
-}
-
 /// Lay `lines` out for a `width`-wide body: wrap each source line (when
 /// wrapping is on), prefix the line-number gutter (blank on continuation
 /// rows, like an editor), and pad tinted diff rows to the full width.
@@ -715,13 +741,13 @@ fn build_rows(lines: &[Line<'static>], numbered: bool, wrap: bool, width: u16) -
     for (src, line) in lines.iter().enumerate() {
         let contains_tab = line.spans.iter().any(|span| span.content.contains('\t'));
         let pieces = if content > 0 && contains_tab {
-            crate::wrap::wrap_line(line, if wrap { content } else { usize::MAX })
+            crate::wrap::wrap_line_with_starts(line, if wrap { content } else { usize::MAX })
         } else if wrap && content > 0 && line.width() > content {
-            crate::wrap::wrap_line(line, content)
+            crate::wrap::wrap_line_with_starts(line, content)
         } else {
-            vec![line.clone()]
+            vec![(0, line.clone())]
         };
-        for (i, piece) in pieces.into_iter().enumerate() {
+        for (i, (start, piece)) in pieces.into_iter().enumerate() {
             let mut row = piece;
             if numbered {
                 // The number sits on the first row only; continuations
@@ -745,7 +771,11 @@ fn build_rows(lines: &[Line<'static>], numbered: bool, wrap: bool, width: u16) -
                     row.spans.push(Span::raw(" ".repeat(pad)));
                 }
             }
-            rows.push(Row { src, line: row });
+            rows.push(Row {
+                src,
+                start,
+                line: row,
+            });
         }
     }
     rows
@@ -758,16 +788,22 @@ fn load(request: &Request) -> Doc {
             context: String::new(),
             lines: vec![Line::raw("(closing)")],
             numbered: false,
-            media: None,
             scroll: 0,
             wrap: true,
-            glow_width: None,
+            rendered_width: None,
             rows: Vec::new(),
             rows_key: None,
             pending_src: None,
             selection: PreviewSelection::default(),
+            source: None,
         },
-        Request::File { path, line } => load_file(path, *line),
+        Request::File {
+            path,
+            line,
+            renderer,
+            external,
+            ..
+        } => load_file(path, *line, renderer.as_deref().filter(|_| !external)),
         Request::Diff { root, rel, kind } => load_diff(root, rel, kind),
         Request::Show { root, spec, path } => load_show(root, spec, path.as_deref()),
     }
@@ -796,14 +832,14 @@ fn loading_doc(request: &Request) -> Doc {
         context,
         lines: vec![Line::raw("(loading preview…)")],
         numbered: false,
-        media: None,
         scroll: 0,
         wrap: true,
-        glow_width: None,
+        rendered_width: None,
         rows: Vec::new(),
         rows_key: None,
         pending_src: None,
         selection: PreviewSelection::default(),
+        source: None,
     }
 }
 
@@ -947,210 +983,40 @@ fn load_show(root: &Path, spec: &str, path: Option<&str>) -> Doc {
         context: format!("git show {display_spec} — {}", root.display()),
         lines,
         numbered: false,
-        media: None,
         scroll: 0,
         wrap: true,
-        glow_width: None,
+        rendered_width: None,
         rows: Vec::new(),
         rows_key: None,
         pending_src: None,
         selection: PreviewSelection::default(),
+        source: None,
     }
 }
 
-/// Render markdown text via `glow`. Returns `None` when glow is not installed
-/// or exits non-zero (caller falls back to syntax highlight).
-///
-/// Receives the already-read `text` buffer so the MAX_BYTES guard in
-/// `load_file` is honoured — glow would otherwise re-read the full file.
-/// Pipes via stdin (`-`) to avoid treating filenames starting with `-` as
-/// flags. The first render uses the most recently drawn body width; the event
-/// loop schedules one background reload if the actual body width differs.
-fn glow_markdown(text: &str, width: u16) -> Option<Vec<Line<'static>>> {
+/// Upper bound on a previewer's stdout. A full-width half-block image is
+/// about 20 bytes per cell, so a 200×100 render is ~400 KiB.
+const MAX_RENDER_BYTES: u64 = 4 * 1024 * 1024;
+/// Upper bound on what is piped INTO a previewer (images are binary and can
+/// be large; the 1 MiB `MAX_BYTES` text cap applies only to the built-in
+/// text path).
+const MAX_RENDER_INPUT: u64 = 32 * 1024 * 1024;
+/// A previewer that has not finished by then is killed.
+const RENDER_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// Run `command` with `input` on stdin, stdout capped at `cap + 1` bytes (so
+/// the caller can tell "exactly cap" from "more"), stderr capped at 16 KiB,
+/// killed after `timeout`. Readers run on threads so
+/// a chatty child can never deadlock against a full pipe.
+fn run_captured(
+    mut command: std::process::Command,
+    input: Vec<u8>,
+    cap: u64,
+    timeout: Duration,
+) -> Result<std::process::Output, String> {
     use std::io::Write as _;
-    let args = glow_args(width, crate::ui::is_light());
-    let mut child = std::process::Command::new("glow")
-        .args(args)
-        .env("CLICOLOR_FORCE", "1")
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .ok()?;
-    if let Some(stdin) = child.stdin.take() {
-        let mut stdin = stdin;
-        let _ = stdin.write_all(text.as_bytes());
-    }
-    let output = child.wait_with_output().ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let rendered = String::from_utf8_lossy(&output.stdout);
-    if rendered.trim().is_empty() {
-        return None;
-    }
-    let mut lines = ansi::to_lines(&rendered);
-    lines.truncate(MAX_LINES);
-    if lines.is_empty() {
-        return None;
-    }
-    Some(lines)
-}
-
-fn glow_args(width: u16, light: bool) -> Vec<String> {
-    vec![
-        "--style".into(),
-        if light { "light" } else { "dark" }.into(),
-        "--width".into(),
-        width.to_string(),
-        "-".into(),
-    ]
-}
-
-fn choose_text_render<F>(
-    glow_rendered: Option<Vec<Line<'static>>>,
-    fallback: F,
-    glow_width: u16,
-) -> (Vec<Line<'static>>, bool, Option<u16>)
-where
-    F: FnOnce() -> Vec<Line<'static>>,
-{
-    match glow_rendered {
-        Some(rendered) => (rendered, false, Some(glow_width)),
-        None => (fallback(), true, None),
-    }
-}
-
-const MAX_MEDIA_FILE_BYTES: u64 = 32 * 1024 * 1024;
-const MAX_MEDIA_PIXELS: u64 = 12_000_000;
-const MAX_MEDIA_DIMENSION: u32 = 8192;
-const MAX_MEDIA_ALLOC_BYTES: u64 = 64 * 1024 * 1024;
-const MAX_VIDEO_FRAME_BYTES: u64 = 16 * 1024 * 1024;
-const VIDEO_FRAME_TIMEOUT: Duration = Duration::from_secs(4);
-
-fn has_extension(target: &Path, extensions: &[&str]) -> bool {
-    target
-        .extension()
-        .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| {
-            extensions
-                .iter()
-                .any(|candidate| extension.eq_ignore_ascii_case(candidate))
-        })
-}
-
-fn is_image_file(target: &Path) -> bool {
-    has_extension(
-        target,
-        &[
-            "bmp", "gif", "ico", "jpeg", "jpg", "png", "tif", "tiff", "webp",
-        ],
-    )
-}
-
-fn is_video_file(target: &Path) -> bool {
-    has_extension(
-        target,
-        &[
-            "avi", "flv", "m4v", "mkv", "mov", "mp4", "mpeg", "mpg", "webm", "wmv",
-        ],
-    )
-}
-
-fn decode_image_file(target: &Path) -> Result<image::RgbaImage, String> {
-    let file_bytes = std::fs::metadata(target)
-        .map_err(|error| error.to_string())?
-        .len();
-    if file_bytes > MAX_MEDIA_FILE_BYTES {
-        return Err(format!(
-            "image file is too large ({} MiB limit)",
-            MAX_MEDIA_FILE_BYTES / 1024 / 1024
-        ));
-    }
-    let (width, height) = image::image_dimensions(target).map_err(|error| error.to_string())?;
-    if width > MAX_MEDIA_DIMENSION
-        || height > MAX_MEDIA_DIMENSION
-        || u64::from(width).saturating_mul(u64::from(height)) > MAX_MEDIA_PIXELS
-    {
-        return Err(format!("image is too large ({width}×{height})"));
-    }
-    let mut reader = image::ImageReader::open(target)
-        .map_err(|error| error.to_string())?
-        .with_guessed_format()
-        .map_err(|error| error.to_string())?;
-    let mut limits = image::Limits::default();
-    limits.max_image_width = Some(MAX_MEDIA_DIMENSION);
-    limits.max_image_height = Some(MAX_MEDIA_DIMENSION);
-    limits.max_alloc = Some(MAX_MEDIA_ALLOC_BYTES);
-    reader.limits(limits);
-    reader
-        .decode()
-        .map(|image| image.to_rgba8())
-        .map_err(|error| error.to_string())
-}
-
-fn ffmpeg_in_path(path: &std::ffi::OsStr, cwd: Option<&Path>) -> Option<PathBuf> {
-    let executable = if cfg!(windows) {
-        "ffmpeg.exe"
-    } else {
-        "ffmpeg"
-    };
-    std::env::split_paths(path)
-        .filter(|directory| directory.is_absolute())
-        .filter_map(|directory| directory.canonicalize().ok())
-        .filter(|directory| !cwd.is_some_and(|cwd| directory.starts_with(cwd)))
-        .map(|directory| directory.join(executable))
-        .find(|candidate| {
-            if !candidate.is_file() {
-                return false;
-            }
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt as _;
-                candidate
-                    .metadata()
-                    .is_ok_and(|metadata| metadata.permissions().mode() & 0o111 != 0)
-            }
-            #[cfg(not(unix))]
-            true
-        })
-}
-
-fn ffmpeg_on_path() -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    let cwd = std::env::current_dir()
-        .ok()
-        .and_then(|path| path.canonicalize().ok());
-    ffmpeg_in_path(&path, cwd.as_deref())
-}
-
-fn decode_video_poster(target: &Path) -> Result<image::RgbaImage, String> {
-    let ffmpeg =
-        ffmpeg_on_path().ok_or_else(|| "video preview needs ffmpeg on PATH".to_string())?;
-    let mut command = std::process::Command::new(ffmpeg);
-    command.args([
-        "-hide_banner",
-        "-loglevel",
-        "error",
-        "-nostdin",
-        "-ss",
-        "0",
-        "-i",
-    ]);
-    command.arg(target);
-    command.args([
-        "-frames:v",
-        "1",
-        "-vf",
-        "scale=1280:720:force_original_aspect_ratio=decrease",
-        "-f",
-        "image2pipe",
-        "-vcodec",
-        "png",
-        "pipe:1",
-    ]);
     command
-        .stdin(std::process::Stdio::null())
+        .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
     #[cfg(windows)]
@@ -1158,22 +1024,18 @@ fn decode_video_poster(target: &Path) -> Result<image::RgbaImage, String> {
         use std::os::windows::process::CommandExt as _;
         command.creation_flags(0x0800_0000);
     }
-    let mut child = command
-        .spawn()
-        .map_err(|error| format!("ffmpeg failed: {error}"))?;
-    let mut stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| "ffmpeg stdout unavailable".to_string())?;
-    let mut stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| "ffmpeg stderr unavailable".to_string())?;
+    let mut child = command.spawn().map_err(|error| error.to_string())?;
+    let mut stdin = child.stdin.take().ok_or("stdin unavailable")?;
+    let mut stdout = child.stdout.take().ok_or("stdout unavailable")?;
+    let mut stderr = child.stderr.take().ok_or("stderr unavailable")?;
+    // A tool that reads `{file}` itself never touches stdin; the write then
+    // fails with a broken pipe once it exits, which is fine.
+    let writer = std::thread::spawn(move || {
+        let _ = stdin.write_all(&input);
+    });
     let stdout_reader = std::thread::spawn(move || {
         let mut bytes = Vec::new();
-        let _ = (&mut stdout)
-            .take(MAX_VIDEO_FRAME_BYTES + 1)
-            .read_to_end(&mut bytes);
+        let _ = (&mut stdout).take(cap + 1).read_to_end(&mut bytes);
         bytes
     });
     let stderr_reader = std::thread::spawn(move || {
@@ -1181,7 +1043,11 @@ fn decode_video_poster(target: &Path) -> Result<image::RgbaImage, String> {
         let _ = (&mut stderr).take(16 * 1024).read_to_end(&mut bytes);
         bytes
     });
-    let deadline = Instant::now() + VIDEO_FRAME_TIMEOUT;
+    let deadline = Instant::now() + timeout;
+    let finish = |child: &mut std::process::Child| {
+        let _ = child.kill();
+        let _ = child.wait();
+    };
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
@@ -1189,141 +1055,168 @@ fn decode_video_poster(target: &Path) -> Result<image::RgbaImage, String> {
                 std::thread::sleep(Duration::from_millis(25));
             }
             Ok(None) => {
-                let _ = child.kill();
-                let _ = child.wait();
+                finish(&mut child);
+                let _ = writer.join();
                 let _ = stdout_reader.join();
                 let _ = stderr_reader.join();
-                return Err("video poster timed out after 4 seconds".into());
+                return Err(format!("timed out after {} seconds", timeout.as_secs()));
             }
             Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
+                finish(&mut child);
+                let _ = writer.join();
                 let _ = stdout_reader.join();
                 let _ = stderr_reader.join();
-                return Err(format!("ffmpeg status failed: {error}"));
+                return Err(format!("status failed: {error}"));
             }
         }
     };
+    let _ = writer.join();
     let stdout = stdout_reader
         .join()
-        .map_err(|_| "ffmpeg output reader failed".to_string())?;
+        .map_err(|_| "output reader failed".to_string())?;
     let stderr = stderr_reader
         .join()
-        .map_err(|_| "ffmpeg error reader failed".to_string())?;
-    if !status.success() {
-        let stderr = String::from_utf8_lossy(&stderr);
+        .map_err(|_| "error reader failed".to_string())?;
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+/// Render `file` with a previewer `command` (`[[preview]]` rule or built-in
+/// default): substitute `{width}`/`{height}`/`{theme}`/`{line}`/`{file}`,
+/// resolve argv[0] through the shared PATH rules, pipe `input` on stdin, and
+/// turn the ANSI stdout into lines. `Err` carries a one-line reason for the
+/// notice; the caller decides what to show instead.
+fn render_with(
+    command: &str,
+    file: &Path,
+    input: &[u8],
+    width: u16,
+    height: u16,
+    light: bool,
+    line: Option<usize>,
+) -> Result<Vec<Line<'static>>, String> {
+    let name = crate::programs::display_name(command);
+    let subs = [
+        ("width", width.to_string()),
+        ("height", height.to_string()),
+        ("theme", if light { "light" } else { "dark" }.to_string()),
+        ("line", line.unwrap_or(1).max(1).to_string()),
+    ];
+    let argv =
+        crate::actions::command_argv(command, file, &subs).map_err(|error| error.to_string())?;
+    let program = crate::programs::resolve_program_here(&argv[0])
+        .ok_or_else(|| format!("{name} is not on PATH"))?;
+    let mut cmd = std::process::Command::new(program);
+    cmd.args(&argv[1..])
+        .env("COLUMNS", width.to_string())
+        .env("LINES", height.to_string())
+        .env("CLICOLOR_FORCE", "1")
+        .env("FORCE_COLOR", "1")
+        .env("COLORTERM", "truecolor")
+        .env_remove("NO_COLOR");
+    let output = run_captured(cmd, input.to_vec(), MAX_RENDER_BYTES, RENDER_TIMEOUT)
+        .map_err(|error| format!("{name} {error}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let detail = stderr.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
+        return Err(format!("{name} exited with {}: {detail}", output.status)
+            .trim_end_matches(": ")
+            .to_string());
+    }
+    if output.stdout.len() as u64 > MAX_RENDER_BYTES {
         return Err(format!(
-            "ffmpeg could not read video: {}",
-            stderr.lines().next().unwrap_or("unknown error")
+            "{name} output exceeded {} MiB",
+            MAX_RENDER_BYTES / 1024 / 1024
         ));
     }
-    if stdout.len() as u64 > MAX_VIDEO_FRAME_BYTES {
-        return Err("video poster frame exceeded 16 MiB".into());
+    let text = String::from_utf8_lossy(&output.stdout);
+    if text.trim().is_empty() {
+        return Err(format!("{name} produced no output"));
     }
-    image::load_from_memory_with_format(&stdout, image::ImageFormat::Png)
-        .map(|image| image.to_rgba8())
-        .map_err(|error| format!("could not decode video frame: {error}"))
+    let mut lines = ansi::to_lines(&text);
+    lines.truncate(MAX_LINES);
+    Ok(lines)
 }
 
-fn load_media_file(target: &Path, name: String, video_poster: bool) -> Doc {
-    let result = if video_poster {
-        decode_video_poster(target)
-    } else {
-        decode_image_file(target)
-    };
-    let (lines, media, context) = match result {
-        Ok(pixels) => {
-            let (source_width, source_height) = pixels.dimensions();
-            let kind = if video_poster {
-                "video poster"
-            } else {
-                "image"
-            };
-            (
-                Vec::new(),
-                Some(MediaPreview {
-                    pixels,
-                    source_width,
-                    source_height,
-                    video_poster,
-                }),
-                format!(
-                    "{} — {source_width}×{source_height} {kind}",
-                    target.display()
-                ),
-            )
-        }
-        Err(error) => (
-            vec![Line::raw(format!("({error})"))],
-            None,
-            target.display().to_string(),
-        ),
-    };
-    Doc {
-        name,
-        context,
-        lines,
-        numbered: false,
-        media,
-        scroll: 0,
-        wrap: false,
-        glow_width: None,
-        rows: Vec::new(),
-        rows_key: None,
-        pending_src: None,
-        selection: PreviewSelection::default(),
-    }
-}
-
-fn load_file(target: &Path, target_line: Option<usize>) -> Doc {
+fn load_file(target: &Path, target_line: Option<usize>, renderer: Option<&str>) -> Doc {
     let name = target
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| target.display().to_string());
-    let lower = name.to_lowercase();
-    if is_image_file(target) {
-        return load_media_file(target, name, false);
-    }
-    if is_video_file(target) {
-        return load_media_file(target, name, true);
-    }
-    let is_markdown = lower.ends_with(".md") || lower.ends_with(".markdown");
-    let (lines, numbered, glow_width) = match std::fs::read(target) {
+    let width = LAST_BODY_WIDTH
+        .load(std::sync::atomic::Ordering::Relaxed)
+        .max(20);
+    let height = LAST_BODY_HEIGHT
+        .load(std::sync::atomic::Ordering::Relaxed)
+        .max(1);
+    let light = crate::ui::is_light();
+    let mut source: Option<std::sync::Arc<String>> = None;
+    let (lines, numbered, rendered_width) = match std::fs::read(target) {
         Err(e) => (vec![Line::raw(format!("(unreadable: {e})"))], true, None),
         Ok(bytes) => {
-            if bytes.contains(&0) {
-                (
+            // A line-anchored preview (search hit) keeps the source view —
+            // rendered output has no line mapping.
+            let mut warning: Option<String> = None;
+            let mut rendered: Option<Vec<Line<'static>>> = None;
+            if target_line.is_none()
+                && let Some(command) = renderer
+            {
+                if bytes.len() as u64 > MAX_RENDER_INPUT {
+                    warning = Some(format!(
+                        "file exceeds the {} MiB previewer limit",
+                        MAX_RENDER_INPUT / 1024 / 1024
+                    ));
+                } else {
+                    match render_with(command, target, &bytes, width, height, light, None) {
+                        Ok(lines) => rendered = Some(lines),
+                        Err(error) => {
+                            warning = Some(format!("{error} — showing built-in preview"));
+                        }
+                    }
+                }
+            }
+            let warn_line = |text: &str| Line::raw(format!("⚠ {text}")).dim();
+            match rendered {
+                Some(mut lines) => {
+                    if let Some(warning) = &warning {
+                        lines.insert(0, warn_line(warning));
+                    }
+                    (lines, false, Some(width))
+                }
+                None if bytes.contains(&0) => (
                     vec![Line::raw(format!("(binary file — {} bytes)", bytes.len()))],
                     false,
                     None,
-                )
-            } else {
-                let truncated = bytes.len() > MAX_BYTES;
-                let text = String::from_utf8_lossy(&bytes[..bytes.len().min(MAX_BYTES)]);
-                // Markdown: render via glow; fall back to syntax highlight on failure.
-                let requested_glow_width = LAST_BODY_WIDTH
-                    .load(std::sync::atomic::Ordering::Relaxed)
-                    .max(20);
-                let glow_rendered = (is_markdown && target_line.is_none())
-                    .then(|| glow_markdown(&text, requested_glow_width))
-                    .flatten();
-                let fallback = || {
-                    crate::syntax::highlight(&name, &text, MAX_LINES).unwrap_or_else(|| {
-                        text.lines()
-                            .take(MAX_LINES)
-                            .map(|l| Line::raw(l.to_string()))
-                            .collect()
-                    })
-                };
-                let (mut lines, numbered, glow_width) =
-                    choose_text_render(glow_rendered, fallback, requested_glow_width);
-                if truncated || text.lines().count() > MAX_LINES {
-                    lines.push(Line::raw("… (truncated)"));
+                ),
+                None => {
+                    let truncated = bytes.len() > MAX_BYTES;
+                    let text = String::from_utf8_lossy(&bytes[..bytes.len().min(MAX_BYTES)]);
+                    let mut lines = crate::syntax::highlight(&name, &text, MAX_LINES)
+                        .unwrap_or_else(|| {
+                            text.lines()
+                                .take(MAX_LINES)
+                                .map(|l| Line::raw(l.to_string()))
+                                .collect()
+                        });
+                    if truncated || text.lines().count() > MAX_LINES {
+                        lines.push(Line::raw("… (truncated)"));
+                    }
+                    if lines.is_empty() {
+                        lines.push(Line::raw("(empty file)"));
+                    }
+                    if let Some(warning) = &warning {
+                        lines.insert(0, warn_line(warning));
+                    }
+                    // Code navigation needs the screen to BE the file: a
+                    // truncated or warning-prefixed view would misplace
+                    // every line the server reports.
+                    let exact = !truncated && warning.is_none() && lines.len() <= MAX_LINES;
+                    source = exact.then(|| std::sync::Arc::new(text.into_owned()));
+                    (lines, true, None)
                 }
-                if lines.is_empty() {
-                    lines.push(Line::raw("(empty file)"));
-                }
-                (lines, numbered, glow_width)
             }
         }
     };
@@ -1332,21 +1225,314 @@ fn load_file(target: &Path, target_line: Option<usize>) -> Doc {
         context: target.display().to_string(),
         lines,
         numbered,
-        media: None,
         scroll: 0,
-        // Glow already laid out tables and paragraphs for `glow_width`.
-        wrap: glow_width.is_none(),
-        glow_width,
+        // A renderer already laid the content out for `rendered_width`.
+        wrap: rendered_width.is_none(),
+        rendered_width,
         rows: Vec::new(),
         rows_key: None,
         pending_src: target_line.map(|line| line.saturating_sub(1)),
         selection: PreviewSelection::default(),
+        source,
     }
 }
 
-fn glow_needs_reload(doc: &Doc, body_width: u16) -> bool {
+/// The editor `e` should run for `request`: the `[[editor]]` rule the
+/// sidebar resolved, else the global "Custom editor…" command. `None` means
+/// the built-in in-pane editor is the only option.
+fn editor_command_for(request: &Request) -> Option<String> {
+    match request {
+        Request::File { editor, .. } => editor.clone().or_else(crate::actions::configured_editor),
+        _ => None,
+    }
+}
+
+/// Why hosting an external previewer on the pane ended.
+#[derive(Debug, PartialEq, Eq)]
+enum ExternalExit {
+    /// The control file asked for something else (another document, or
+    /// `Close`).
+    Request(Request),
+    /// The user pressed q/Esc on the held output.
+    Close,
+    /// The program could not run or exited non-zero: show the built-in
+    /// preview with this reason.
+    Failed(String),
+    /// An editor session ended cleanly; reload the document.
+    Finished,
+    /// The user pressed `e` on held previewer output.
+    Edit,
+}
+
+/// The command to host on the pane's terminal for `request`: an external
+/// `[[preview]]` rule. Line-anchored previews stay in the viewer.
+fn external_command_for(request: &Request) -> Option<String> {
+    match request {
+        Request::File {
+            line: None,
+            renderer: Some(command),
+            external: true,
+            ..
+        } => Some(command.clone()),
+        _ => None,
+    }
+}
+
+/// Terminal modes for a hosted child: cooked output (`\n` → `\r\n` stays
+/// on for tools that print lines) but no echo, no line buffering and no
+/// signal keys — a terminal's reply to the child's Kitty/DA1 probe must not
+/// be echoed onto the screen as text, and Ctrl+C must reach the child as a
+/// byte rather than killing this viewer along with it.
+#[cfg(unix)]
+fn quiet_child_mode() {
+    let _ = crossterm::terminal::disable_raw_mode();
+    // SAFETY: plain termios calls on stdin's descriptor with a zeroed,
+    // then fully initialised, termios struct.
+    unsafe {
+        let mut modes: libc::termios = std::mem::zeroed();
+        if libc::tcgetattr(libc::STDIN_FILENO, &mut modes) == 0 {
+            modes.c_lflag &= !(libc::ECHO | libc::ICANON | libc::ISIG);
+            modes.c_cc[libc::VMIN] = 1;
+            modes.c_cc[libc::VTIME] = 0;
+            let _ = libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &modes);
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn quiet_child_mode() {
+    let _ = crossterm::terminal::disable_raw_mode();
+}
+
+/// Host `command` on the pane's own terminal: suspend the TUI, run the
+/// program with inherited stdio so it can negotiate Kitty graphics or run
+/// interactively, and keep whatever it drew on screen after a clean exit
+/// until q/Esc, the next request, or a resize (which re-runs it). The
+/// heartbeat and the control file keep being serviced throughout, so the
+/// sidebar can still switch or close this pane.
+///
+/// With `preview` false the program is an EDITOR: it gets the whole screen
+/// (no chrome), is never killed under the user — a request that arrives
+/// meanwhile is dropped and the control file put back — and the call
+/// returns `Finished` as soon as it exits so the document can reload.
+fn run_external(
+    terminal: &mut ratatui::DefaultTerminal,
+    control: &Path,
+    request: &Request,
+    command: &str,
+    path: &Path,
+    mode: &ViewMode,
+    preview: bool,
+) -> std::io::Result<ExternalExit> {
+    use std::io::Write as _;
+    let name = crate::programs::display_name(command);
+    let doc_key = request.doc_key();
+    let line = match request {
+        Request::File {
+            line: Some(line), ..
+        } => *line,
+        _ => 1,
+    };
+    let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
+    // A hosted EDITOR is labelled like the in-pane editor for as long as it
+    // runs; `report_identity` would otherwise keep the `· preview` label the
+    // preview mode implies. The next identity report after exit restores it.
+    let hosted_label = (!preview).then(|| {
+        editor_pane_label(
+            &path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+        )
+    });
+    let relabel = || {
+        if let (Some(label), Ok(pane_id)) = (&hosted_label, std::env::var("HERDR_PANE_ID"))
+            && !pane_id.is_empty()
+        {
+            let _ = ipc::call_text(
+                "pane.rename",
+                serde_json::json!({ "pane_id": pane_id, "label": label }),
+            );
+        }
+    };
+    relabel();
+    let mut last_heartbeat = Instant::now();
+    let heartbeat = |mode: &ViewMode, last: &mut Instant| {
+        if last.elapsed() >= Duration::from_secs(5) {
+            report_identity(mode, Some(&doc_key), control);
+            relabel();
+            *last = Instant::now();
+        }
+    };
+    let outcome = 'rerun: loop {
+        let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+        let height = if preview {
+            rows.saturating_sub(2).max(1)
+        } else {
+            rows.max(1)
+        };
+        let subs = [
+            ("width", cols.to_string()),
+            ("height", height.to_string()),
+            (
+                "theme",
+                if crate::ui::is_light() {
+                    "light"
+                } else {
+                    "dark"
+                }
+                .to_string(),
+            ),
+            ("line", line.to_string()),
+        ];
+        let argv = match crate::actions::command_argv(command, path, &subs) {
+            Ok(argv) => argv,
+            Err(error) => break ExternalExit::Failed(error.to_string()),
+        };
+        let Some(program) = crate::programs::resolve_program_here(&argv[0]) else {
+            break ExternalExit::Failed(format!("{name} is not on PATH"));
+        };
+        // Fresh canvas inside the alternate screen: delete any images a
+        // previous run placed, clear, a dim header line (previews only),
+        // then the program draws.
+        quiet_child_mode();
+        let header = format!(
+            "\x1b[2m ✕  {}  {}\x1b[0m",
+            path.file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            path.display()
+        );
+        {
+            let mut out = std::io::stdout();
+            let _ = write!(out, "\x1b_Ga=d,d=A\x1b\\\x1b[2J\x1b[H");
+            if preview {
+                let _ = write!(out, "{header}\r\n");
+            }
+            let _ = out.flush();
+        }
+        let mut cmd = std::process::Command::new(program);
+        cmd.args(&argv[1..])
+            .env("COLUMNS", cols.to_string())
+            .env("LINES", height.to_string())
+            .env_remove("NO_COLOR")
+            .stdin(std::process::Stdio::inherit())
+            .stdout(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::inherit());
+        let mut child = match cmd.spawn() {
+            Ok(child) => child,
+            Err(error) => break ExternalExit::Failed(format!("{name}: {error}")),
+        };
+        // Phase 1: the program owns the terminal. Only the control file and
+        // the heartbeat are serviced; keys go to the program.
+        let mut deferred = false;
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) => {}
+                Err(error) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break 'rerun ExternalExit::Failed(format!("{name}: {error}"));
+                }
+            }
+            if let Some(next) = read_control(control).filter(|target| target != request) {
+                if preview {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break 'rerun ExternalExit::Request(next);
+                }
+                // An editor is never killed under the user.
+                deferred = true;
+            }
+            heartbeat(mode, &mut last_heartbeat);
+            std::thread::sleep(Duration::from_millis(100));
+        };
+        if deferred {
+            restore_current_control(control, &Some(request.clone()));
+        }
+        if !status.success() {
+            break ExternalExit::Failed(format!("{name} exited with {status}"));
+        }
+        if !preview {
+            break ExternalExit::Finished;
+        }
+        // Phase 2: hold the output. Raw mode so keys reach us without echo;
+        // q/Esc close, a resize re-runs, anything else is ignored.
+        let _ = crossterm::terminal::enable_raw_mode();
+        {
+            // Re-assert the chrome: a program that homed the cursor or
+            // scrolled may have taken the header with it.
+            let mut out = std::io::stdout();
+            let _ = write!(
+                out,
+                "\x1b[1;1H{header}\x1b[{rows};1H\x1b[2m q close  ({name})\x1b[0m"
+            );
+            let _ = out.flush();
+        }
+        loop {
+            if event::poll(Duration::from_millis(150))? {
+                match event::read()? {
+                    Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
+                        KeyCode::Char('q') | KeyCode::Esc => break 'rerun ExternalExit::Close,
+                        KeyCode::Char('e') => break 'rerun ExternalExit::Edit,
+                        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            break 'rerun ExternalExit::Close;
+                        }
+                        _ => {}
+                    },
+                    Event::Resize(..) => continue 'rerun,
+                    _ => {}
+                }
+            }
+            if let Some(next) = read_control(control).filter(|target| target != request) {
+                break 'rerun ExternalExit::Request(next);
+            }
+            heartbeat(mode, &mut last_heartbeat);
+        }
+    };
+    // Back to the TUI: raw mode, mouse, images gone, full redraw.
+    let _ = crossterm::terminal::enable_raw_mode();
+    let _ = crossterm::execute!(std::io::stdout(), EnableMouseCapture);
+    {
+        let mut out = std::io::stdout();
+        let _ = write!(out, "\x1b_Ga=d,d=A\x1b\\\x1b[2J\x1b[H");
+        let _ = out.flush();
+    }
+    let _ = terminal.clear();
+    Ok(outcome)
+}
+
+/// After an external previewer failed: load the built-in preview for the
+/// same request (its renderer ignored) with the reason on top, tagged with
+/// the ORIGINAL request so the loop's equality check accepts it.
+fn start_fallback_load(
+    request: Request,
+    reason: String,
+) -> (Request, std::sync::mpsc::Receiver<Doc>) {
+    let plain = match &request {
+        Request::File { path, line, .. } => Request::File {
+            path: path.clone(),
+            line: *line,
+            renderer: None,
+            editor: None,
+            external: false,
+            lsp: None,
+        },
+        other => other.clone(),
+    };
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut doc = load(&plain);
+        doc.lines.insert(0, Line::raw(format!("⚠ {reason}")).dim());
+        let _ = sender.send(doc);
+    });
+    (request, receiver)
+}
+
+fn needs_rerender(doc: &Doc, body_width: u16) -> bool {
     let body_width = body_width.max(20);
-    doc.glow_width.is_some_and(|width| width != body_width)
+    doc.rendered_width.is_some_and(|width| width != body_width)
 }
 
 fn load_diff(root: &Path, rel: &str, kind: &str) -> Doc {
@@ -1402,14 +1588,14 @@ fn load_diff(root: &Path, rel: &str, kind: &str) -> Doc {
         context: format!("{} — {what} diff", root.join(rel).display()),
         lines,
         numbered: false,
-        media: None,
         scroll: 0,
         wrap: true,
-        glow_width: None,
+        rendered_width: None,
         rows: Vec::new(),
         rows_key: None,
         pending_src: None,
         selection: PreviewSelection::default(),
+        source: None,
     }
 }
 
@@ -1722,6 +1908,1146 @@ fn heartbeat_due(last: u64, now: u64) -> bool {
     now < last || now - last >= 5
 }
 
+/// Polling interval while a language-server handshake or request is in
+/// flight: prompt enough for a warm server, cheap enough for a cold one.
+const NAV_POLL: Duration = Duration::from_millis(50);
+/// A navigation request unanswered for this long is dropped with a notice.
+const NAV_TIMEOUT: Duration = Duration::from_secs(5);
+/// `initialize` may take seconds on a cold server; the worker waits this long.
+const INIT_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// What a navigation gesture asks the server.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NavKind {
+    Definition,
+    TypeDefinition,
+    Implementation,
+    References,
+    Hover,
+    Symbols,
+}
+
+impl NavKind {
+    fn label(self) -> &'static str {
+        match self {
+            NavKind::Definition => "Go to Definition",
+            NavKind::TypeDefinition => "Go to Type Definition",
+            NavKind::Implementation => "Go to Implementation",
+            NavKind::References => "Find References",
+            NavKind::Hover => "Hover",
+            NavKind::Symbols => "Document Symbols",
+        }
+    }
+
+    fn method(self) -> &'static str {
+        match self {
+            NavKind::Definition => "definition",
+            NavKind::TypeDefinition => "typeDefinition",
+            NavKind::Implementation => "implementation",
+            NavKind::References => "references",
+            NavKind::Hover => "hover",
+            NavKind::Symbols => "documentSymbol",
+        }
+    }
+}
+
+/// Why a handshake did not produce a client.
+enum ConnectError {
+    /// lspmux is missing or not running: the advice to show.
+    Preflight(String),
+    Failed(String),
+}
+
+struct Inflight {
+    kind: NavKind,
+    /// The document the gesture was made on; a reply is applied only while
+    /// it is still showing.
+    doc: Request,
+    /// The screen cell the gesture was made at (where a hover box goes).
+    at: (u16, u16),
+    started: Instant,
+    receiver: std::sync::mpsc::Receiver<Result<serde_json::Value, String>>,
+}
+
+/// Something the event loop must act on after [`Nav::collect`].
+enum NavEvent {
+    Notice(String),
+    /// A reply for `kind` on the document it was asked about, made at a cell.
+    Reply(NavKind, serde_json::Value, (u16, u16)),
+}
+
+/// Code-navigation state for the pane: one language-server session (through
+/// the lspmux shim), the handshake worker, the request in flight and the
+/// back/forward history. See docs/lsp-navigation.md.
+#[derive(Default)]
+struct Nav {
+    session: Option<(LspSpec, lsp::Client)>,
+    connecting: Option<(
+        LspSpec,
+        std::sync::mpsc::Receiver<Result<lsp::Client, ConnectError>>,
+    )>,
+    /// Advice from the last failed preflight. Re-checked on the next
+    /// gesture, never on a timer or a document load.
+    preflight_failed: Option<String>,
+    /// The document the server has open.
+    open: Option<PathBuf>,
+    version: i32,
+    history: lsp::History<(Request, usize)>,
+    inflight: Option<Inflight>,
+    /// One gesture parked while the server connects or indexes.
+    queued: Option<(NavKind, usize, usize, (u16, u16))>,
+    /// The last cell the pointer clicked or rested on: where `m` acts.
+    last_cell: Option<(u16, u16)>,
+    /// Scroll to restore once the load for a history entry lands.
+    restore_scroll: Option<(Request, usize)>,
+}
+
+fn server_name(spec: &LspSpec) -> String {
+    crate::programs::display_name(&spec.command)
+}
+
+fn nav_spec(request: &Request) -> Option<&LspSpec> {
+    match request {
+        Request::File { lsp, .. } => lsp.as_ref(),
+        _ => None,
+    }
+}
+
+impl Nav {
+    /// Whether the loop should poll quickly for a worker.
+    fn busy(&self) -> bool {
+        self.connecting.is_some() || self.inflight.is_some()
+    }
+
+    /// Footer status while the server reports progress.
+    fn status(&self) -> Option<String> {
+        let (_, client) = self.session.as_ref()?;
+        let progress = client.progress()?;
+        Some(match progress.percentage {
+            Some(pct) => format!("{}… {pct}%", progress.title.to_lowercase()),
+            None => format!("{}…", progress.title.to_lowercase()),
+        })
+    }
+
+    /// A document finished loading: open it on the server (prewarming the
+    /// connection when there is none), or close the previous one when this
+    /// document is not navigable.
+    fn on_loaded(&mut self, request: &Request, doc: &Doc) {
+        self.drop_dead();
+        if let Some(path) = self.open.take()
+            && let Some((_, client)) = &mut self.session
+        {
+            client.did_close(&path);
+        }
+        self.queued = None;
+        let Some(spec) = nav_spec(request) else {
+            return;
+        };
+        if doc.source.is_none() {
+            return;
+        }
+        if self
+            .session
+            .as_ref()
+            .is_some_and(|(active, _)| active != spec)
+            && let Some((_, client)) = self.session.take()
+        {
+            std::thread::spawn(move || client.shutdown());
+        }
+        if self
+            .connecting
+            .as_ref()
+            .is_some_and(|(pending, _)| pending != spec)
+        {
+            self.connecting = None;
+        }
+        match &self.session {
+            Some(_) => self.open_current(request, doc),
+            None if self.connecting.is_none() && self.preflight_failed.is_none() => {
+                self.start_connect(spec.clone());
+            }
+            None => {}
+        }
+    }
+
+    fn open_current(&mut self, request: &Request, doc: &Doc) {
+        let (Request::File { path, .. }, Some(source), Some((_, client))) =
+            (request, &doc.source, &mut self.session)
+        else {
+            return;
+        };
+        self.version += 1;
+        client.did_open(path, source, self.version);
+        self.open = Some(path.clone());
+    }
+
+    fn drop_dead(&mut self) {
+        if self
+            .session
+            .as_ref()
+            .is_some_and(|(_, client)| client.is_dead())
+        {
+            self.session = None;
+            self.open = None;
+        }
+    }
+
+    /// Preflight, spawn the shim and run `initialize` on a worker.
+    fn start_connect(&mut self, spec: LspSpec) {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker_spec = spec.clone();
+        std::thread::spawn(move || {
+            let state = lsp::preflight();
+            let outcome = match lsp::advice_here(state) {
+                Some(advice) => Err(ConnectError::Preflight(advice)),
+                None => lsp::Transport::spawn(&worker_spec)
+                    .map_err(|e| ConnectError::Failed(e.to_string()))
+                    .and_then(|transport| {
+                        let mut client = lsp::Client::new(transport);
+                        client
+                            .initialize(&worker_spec.root, INIT_TIMEOUT)
+                            .map(|()| client)
+                            .map_err(ConnectError::Failed)
+                    }),
+            };
+            let _ = sender.send(outcome);
+        });
+        self.connecting = Some((spec, receiver));
+    }
+
+    /// A navigation gesture at a source position on `request`'s document.
+    /// Sends the request, or parks it while the server connects or indexes.
+    /// Returns the notice to show, if any.
+    fn gesture(
+        &mut self,
+        kind: NavKind,
+        request: &Request,
+        doc: &Doc,
+        line: usize,
+        col: usize,
+        at: (u16, u16),
+    ) -> Option<String> {
+        self.drop_dead();
+        let Some(spec) = nav_spec(request).cloned() else {
+            return Some(format!(
+                "no [[lsp]] rule for {} (Settings → Preview programs…)",
+                doc.name
+            ));
+        };
+        if doc.source.is_none() {
+            return Some("code navigation needs the plain source view".into());
+        }
+        if self.session.is_none() {
+            self.queued = Some((kind, line, col, at));
+            if self.connecting.is_none() {
+                let advice = self.preflight_failed.take();
+                self.start_connect(spec.clone());
+                return advice;
+            }
+            return Some(format!("connecting to {}…", server_name(&spec)));
+        }
+        if self.open.is_none() {
+            self.open_current(request, doc);
+        }
+        if self.status().is_some() {
+            self.queued = Some((kind, line, col, at));
+            return Some("waiting for the server to finish indexing…".into());
+        }
+        self.send(kind, request, doc, line, col, at);
+        None
+    }
+
+    /// Whether a server is connected and idle (a hover is worth asking for).
+    fn ready(&self) -> bool {
+        self.session.is_some() && self.inflight.is_none() && self.status().is_none()
+    }
+
+    fn supports(&self, provider: &str) -> bool {
+        self.session
+            .as_ref()
+            .is_some_and(|(_, client)| client.supports(provider))
+    }
+
+    fn send(
+        &mut self,
+        kind: NavKind,
+        request: &Request,
+        doc: &Doc,
+        line: usize,
+        col: usize,
+        at: (u16, u16),
+    ) {
+        let (Request::File { path, .. }, Some(source), Some((_, client))) =
+            (request, &doc.source, &mut self.session)
+        else {
+            return;
+        };
+        let text = source.lines().nth(line).unwrap_or("");
+        let character = lsp::to_lsp_col(text, col, client.encoding);
+        let receiver = match kind {
+            NavKind::References => client.references(path, line, character),
+            NavKind::Symbols => client.document_symbols(path),
+            other => client.at(other.method(), path, line, character),
+        };
+        self.inflight = Some(Inflight {
+            kind,
+            doc: request.clone(),
+            at,
+            started: Instant::now(),
+            receiver,
+        });
+    }
+
+    /// Drain the workers: the handshake, the server's own traffic, the
+    /// request in flight. Call once per loop iteration.
+    fn collect(&mut self, current: Option<&Request>, doc: Option<&Doc>) -> Vec<NavEvent> {
+        let mut events = Vec::new();
+        if let Some((spec, receiver)) = &self.connecting {
+            match receiver.try_recv() {
+                Ok(Ok(client)) => {
+                    let spec = spec.clone();
+                    self.connecting = None;
+                    self.session = Some((spec, client));
+                    if let (Some(request), Some(doc)) = (current, doc)
+                        && nav_spec(request) == self.session.as_ref().map(|(s, _)| s)
+                    {
+                        self.open_current(request, doc);
+                    }
+                }
+                Ok(Err(ConnectError::Preflight(advice))) => {
+                    self.connecting = None;
+                    if self.queued.take().is_some() {
+                        events.push(NavEvent::Notice(advice.clone()));
+                    }
+                    self.preflight_failed = Some(advice);
+                }
+                Ok(Err(ConnectError::Failed(error))) => {
+                    let name = server_name(spec);
+                    self.connecting = None;
+                    self.queued = None;
+                    events.push(NavEvent::Notice(format!("{name} failed: {error}")));
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => self.connecting = None,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        if let Some((_, client)) = &mut self.session {
+            client.pump();
+        }
+        let was_dead = self
+            .session
+            .as_ref()
+            .is_some_and(|(_, client)| client.is_dead());
+        if was_dead {
+            self.drop_dead();
+            self.inflight = None;
+            self.queued = None;
+            events.push(NavEvent::Notice("language server connection closed".into()));
+        }
+        if let Some(inflight) = &self.inflight {
+            match inflight.receiver.try_recv() {
+                Ok(outcome) => {
+                    let Inflight { kind, doc, at, .. } = self.inflight.take().expect("checked");
+                    if current == Some(&doc) {
+                        match outcome {
+                            Ok(value) => events.push(NavEvent::Reply(kind, value, at)),
+                            Err(error) => events.push(NavEvent::Notice(error)),
+                        }
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => self.inflight = None,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    if inflight.started.elapsed() > NAV_TIMEOUT {
+                        let name = self
+                            .session
+                            .as_ref()
+                            .map(|(spec, _)| server_name(spec))
+                            .unwrap_or_else(|| "the language server".into());
+                        self.inflight = None;
+                        events.push(NavEvent::Notice(format!("{name} did not answer")));
+                    }
+                }
+            }
+        }
+        // A parked gesture fires once the server is connected and idle.
+        if let Some((kind, line, col, at)) = self.queued
+            && self.session.is_some()
+            && self.status().is_none()
+            && let (Some(request), Some(doc)) = (current, doc)
+        {
+            self.queued = None;
+            if self.open.is_none() {
+                self.open_current(request, doc);
+            }
+            self.send(kind, request, doc, line, col, at);
+        }
+        events
+    }
+
+    /// Shut the session down (viewer exit).
+    fn finish(&mut self) {
+        if let Some((_, client)) = self.session.take() {
+            client.shutdown();
+        }
+    }
+}
+
+/// How long the pointer rests on one cell before a hover is requested.
+const HOVER_DWELL: Duration = Duration::from_millis(500);
+/// A hover box closes by itself after this long (terminals send no
+/// "pointer left the pane" event).
+const HOVER_TTL: Duration = Duration::from_secs(8);
+/// Widest hover box; leaf wraps the Markdown to it.
+const HOVER_MAX_WIDTH: u16 = 60;
+/// Pickers list at most this many locations.
+const PICKER_CAP: usize = 500;
+
+/// A floating element over the preview body: the navigation menu, a result
+/// picker, or a hover box. Input goes to the overlay first.
+enum Overlay {
+    Menu {
+        at: (u16, u16),
+        /// Source position the entries act on.
+        pos: (usize, usize),
+        entries: Vec<MenuAction>,
+        selected: usize,
+        rect: Rect,
+    },
+    Picker {
+        title: String,
+        items: Vec<PickItem>,
+        selected: usize,
+        scroll: usize,
+        rect: Rect,
+    },
+    Hover {
+        lines: Vec<Line<'static>>,
+        at: (u16, u16),
+        shown: Instant,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MenuAction {
+    Nav(NavKind),
+    Back,
+    Forward,
+}
+
+impl MenuAction {
+    fn label(self) -> &'static str {
+        match self {
+            MenuAction::Nav(kind) => kind.label(),
+            MenuAction::Back => "Back",
+            MenuAction::Forward => "Forward",
+        }
+    }
+}
+
+/// One picker row: a navigable location, or a file header (`target: None`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PickItem {
+    label: String,
+    target: Option<lsp::Target>,
+}
+
+/// The menu for a server with these capabilities (`supports` answers
+/// `<name>Provider` questions).
+fn menu_entries(supports: impl Fn(&str) -> bool) -> Vec<MenuAction> {
+    let mut entries = vec![MenuAction::Nav(NavKind::Definition)];
+    if supports("typeDefinitionProvider") {
+        entries.push(MenuAction::Nav(NavKind::TypeDefinition));
+    }
+    if supports("implementationProvider") {
+        entries.push(MenuAction::Nav(NavKind::Implementation));
+    }
+    entries.extend([
+        MenuAction::Nav(NavKind::References),
+        MenuAction::Nav(NavKind::Hover),
+        MenuAction::Nav(NavKind::Symbols),
+        MenuAction::Back,
+        MenuAction::Forward,
+    ]);
+    entries
+}
+
+/// Picker rows for a list of locations: grouped by file (header rows show
+/// the path relative to `root`), each location with its trimmed line text
+/// from `read`, capped at [`PICKER_CAP`] with a `+N more` footer.
+fn location_items(
+    targets: &[lsp::Target],
+    root: &Path,
+    read: impl Fn(&Path) -> Option<String>,
+) -> Vec<PickItem> {
+    let mut sorted: Vec<&lsp::Target> = targets.iter().take(PICKER_CAP).collect();
+    sorted.sort_by(|a, b| (&a.path, a.line, a.character).cmp(&(&b.path, b.line, b.character)));
+    let mut items = Vec::new();
+    let mut current_file: Option<&Path> = None;
+    let mut text: Option<String> = None;
+    for target in sorted {
+        if current_file != Some(target.path.as_path()) {
+            current_file = Some(&target.path);
+            text = read(&target.path);
+            let shown = target
+                .path
+                .strip_prefix(root)
+                .unwrap_or(&target.path)
+                .display()
+                .to_string();
+            items.push(PickItem {
+                label: shown,
+                target: None,
+            });
+        }
+        let snippet = text
+            .as_deref()
+            .and_then(|t| t.lines().nth(target.line))
+            .map(str::trim)
+            .unwrap_or("");
+        let snippet: String = snippet.chars().take(120).collect();
+        items.push(PickItem {
+            label: format!("  {}: {snippet}", target.line + 1),
+            target: Some(target.clone()),
+        });
+    }
+    if targets.len() > PICKER_CAP {
+        items.push(PickItem {
+            label: format!("+{} more", targets.len() - PICKER_CAP),
+            target: None,
+        });
+    }
+    items
+}
+
+fn read_snippet_source(path: &Path) -> Option<String> {
+    let metadata = std::fs::metadata(path).ok()?;
+    if metadata.len() > MAX_BYTES as u64 {
+        return None;
+    }
+    std::fs::read_to_string(path).ok()
+}
+
+fn symbol_kind_label(kind: u64) -> &'static str {
+    match kind {
+        2 => "mod",
+        3 => "ns",
+        5 => "class",
+        6 => "fn",
+        7 => "prop",
+        8 => "field",
+        9 => "new",
+        10 => "enum",
+        11 => "trait",
+        12 => "fn",
+        13 => "var",
+        14 => "const",
+        22 => "variant",
+        23 => "struct",
+        26 => "type",
+        _ => "",
+    }
+}
+
+/// Picker rows for a `textDocument/documentSymbol` result: nested
+/// `DocumentSymbol`s flattened with two spaces per depth, or the flat
+/// `SymbolInformation` form. `path` is the document (DocumentSymbol carries
+/// no URI).
+fn symbol_items(result: &serde_json::Value, path: &Path) -> Vec<PickItem> {
+    fn push(items: &mut Vec<PickItem>, symbols: &[serde_json::Value], depth: usize, path: &Path) {
+        for symbol in symbols {
+            let name = symbol.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+            let kind = symbol
+                .get("kind")
+                .and_then(|v| v.as_u64())
+                .map(symbol_kind_label)
+                .unwrap_or("");
+            let (target, nested) = if let Some(location) = symbol.get("location") {
+                (lsp::targets(location).into_iter().next(), false)
+            } else {
+                let range = symbol.get("selectionRange").or_else(|| symbol.get("range"));
+                let start = range.and_then(|r| r.get("start"));
+                let line = start.and_then(|s| s.get("line")).and_then(|v| v.as_u64());
+                (
+                    line.map(|line| lsp::Target {
+                        path: path.to_path_buf(),
+                        line: line as usize,
+                        character: start
+                            .and_then(|s| s.get("character"))
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0) as u32,
+                    }),
+                    true,
+                )
+            };
+            let label = if kind.is_empty() {
+                format!("{}{name}", "  ".repeat(depth))
+            } else {
+                format!("{}{name}  {kind}", "  ".repeat(depth))
+            };
+            items.push(PickItem { label, target });
+            if nested && let Some(children) = symbol.get("children").and_then(|v| v.as_array()) {
+                push(items, children, depth + 1, path);
+            }
+        }
+    }
+    let mut items = Vec::new();
+    if let Some(symbols) = result.as_array() {
+        push(&mut items, symbols, 0, path);
+    }
+    items
+}
+
+/// One Markdown string from a hover result's `contents`: `MarkupContent`,
+/// a `MarkedString` (plain or `{language, value}`), or an array of them.
+fn hover_markdown(result: &serde_json::Value) -> Option<String> {
+    fn one(value: &serde_json::Value) -> Option<String> {
+        match value {
+            serde_json::Value::String(text) => Some(text.clone()),
+            serde_json::Value::Object(map) => {
+                let text = map.get("value")?.as_str()?;
+                match map.get("language").and_then(|l| l.as_str()) {
+                    Some(language) => Some(format!("```{language}\n{text}\n```")),
+                    None => Some(text.to_string()),
+                }
+            }
+            _ => None,
+        }
+    }
+    let contents = result.get("contents")?;
+    let parts: Vec<String> = match contents {
+        serde_json::Value::Array(items) => items.iter().filter_map(one).collect(),
+        other => one(other).into_iter().collect(),
+    };
+    let joined = parts.join("\n\n");
+    (!joined.trim().is_empty()).then_some(joined)
+}
+
+/// Plain-text fallback for hover Markdown: fence markers dropped.
+fn strip_fences(markdown: &str) -> Vec<Line<'static>> {
+    markdown
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("```"))
+        .map(|line| Line::raw(line.to_string()))
+        .collect()
+}
+
+/// Render hover Markdown with `leaf --inline ansi:<width>` on stdin — a
+/// fixed renderer, never the user's Markdown previewer rule (that may be an
+/// external viewer or slow; a tooltip must be instant and inline). Without
+/// leaf, the plain text with fences stripped.
+fn render_hover(markdown: &str, width: u16) -> Vec<Line<'static>> {
+    let Some(leaf) = crate::programs::resolve_program_here("leaf") else {
+        return strip_fences(markdown);
+    };
+    let mut command = std::process::Command::new(leaf);
+    command
+        .arg("--inline")
+        .arg(format!("ansi:{width}"))
+        .env("COLUMNS", width.to_string())
+        .env("CLICOLOR_FORCE", "1")
+        .env("FORCE_COLOR", "1")
+        .env("COLORTERM", "truecolor")
+        .env_remove("NO_COLOR");
+    match run_captured(
+        command,
+        markdown.as_bytes().to_vec(),
+        MAX_RENDER_BYTES,
+        RENDER_TIMEOUT,
+    ) {
+        Ok(output) if output.status.success() && !output.stdout.is_empty() => {
+            let text = String::from_utf8_lossy(&output.stdout);
+            let mut lines = ansi::to_lines(&text);
+            while lines.last().is_some_and(|l| l.width() == 0) {
+                lines.pop();
+            }
+            lines
+        }
+        _ => strip_fences(markdown),
+    }
+}
+
+/// Draw the overlay over the body; menu and picker remember their rect for
+/// mouse hit-testing.
+fn draw_overlay(frame: &mut Frame, overlay: &mut Overlay, body: Rect) {
+    let area = frame.area();
+    match overlay {
+        Overlay::Menu {
+            at,
+            entries,
+            selected,
+            rect,
+            ..
+        } => {
+            let label_width = entries
+                .iter()
+                .map(|e| e.label().chars().count())
+                .max()
+                .unwrap_or(0) as u16;
+            let width = (label_width + 4).min(area.width);
+            let height = (entries.len() as u16 + 2).min(area.height);
+            let px = at.0.min(area.width.saturating_sub(width));
+            let py = (at.1 + 1).min(area.height.saturating_sub(height));
+            *rect = Rect::new(px, py, width, height);
+            let items: Vec<ListItem> = entries
+                .iter()
+                .enumerate()
+                .map(|(i, entry)| {
+                    let line = Line::raw(format!(" {}", entry.label()));
+                    if i == *selected {
+                        ListItem::new(line).style(selection_style(true))
+                    } else {
+                        ListItem::new(line)
+                    }
+                })
+                .collect();
+            frame.render_widget(Clear, *rect);
+            frame.render_widget(
+                List::new(items).block(Block::bordered().border_style(Style::default().dim())),
+                *rect,
+            );
+        }
+        Overlay::Picker {
+            title,
+            items,
+            selected,
+            scroll,
+            rect,
+        } => {
+            let width = area.width.saturating_sub(2).clamp(10, 90);
+            let visible = usize::from(area.height.saturating_sub(4))
+                .min(items.len())
+                .max(1);
+            let height = (visible as u16 + 2).min(area.height).max(3);
+            *rect = Rect::new(
+                area.width.saturating_sub(width) / 2,
+                area.height.saturating_sub(height) / 4,
+                width,
+                height,
+            );
+            let inner = rect.inner(ratatui::layout::Margin::new(1, 1));
+            let rows = usize::from(inner.height).max(1);
+            if *selected < *scroll {
+                *scroll = *selected;
+            } else if *selected >= *scroll + rows {
+                *scroll = *selected + 1 - rows;
+            }
+            let list: Vec<ListItem> = items
+                .iter()
+                .enumerate()
+                .skip(*scroll)
+                .take(rows)
+                .map(|(i, item)| {
+                    let label: String = item
+                        .label
+                        .chars()
+                        .take(usize::from(inner.width).saturating_sub(2))
+                        .collect();
+                    let line = if item.target.is_none() {
+                        Line::from(Span::styled(
+                            format!(" {label}"),
+                            Style::default().bold().fg(palette().header_accent),
+                        ))
+                    } else {
+                        Line::raw(format!(" {label}"))
+                    };
+                    if i == *selected {
+                        ListItem::new(line).style(selection_style(true))
+                    } else {
+                        ListItem::new(line)
+                    }
+                })
+                .collect();
+            frame.render_widget(Clear, *rect);
+            frame.render_widget(
+                List::new(list).block(
+                    Block::bordered()
+                        .title(format!(" {title} "))
+                        .border_style(Style::default().fg(palette().accent)),
+                ),
+                *rect,
+            );
+            draw_scrollbar(
+                frame,
+                Rect::new(rect.right().saturating_sub(1), inner.y, 1, inner.height),
+                items.len(),
+                rows,
+                *scroll,
+            );
+        }
+        Overlay::Hover { lines, at, .. } => {
+            let text_width = lines.iter().map(Line::width).max().unwrap_or(0) as u16;
+            let width = (text_width + 2)
+                .min(HOVER_MAX_WIDTH + 2)
+                .min(area.width)
+                .max(3);
+            let height = (lines.len() as u16 + 2)
+                .min(body.height / 2)
+                .min(area.height)
+                .max(3);
+            let px = at.0.min(area.width.saturating_sub(width));
+            let below = at.1 + 1;
+            let py = if below + height <= area.height {
+                below
+            } else {
+                at.1.saturating_sub(height)
+            };
+            let rect = Rect::new(px, py, width, height);
+            frame.render_widget(Clear, rect);
+            frame.render_widget(
+                Paragraph::new(lines.clone())
+                    .block(Block::bordered().border_style(Style::default().dim())),
+                rect,
+            );
+        }
+    }
+}
+
+/// Picker/menu row under a screen cell, if inside the overlay's inner area.
+fn overlay_row_at(rect: Rect, scroll: usize, column: u16, row: u16) -> Option<usize> {
+    let inner = rect.inner(ratatui::layout::Margin::new(1, 1));
+    (column >= inner.x && column < inner.right() && row >= inner.y && row < inner.bottom())
+        .then(|| scroll + usize::from(row - inner.y))
+}
+
+/// Move a picker selection to the next selectable row in `direction`.
+fn picker_step(items: &[PickItem], selected: usize, direction: isize) -> usize {
+    let mut index = selected;
+    loop {
+        let next = index as isize + direction;
+        if next < 0 || next >= items.len() as isize {
+            return selected;
+        }
+        index = next as usize;
+        if items[index].target.is_some() {
+            return index;
+        }
+        if index == 0 || index + 1 == items.len() {
+            // Only headers that way: stay.
+            return selected;
+        }
+    }
+}
+
+fn first_selectable(items: &[PickItem]) -> usize {
+    items
+        .iter()
+        .position(|item| item.target.is_some())
+        .unwrap_or(0)
+}
+
+/// A hover box being rendered on a worker, and the cell it belongs to.
+type HoverRender = (std::sync::mpsc::Receiver<Vec<Line<'static>>>, (u16, u16));
+
+/// What the loop does after an overlay handled an input event.
+enum OverlayOutcome {
+    Keep(Overlay),
+    Close,
+    /// Run a navigation gesture at a source position, from a cell.
+    Nav(NavKind, (usize, usize), (u16, u16)),
+    /// Back (`false`) or forward (`true`).
+    History(bool),
+    GoTo(lsp::Target),
+}
+
+fn activate_menu(
+    entries: &[MenuAction],
+    index: usize,
+    pos: (usize, usize),
+    at: (u16, u16),
+) -> OverlayOutcome {
+    match entries.get(index) {
+        Some(MenuAction::Nav(kind)) => OverlayOutcome::Nav(*kind, pos, at),
+        Some(MenuAction::Back) => OverlayOutcome::History(false),
+        Some(MenuAction::Forward) => OverlayOutcome::History(true),
+        None => OverlayOutcome::Close,
+    }
+}
+
+fn activate_picker(items: &[PickItem], index: usize) -> OverlayOutcome {
+    match items.get(index).and_then(|item| item.target.clone()) {
+        Some(target) => OverlayOutcome::GoTo(target),
+        None => OverlayOutcome::Keep(Overlay::Picker {
+            title: String::new(),
+            items: Vec::new(),
+            selected: 0,
+            scroll: 0,
+            rect: Rect::default(),
+        }),
+    }
+}
+
+/// A key while a menu or picker is up. (A hover box is closed by the loop
+/// before any key reaches here.)
+fn overlay_key(overlay: Overlay, key: KeyCode, page: usize) -> OverlayOutcome {
+    match overlay {
+        Overlay::Menu {
+            at,
+            pos,
+            entries,
+            mut selected,
+            rect,
+        } => match key {
+            KeyCode::Esc | KeyCode::Char('q') => OverlayOutcome::Close,
+            KeyCode::Enter => activate_menu(&entries, selected, pos, at),
+            KeyCode::Up | KeyCode::Char('k') => {
+                selected = selected.saturating_sub(1);
+                OverlayOutcome::Keep(Overlay::Menu {
+                    at,
+                    pos,
+                    entries,
+                    selected,
+                    rect,
+                })
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                selected = (selected + 1).min(entries.len().saturating_sub(1));
+                OverlayOutcome::Keep(Overlay::Menu {
+                    at,
+                    pos,
+                    entries,
+                    selected,
+                    rect,
+                })
+            }
+            _ => OverlayOutcome::Keep(Overlay::Menu {
+                at,
+                pos,
+                entries,
+                selected,
+                rect,
+            }),
+        },
+        Overlay::Picker {
+            title,
+            items,
+            mut selected,
+            scroll,
+            rect,
+        } => {
+            match key {
+                KeyCode::Esc | KeyCode::Char('q') => return OverlayOutcome::Close,
+                KeyCode::Enter => {
+                    if let OverlayOutcome::GoTo(target) = activate_picker(&items, selected) {
+                        return OverlayOutcome::GoTo(target);
+                    }
+                }
+                KeyCode::Up | KeyCode::Char('k') => selected = picker_step(&items, selected, -1),
+                KeyCode::Down | KeyCode::Char('j') => selected = picker_step(&items, selected, 1),
+                KeyCode::PageUp | KeyCode::Char('b') => {
+                    for _ in 0..page {
+                        selected = picker_step(&items, selected, -1);
+                    }
+                }
+                KeyCode::PageDown | KeyCode::Char(' ') => {
+                    for _ in 0..page {
+                        selected = picker_step(&items, selected, 1);
+                    }
+                }
+                KeyCode::Home | KeyCode::Char('g') => selected = first_selectable(&items),
+                KeyCode::End | KeyCode::Char('G') => {
+                    selected = items
+                        .iter()
+                        .rposition(|item| item.target.is_some())
+                        .unwrap_or(selected)
+                }
+                _ => {}
+            }
+            OverlayOutcome::Keep(Overlay::Picker {
+                title,
+                items,
+                selected,
+                scroll,
+                rect,
+            })
+        }
+        hover @ Overlay::Hover { .. } => OverlayOutcome::Keep(hover),
+    }
+}
+
+/// A mouse event while a menu or picker is up: clicks inside pick, clicks
+/// outside close, the wheel scrolls a picker, motion highlights.
+fn overlay_mouse(overlay: Overlay, mouse: &MouseEvent) -> OverlayOutcome {
+    match overlay {
+        Overlay::Menu {
+            at,
+            pos,
+            entries,
+            mut selected,
+            rect,
+        } => {
+            let hit =
+                overlay_row_at(rect, 0, mouse.column, mouse.row).filter(|row| *row < entries.len());
+            match (mouse.kind, hit) {
+                (MouseEventKind::Down(_), Some(row)) => activate_menu(&entries, row, pos, at),
+                (MouseEventKind::Down(_), None) => OverlayOutcome::Close,
+                (MouseEventKind::Moved, Some(row)) => {
+                    selected = row;
+                    OverlayOutcome::Keep(Overlay::Menu {
+                        at,
+                        pos,
+                        entries,
+                        selected,
+                        rect,
+                    })
+                }
+                _ => OverlayOutcome::Keep(Overlay::Menu {
+                    at,
+                    pos,
+                    entries,
+                    selected,
+                    rect,
+                }),
+            }
+        }
+        Overlay::Picker {
+            title,
+            items,
+            mut selected,
+            mut scroll,
+            rect,
+        } => {
+            let hit = overlay_row_at(rect, scroll, mouse.column, mouse.row)
+                .filter(|row| *row < items.len());
+            match (mouse.kind, hit) {
+                (MouseEventKind::Down(MouseButton::Left), Some(row)) => {
+                    if let OverlayOutcome::GoTo(target) = activate_picker(&items, row) {
+                        return OverlayOutcome::GoTo(target);
+                    }
+                }
+                (MouseEventKind::Down(_), None) => return OverlayOutcome::Close,
+                (MouseEventKind::Moved, Some(row)) if items[row].target.is_some() => {
+                    selected = row;
+                }
+                (MouseEventKind::ScrollUp, _) => scroll = scroll.saturating_sub(3),
+                (MouseEventKind::ScrollDown, _) => {
+                    scroll = (scroll + 3).min(items.len().saturating_sub(1));
+                }
+                _ => {}
+            }
+            OverlayOutcome::Keep(Overlay::Picker {
+                title,
+                items,
+                selected,
+                scroll,
+                rect,
+            })
+        }
+        hover @ Overlay::Hover { .. } => OverlayOutcome::Keep(hover),
+    }
+}
+
+/// The navigation menu at `cell`, acting on the source position under it.
+fn open_menu(nav: &Nav, doc: &Doc, body: Rect, cell: (u16, u16)) -> Result<Overlay, String> {
+    if doc.source.is_none() {
+        return Err("code navigation needs the plain source view".into());
+    }
+    let pos = doc
+        .source_position_at(body, cell.0, cell.1)
+        .ok_or_else(|| "no code under the pointer".to_string())?;
+    Ok(Overlay::Menu {
+        at: cell,
+        pos,
+        entries: menu_entries(|provider| nav.supports(provider)),
+        selected: 0,
+        rect: Rect::default(),
+    })
+}
+
+/// Show `target` in this pane: a jump within the current file scrolls and
+/// flashes the line; another file loads through the normal request path with
+/// the origin's language server, so the sidebar's routing stays consistent.
+/// The document being left goes onto the back history.
+#[allow(clippy::too_many_arguments)]
+fn go_to(
+    nav: &mut Nav,
+    target: &lsp::Target,
+    current: &mut Option<Request>,
+    mode: &mut ViewMode,
+    preview_load: &mut Option<(Request, std::sync::mpsc::Receiver<Doc>)>,
+    control: &Path,
+    identity_pending: &mut bool,
+    notice: &mut Option<String>,
+) {
+    let (Some(origin @ Request::File { path, lsp, .. }), ViewMode::Preview(doc)) =
+        (current.as_ref(), &mut *mode)
+    else {
+        return;
+    };
+    let line = target.line + 1;
+    let name = target
+        .path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    nav.history.push((origin.clone(), doc.scroll));
+    if &target.path == path {
+        doc.pending_src = Some(target.line);
+        *notice = Some(format!("{name}:{line}"));
+        return;
+    }
+    let request = Request::File {
+        path: target.path.clone(),
+        line: Some(line),
+        renderer: None,
+        editor: None,
+        external: false,
+        lsp: lsp.clone(),
+    };
+    let _ = write_scratch_file(control, &request_payload(&request));
+    *mode = ViewMode::Preview(loading_doc(&request));
+    *current = Some(request.clone());
+    *preview_load = Some(start_preview_load(request));
+    *identity_pending = true;
+    *notice = Some(format!("{name}:{line}"));
+}
+
+/// Back (`forward == false`) or forward through the navigation history.
+#[allow(clippy::too_many_arguments)]
+fn history_step(
+    nav: &mut Nav,
+    forward: bool,
+    current: &mut Option<Request>,
+    mode: &mut ViewMode,
+    preview_load: &mut Option<(Request, std::sync::mpsc::Receiver<Doc>)>,
+    control: &Path,
+    identity_pending: &mut bool,
+    notice: &mut Option<String>,
+) {
+    let (Some(here), ViewMode::Preview(doc)) = (current.clone(), &mut *mode) else {
+        return;
+    };
+    let now = (here.clone(), doc.scroll);
+    let step = if forward {
+        nav.history.forward(now)
+    } else {
+        nav.history.back(now)
+    };
+    let Some((request, scroll)) = step else {
+        *notice = Some(
+            if forward {
+                "nothing ahead"
+            } else {
+                "nothing to go back to"
+            }
+            .into(),
+        );
+        return;
+    };
+    if request == here {
+        doc.pending_src = None;
+        doc.scroll = scroll;
+        *notice = None;
+        return;
+    }
+    let _ = write_scratch_file(control, &request_payload(&request));
+    *mode = ViewMode::Preview(loading_doc(&request));
+    *current = Some(request.clone());
+    nav.restore_scroll = Some((request.clone(), scroll));
+    *preview_load = Some(start_preview_load(request));
+    *identity_pending = true;
+    *notice = None;
+}
+
 /// The viewer's event loop; returns when the user closes it.
 pub fn run(control: &Path) -> std::io::Result<()> {
     // A control path outside our confined scratch directory would otherwise
@@ -1754,14 +3080,14 @@ pub fn run(control: &Path) -> std::io::Result<()> {
         context: String::new(),
         lines: vec![Line::raw("(waiting for a click in the sidebar)")],
         numbered: false,
-        media: None,
         scroll: 0,
         wrap: true,
-        glow_width: None,
+        rendered_width: None,
         rows: Vec::new(),
         rows_key: None,
         pending_src: None,
         selection: PreviewSelection::default(),
+        source: None,
     });
     let mut mode = ViewMode::Preview(doc);
     report_identity(
@@ -1791,7 +3117,91 @@ pub fn run(control: &Path) -> std::io::Result<()> {
     let mut last_diff_refresh = Instant::now();
     let mut diff_refresh: Option<(Request, std::sync::mpsc::Receiver<Doc>)> = None;
     let mut identity_pending = false;
+    let mut external_failed: Option<Request> = None;
+    let mut pending_edit: Option<String> = None;
+    let mut nav = Nav::default();
+    let mut overlay: Option<Overlay> = None;
+    let mut hover_render: Option<HoverRender> = None;
+    let mut last_motion: Option<((u16, u16), Instant)> = None;
+    let mut hovered_cell: Option<(u16, u16)> = None;
     let result = loop {
+        // `e`: the real editor takes over this pane; the document reloads
+        // when it exits. The tab is pinned first so a click elsewhere opens
+        // a fresh preview instead of hijacking an edit in progress.
+        if let Some(command) = pending_edit.take()
+            && let Some(request @ Request::File { .. }) = current.clone()
+            && let Request::File { path, .. } = &request
+        {
+            let path = path.clone();
+            pin_own_tab(&request.doc_key());
+            let name = crate::programs::display_name(&command);
+            notice = match run_external(
+                &mut terminal,
+                control,
+                &request,
+                &command,
+                &path,
+                &mode,
+                false,
+            )? {
+                ExternalExit::Failed(error) => Some(error),
+                _ => Some(format!("edited with {name}")),
+            };
+            mode = ViewMode::Preview(loading_doc(&request));
+            preview_load = Some(start_preview_load(request));
+            identity_pending = true;
+            external_failed = None;
+            continue;
+        }
+        // An external previewer (mode = "external") takes the pane's terminal
+        // until the next request.
+        if prompt.is_none()
+            && matches!(mode, ViewMode::Preview(_))
+            && let Some(request) = current.clone()
+            && external_failed.as_ref() != Some(&request)
+            && let Some(command) = external_command_for(&request)
+            && let Request::File { path, .. } = &request
+        {
+            preview_load = None;
+            let path = path.clone();
+            match run_external(
+                &mut terminal,
+                control,
+                &request,
+                &command,
+                &path,
+                &mode,
+                true,
+            )? {
+                ExternalExit::Edit => {
+                    pending_edit = editor_command_for(&request);
+                    if pending_edit.is_none() {
+                        external_failed = Some(request);
+                        notice = Some("no editor configured (Settings → Custom editor…)".into());
+                    }
+                }
+                ExternalExit::Finished => {}
+                ExternalExit::Request(Request::Close) | ExternalExit::Close => {
+                    if close_own_pane(control, &current, &mut notice) {
+                        break Ok(());
+                    }
+                    // Restore failed: the notice explains; a second q closes.
+                    external_failed = Some(request);
+                }
+                ExternalExit::Request(next) => {
+                    mode = ViewMode::Preview(loading_doc(&next));
+                    current = Some(next.clone());
+                    preview_load = Some(start_preview_load(next));
+                    identity_pending = true;
+                    notice = None;
+                }
+                ExternalExit::Failed(error) => {
+                    external_failed = Some(request.clone());
+                    preview_load = Some(start_fallback_load(request, error));
+                }
+            }
+            continue;
+        }
         let loaded =
             preview_load
                 .as_ref()
@@ -1804,16 +3214,151 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                 });
         if let Some((request, loaded)) = loaded {
             preview_load = None;
+            overlay = None;
+            hover_render = None;
             if current.as_ref() == Some(&request)
                 && let (ViewMode::Preview(doc), Some(mut loaded)) = (&mut mode, loaded)
             {
-                if doc.glow_width.is_some() && loaded.glow_width.is_some() {
+                if doc.rendered_width.is_some() && loaded.rendered_width.is_some() {
                     loaded.scroll = doc.scroll;
                 }
+                if let Some((wanted, scroll)) = nav.restore_scroll.take()
+                    && wanted == request
+                {
+                    loaded.pending_src = None;
+                    loaded.scroll = scroll;
+                }
                 *doc = loaded;
+                nav.on_loaded(&request, doc);
+            }
+        }
+        // Language-server traffic: the handshake, progress, and replies.
+        let events = nav.collect(
+            current.as_ref(),
+            match &mode {
+                ViewMode::Preview(doc) => Some(doc),
+                ViewMode::Edit(_) => None,
+            },
+        );
+        for event in events {
+            match event {
+                NavEvent::Notice(text) => notice = Some(text),
+                NavEvent::Reply(NavKind::Hover, value, at) => match hover_markdown(&value) {
+                    None => notice = Some("no hover information".into()),
+                    Some(markdown) => {
+                        let width = HOVER_MAX_WIDTH
+                            .min(preview_body.width.saturating_sub(4))
+                            .max(10);
+                        let (sender, receiver) = std::sync::mpsc::channel();
+                        std::thread::spawn(move || {
+                            let _ = sender.send(render_hover(&markdown, width));
+                        });
+                        hover_render = Some((receiver, at));
+                    }
+                },
+                NavEvent::Reply(NavKind::Symbols, value, _) => {
+                    let Some(Request::File { path, .. }) = current.as_ref() else {
+                        continue;
+                    };
+                    let items = symbol_items(&value, path);
+                    if items.is_empty() {
+                        notice = Some("no symbols".into());
+                    } else {
+                        overlay = Some(Overlay::Picker {
+                            title: format!("Symbols ({})", items.len()),
+                            selected: first_selectable(&items),
+                            items,
+                            scroll: 0,
+                            rect: Rect::default(),
+                        });
+                    }
+                }
+                NavEvent::Reply(kind, value, _) => {
+                    let targets = lsp::targets(&value);
+                    let root = current
+                        .as_ref()
+                        .and_then(nav_spec)
+                        .map(|spec| spec.root.clone())
+                        .unwrap_or_default();
+                    match (kind, targets.as_slice()) {
+                        (_, []) => {
+                            notice = Some(format!(
+                                "no {}",
+                                kind.label()
+                                    .to_lowercase()
+                                    .trim_start_matches("go to ")
+                                    .trim_start_matches("find ")
+                            ))
+                        }
+                        (NavKind::References, _) | (_, [_, _, ..]) => {
+                            let items = location_items(&targets, &root, read_snippet_source);
+                            overlay = Some(Overlay::Picker {
+                                title: format!(
+                                    "{} ({})",
+                                    kind.label()
+                                        .trim_start_matches("Go to ")
+                                        .trim_start_matches("Find "),
+                                    targets.len()
+                                ),
+                                selected: first_selectable(&items),
+                                items,
+                                scroll: 0,
+                                rect: Rect::default(),
+                            });
+                        }
+                        (_, [only]) => go_to(
+                            &mut nav,
+                            only,
+                            &mut current,
+                            &mut mode,
+                            &mut preview_load,
+                            control,
+                            &mut identity_pending,
+                            &mut notice,
+                        ),
+                    }
+                }
+            }
+        }
+        if let Some((receiver, at)) = &hover_render {
+            match receiver.try_recv() {
+                Ok(lines) => {
+                    let at = *at;
+                    hover_render = None;
+                    if !lines.is_empty() && overlay.is_none() {
+                        overlay = Some(Overlay::Hover {
+                            lines,
+                            at,
+                            shown: Instant::now(),
+                        });
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => hover_render = None,
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+        }
+        // A hover box times out on its own; a pointer resting on a cell asks
+        // for one once the server is idle.
+        if let Some(Overlay::Hover { shown, .. }) = &overlay
+            && shown.elapsed() > HOVER_TTL
+        {
+            overlay = None;
+        }
+        if overlay.is_none()
+            && hover_render.is_none()
+            && nav.ready()
+            && let Some((cell, since)) = last_motion
+            && since.elapsed() >= HOVER_DWELL
+            && hovered_cell != Some(cell)
+            && let (Some(request), ViewMode::Preview(doc)) = (current.as_ref(), &mode)
+        {
+            hovered_cell = Some(cell);
+            if let Some((line, col)) = doc.source_position_at(preview_body, cell.0, cell.1) {
+                nav.gesture(NavKind::Hover, request, doc, line, col, cell);
             }
         }
         let prompt_text = prompt.as_ref().map(Prompt::text);
+        let status = nav.status();
         let draw = terminal.draw(|frame| match &mut mode {
             ViewMode::Preview(doc) => {
                 (page, preview_body) = draw_doc(
@@ -1821,8 +3366,11 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                     doc,
                     theme,
                     matches!(current, Some(Request::File { .. })),
-                    notice.as_deref(),
+                    notice.as_deref().or(status.as_deref()),
                 );
+                if let Some(active) = overlay.as_mut() {
+                    draw_overlay(frame, active, preview_body);
+                }
             }
             ViewMode::Edit(editor) => {
                 (page, edit_width, edit_body) = draw_editor(frame, editor, theme, prompt_text);
@@ -1843,7 +3391,7 @@ pub fn run(control: &Path) -> std::io::Result<()> {
         if preview_load.is_none()
             && let (ViewMode::Preview(doc), Some(request @ Request::File { line: None, .. })) =
                 (&mode, current.as_ref())
-            && glow_needs_reload(doc, body_width)
+            && needs_rerender(doc, body_width)
         {
             LAST_BODY_WIDTH.store(body_width, std::sync::atomic::Ordering::Relaxed);
             preview_load = Some(start_preview_load(request.clone()));
@@ -1851,6 +3399,8 @@ pub fn run(control: &Path) -> std::io::Result<()> {
         let mut should_close = false;
         let poll = if preview_load.is_some() {
             LOAD_POLL
+        } else if nav.busy() {
+            NAV_POLL
         } else {
             POLL
         };
@@ -1959,6 +3509,43 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                             }
                             (active, _) => prompt = Some(active),
                         }
+                    } else if let Some(active) = overlay
+                        .take()
+                        .filter(|o| !matches!(o, Overlay::Hover { .. }))
+                    {
+                        // A menu or picker owns the keyboard; a hover box is
+                        // simply gone (`take`) and the key goes on below.
+                        match overlay_key(active, key.code, page) {
+                            OverlayOutcome::Keep(kept) => overlay = Some(kept),
+                            OverlayOutcome::Close => {}
+                            OverlayOutcome::Nav(kind, (line, col), at) => {
+                                if let (Some(request), ViewMode::Preview(doc)) =
+                                    (current.as_ref(), &mode)
+                                {
+                                    notice = nav.gesture(kind, request, doc, line, col, at);
+                                }
+                            }
+                            OverlayOutcome::History(forward) => history_step(
+                                &mut nav,
+                                forward,
+                                &mut current,
+                                &mut mode,
+                                &mut preview_load,
+                                control,
+                                &mut identity_pending,
+                                &mut notice,
+                            ),
+                            OverlayOutcome::GoTo(target) => go_to(
+                                &mut nav,
+                                &target,
+                                &mut current,
+                                &mut mode,
+                                &mut preview_load,
+                                control,
+                                &mut identity_pending,
+                                &mut notice,
+                            ),
+                        }
                     } else {
                         match &mut mode {
                             ViewMode::Preview(doc) => {
@@ -1992,8 +3579,14 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                                             close_own_pane(control, &current, &mut notice);
                                     }
                                     KeyCode::Char('e') => {
-                                        if doc.media.is_some() {
-                                            notice = Some("media previews are read-only".into());
+                                        if let Some(request @ Request::File { .. }) =
+                                            current.as_ref()
+                                            && let Some(command) = editor_command_for(request)
+                                        {
+                                            // The real editor replaces this
+                                            // pane (handled at the top of the
+                                            // loop, outside these borrows).
+                                            pending_edit = Some(command);
                                         } else if let Some(Request::File { path, .. }) =
                                             current.as_ref()
                                         {
@@ -2035,9 +3628,36 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                                     }
                                     KeyCode::Home | KeyCode::Char('g') => doc.scroll = 0,
                                     KeyCode::End | KeyCode::Char('G') => doc.scroll = max,
-                                    KeyCode::Char('w') if doc.media.is_none() => {
+                                    KeyCode::Char('w') => {
                                         doc.pending_src = Some(doc.top_src());
                                         doc.wrap = !doc.wrap;
+                                    }
+                                    KeyCode::Char('m') => {
+                                        let cell = nav.last_cell.unwrap_or((
+                                            preview_body.x + doc.gutter() as u16,
+                                            preview_body.y,
+                                        ));
+                                        match open_menu(&nav, doc, preview_body, cell) {
+                                            Ok(menu) => overlay = Some(menu),
+                                            Err(why) => notice = Some(why),
+                                        }
+                                    }
+                                    // Ctrl+- arrives as 0x1F, which crossterm
+                                    // reports as Ctrl+7; with Alt (ESC 0x1F)
+                                    // it is forward.
+                                    KeyCode::Char('7')
+                                        if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                                    {
+                                        history_step(
+                                            &mut nav,
+                                            key.modifiers.contains(KeyModifiers::ALT),
+                                            &mut current,
+                                            &mut mode,
+                                            &mut preview_load,
+                                            control,
+                                            &mut identity_pending,
+                                            &mut notice,
+                                        );
                                     }
                                     _ => {}
                                 }
@@ -2091,6 +3711,54 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                 Event::Mouse(mouse) => match &mut mode {
                     ViewMode::Preview(doc) => {
                         let max = doc.rows.len().saturating_sub(1);
+                        let cell = (mouse.column, mouse.row);
+                        if mouse.kind == MouseEventKind::Moved {
+                            if last_motion.is_none_or(|(c, _)| c != cell) {
+                                last_motion = Some((cell, Instant::now()));
+                            }
+                            if matches!(&overlay, Some(Overlay::Hover { at, .. }) if *at != cell) {
+                                overlay = None;
+                            }
+                        } else {
+                            // A click or the wheel dismisses a hover box.
+                            if matches!(overlay, Some(Overlay::Hover { .. })) {
+                                overlay = None;
+                            }
+                            last_motion = None;
+                            hovered_cell = None;
+                        }
+                        if let Some(active) = overlay.take() {
+                            match overlay_mouse(active, &mouse) {
+                                OverlayOutcome::Keep(kept) => overlay = Some(kept),
+                                OverlayOutcome::Close => {}
+                                OverlayOutcome::Nav(kind, (line, col), at) => {
+                                    if let Some(request) = current.as_ref() {
+                                        notice = nav.gesture(kind, request, doc, line, col, at);
+                                    }
+                                }
+                                OverlayOutcome::History(forward) => history_step(
+                                    &mut nav,
+                                    forward,
+                                    &mut current,
+                                    &mut mode,
+                                    &mut preview_load,
+                                    control,
+                                    &mut identity_pending,
+                                    &mut notice,
+                                ),
+                                OverlayOutcome::GoTo(target) => go_to(
+                                    &mut nav,
+                                    &target,
+                                    &mut current,
+                                    &mut mode,
+                                    &mut preview_load,
+                                    control,
+                                    &mut identity_pending,
+                                    &mut notice,
+                                ),
+                            }
+                            continue;
+                        }
                         match mouse.kind {
                             MouseEventKind::ScrollUp => doc.scroll = doc.scroll.saturating_sub(3),
                             MouseEventKind::ScrollDown => doc.scroll = (doc.scroll + 3).min(max),
@@ -2098,6 +3766,44 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                                 if mouse.row == 0 && mouse.column < 3 =>
                             {
                                 should_close = close_own_pane(control, &current, &mut notice);
+                            }
+                            // Ctrl+click: go to definition. The click never
+                            // starts a selection.
+                            MouseEventKind::Down(MouseButton::Left)
+                                if mouse.modifiers.contains(KeyModifiers::CONTROL) =>
+                            {
+                                if let Some(request) = current.as_ref()
+                                    && let Some((line, col)) = doc.source_position_at(
+                                        preview_body,
+                                        mouse.column,
+                                        mouse.row,
+                                    )
+                                {
+                                    notice = nav.gesture(
+                                        NavKind::Definition,
+                                        request,
+                                        doc,
+                                        line,
+                                        col,
+                                        cell,
+                                    );
+                                }
+                            }
+                            MouseEventKind::Drag(MouseButton::Left)
+                            | MouseEventKind::Up(MouseButton::Left)
+                                if mouse.modifiers.contains(KeyModifiers::CONTROL) => {}
+                            // Right-click (herdr passes it through only with
+                            // its configured modifier): the navigation menu.
+                            MouseEventKind::Down(MouseButton::Right) => {
+                                nav.last_cell = Some(cell);
+                                match open_menu(&nav, doc, preview_body, cell) {
+                                    Ok(menu) => overlay = Some(menu),
+                                    Err(why) => notice = Some(why),
+                                }
+                            }
+                            MouseEventKind::Down(MouseButton::Left) => {
+                                nav.last_cell = Some(cell);
+                                doc.on_mouse(&mouse, preview_body);
                             }
                             _ => doc.on_mouse(&mouse, preview_body),
                         }
@@ -2161,11 +3867,19 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                         break Ok(());
                     }
                 } else {
+                    // A sidebar click is history too: Back returns to what
+                    // was being read before it.
+                    if let (Some(previous), ViewMode::Preview(doc)) = (current.as_ref(), &mode)
+                        && previous != &Request::Close
+                    {
+                        nav.history.push((previous.clone(), doc.scroll));
+                    }
                     mode = ViewMode::Preview(loading_doc(&request));
                     current = Some(request.clone());
                     preview_load = Some(start_preview_load(request));
                     identity_pending = true;
                     notice = None;
+                    external_failed = None;
                 }
             }
         }
@@ -2209,6 +3923,7 @@ pub fn run(control: &Path) -> std::io::Result<()> {
             last_diff_refresh = Instant::now();
         }
     };
+    nav.finish();
     let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
     ratatui::restore();
     result
@@ -2234,6 +3949,7 @@ fn draw_doc(
     // Lay the body out for THIS width first: everything below (the clamp,
     // the slice, the page stride) counts rendered rows.
     LAST_BODY_WIDTH.store(body.width, std::sync::atomic::Ordering::Relaxed);
+    LAST_BODY_HEIGHT.store(body.height, std::sync::atomic::Ordering::Relaxed);
     doc.relayout(body.width, body.height);
     doc.scroll = doc.scroll.min(
         doc.rows
@@ -2291,12 +4007,6 @@ fn draw_doc(
     };
     let hint = if let Some(notice) = notice {
         format!(" {notice}")
-    } else if let Some(media) = &doc.media {
-        if media.video_poster {
-            " video poster frame  q close".into()
-        } else {
-            " image preview  q close".into()
-        }
     } else if editable {
         preview_hint(&["e edit", "space/b page", wrap_hint], footer.width)
     } else {
@@ -2957,7 +4667,9 @@ pub(crate) fn previews_in(pane_list_json: &str) -> Vec<PreviewPane> {
         .collect()
 }
 
-fn tab_is_plugin_only(pane_list_json: &str, tab_id: &str) -> bool {
+/// Every pane in `tab_id` is one of ours (sidebar, viewer, or a custom-editor
+/// wrapper), so closing the whole tab cannot take a user's shell or agent.
+pub(crate) fn tab_is_plugin_only(pane_list_json: &str, tab_id: &str) -> bool {
     #[derive(serde::Deserialize)]
     struct Msg {
         result: Res,
@@ -2994,6 +4706,7 @@ fn tab_is_plugin_only(pane_list_json: &str, tab_id: &str) -> bool {
             pane.tokens.contains_key(METADATA_SOURCE)
                 || pane.tokens.contains_key("herdr-sidebar-explorer")
                 || pane.tokens.contains_key("herdr-sidebar-git")
+                || pane.tokens.contains_key("herdr-sidebar-editor")
                 || pane
                     .label
                     .as_deref()
@@ -3390,6 +5103,8 @@ fn side_neighbor(layout_json: &str, pane_id: &str, on_the_left: bool) -> Option<
 
 #[cfg(test)]
 mod tests {
+    use ratatui::style::Color;
+
     use super::*;
 
     fn doc_of(lines: Vec<Line<'static>>, numbered: bool) -> Doc {
@@ -3398,14 +5113,14 @@ mod tests {
             context: String::new(),
             lines,
             numbered,
-            media: None,
             scroll: 0,
             wrap: true,
-            glow_width: None,
+            rendered_width: None,
             rows: Vec::new(),
             rows_key: None,
             pending_src: None,
             selection: PreviewSelection::default(),
+            source: None,
         }
     }
 
@@ -3416,95 +5131,55 @@ mod tests {
     }
 
     #[test]
-    fn raster_media_uses_two_truecolor_pixels_per_cell() {
-        let mut pixels = image::RgbaImage::new(2, 2);
-        for x in 0..2 {
-            pixels.put_pixel(x, 0, image::Rgba([255, 0, 0, 255]));
-            pixels.put_pixel(x, 1, image::Rgba([0, 0, 255, 255]));
-        }
-        let rows = render_media_rows(
-            &MediaPreview {
-                pixels,
-                source_width: 2,
-                source_height: 2,
-                video_poster: false,
-            },
-            2,
-            1,
-        );
-        assert_eq!(rows.len(), 1);
-        assert_eq!(row_texts(&rows), vec!["▀▀"]);
-        for span in &rows[0].line.spans {
-            assert_eq!(span.style.fg, Some(Color::Rgb(255, 0, 0)));
-            assert_eq!(span.style.bg, Some(Color::Rgb(0, 0, 255)));
-        }
-    }
-
-    #[test]
-    fn media_extensions_are_case_insensitive_and_disjoint() {
-        assert!(is_image_file(Path::new("photo.JPEG")));
-        assert!(is_video_file(Path::new("clip.MP4")));
-        assert!(!is_video_file(Path::new("photo.png")));
-        assert!(!is_image_file(Path::new("notes.txt")));
-    }
-
-    #[test]
-    fn image_files_decode_into_media_and_oversized_inputs_stop_before_decode() {
-        let root = std::env::temp_dir().join(format!("viewer-media-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
-
-        let image_path = root.join("sample.png");
-        image::RgbaImage::from_pixel(3, 2, image::Rgba([12, 34, 56, 255]))
-            .save_with_format(&image_path, image::ImageFormat::Png)
-            .unwrap();
-        let doc = load_file(&image_path, None);
-        assert!(doc.media.is_some());
-        assert!(doc.lines.is_empty());
-
-        let oversized = root.join("oversized.png");
-        std::fs::File::create(&oversized)
-            .unwrap()
-            .set_len(MAX_MEDIA_FILE_BYTES + 1)
-            .unwrap();
+    fn render_with_captures_stdout_and_reports_failures() {
+        // `git` is on every CI leg. `--version` exercises a plain capture;
+        // the `{file}` path is appended as the last argument, which `git
+        // --version` ignores.
+        let file = Path::new("/nonexistent/x.md");
+        let lines = render_with("git --version", file, b"", 80, 24, false, None).unwrap();
         assert!(
-            decode_image_file(&oversized)
-                .unwrap_err()
-                .contains("MiB limit")
+            lines[0].to_string().starts_with("git version"),
+            "{}",
+            lines[0]
         );
-        std::fs::remove_dir_all(root).unwrap();
+
+        let error = render_with(
+            "git definitely-not-a-command",
+            file,
+            b"",
+            80,
+            24,
+            false,
+            None,
+        )
+        .unwrap_err();
+        assert!(error.starts_with("git exited with"), "{error}");
+        assert!(error.contains("definitely-not-a-command"), "{error}");
+
+        let error = render_with(
+            "no-such-previewer-xyz {file}",
+            file,
+            b"",
+            80,
+            24,
+            false,
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(error, "no-such-previewer-xyz is not on PATH");
     }
 
     #[test]
-    fn ffmpeg_lookup_skips_project_local_path_entries() {
-        let root = std::env::temp_dir().join(format!("viewer-ffmpeg-{}", std::process::id()));
-        let project = root.join("project");
-        let local_bin = project.join("tools");
-        let external_bin = root.join("external");
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&local_bin).unwrap();
-        std::fs::create_dir_all(&external_bin).unwrap();
-        let executable = if cfg!(windows) {
-            "ffmpeg.exe"
-        } else {
-            "ffmpeg"
-        };
-        for directory in [&local_bin, &external_bin] {
-            let file = directory.join(executable);
-            std::fs::write(&file, b"placeholder").unwrap();
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt as _;
-                std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755)).unwrap();
-            }
-        }
-        let search_path = std::env::join_paths([&local_bin, &external_bin]).unwrap();
-        let project = project.canonicalize().unwrap();
+    fn run_captured_delivers_stdin_to_the_child() {
+        let mut cmd = std::process::Command::new("git");
+        cmd.args(["hash-object", "--stdin"]);
+        let out = run_captured(cmd, b"hello\n".to_vec(), 1024, Duration::from_secs(10)).unwrap();
+        assert!(out.status.success());
+        // git's blob hash of "hello\n".
         assert_eq!(
-            ffmpeg_in_path(&search_path, Some(&project)),
-            Some(external_bin.canonicalize().unwrap().join(executable))
+            String::from_utf8_lossy(&out.stdout).trim(),
+            "ce013625030ba8dba906f756967f9e9ca394464a"
         );
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -3597,6 +5272,245 @@ mod tests {
         assert_eq!(doc.selection.cursor, selection.cursor);
         assert_eq!(doc.rows_key, rows_key);
         assert_eq!(doc.scroll, 1);
+    }
+
+    #[test]
+    fn menu_entries_are_gated_by_capabilities() {
+        let all = menu_entries(|_| true);
+        assert_eq!(
+            all,
+            vec![
+                MenuAction::Nav(NavKind::Definition),
+                MenuAction::Nav(NavKind::TypeDefinition),
+                MenuAction::Nav(NavKind::Implementation),
+                MenuAction::Nav(NavKind::References),
+                MenuAction::Nav(NavKind::Hover),
+                MenuAction::Nav(NavKind::Symbols),
+                MenuAction::Back,
+                MenuAction::Forward,
+            ]
+        );
+        let basic = menu_entries(|_| false);
+        assert_eq!(basic.len(), 6);
+        assert!(!basic.contains(&MenuAction::Nav(NavKind::TypeDefinition)));
+        assert_eq!(
+            MenuAction::Nav(NavKind::References).label(),
+            "Find References"
+        );
+    }
+
+    #[test]
+    fn location_items_group_by_file_with_snippets_and_a_cap() {
+        let target = |path: &str, line: usize| lsp::Target {
+            path: PathBuf::from(path),
+            line,
+            character: 0,
+        };
+        let targets = vec![
+            target("/r/src/b.rs", 4),
+            target("/r/src/a.rs", 9),
+            target("/r/src/b.rs", 1),
+            target("/elsewhere/c.rs", 0),
+        ];
+        let read = |path: &Path| {
+            Some(match path.to_str().unwrap() {
+                "/r/src/a.rs" => "0\n1\n2\n3\n4\n5\n6\n7\n8\n   let nine = 9;  \n".to_string(),
+                "/r/src/b.rs" => "zero\n\tone\ntwo\nthree\nfour\n".to_string(),
+                _ => return None,
+            })
+        };
+        let items = location_items(&targets, Path::new("/r"), read);
+        let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            vec![
+                "/elsewhere/c.rs",
+                "  1: ",
+                "src/a.rs",
+                "  10: let nine = 9;",
+                "src/b.rs",
+                "  2: one",
+                "  5: four",
+            ]
+        );
+        assert!(items[0].target.is_none());
+        assert_eq!(items[3].target.as_ref().unwrap().line, 9);
+        assert_eq!(first_selectable(&items), 1);
+        assert_eq!(picker_step(&items, 1, 1), 3);
+        assert_eq!(picker_step(&items, 3, 1), 5);
+        assert_eq!(picker_step(&items, 5, -1), 3);
+        assert_eq!(picker_step(&items, 1, -1), 1);
+        assert_eq!(picker_step(&items, 6, 1), 6);
+
+        let many: Vec<lsp::Target> = (0..PICKER_CAP + 7).map(|i| target("/r/x.rs", i)).collect();
+        let items = location_items(&many, Path::new("/r"), |_| None);
+        assert_eq!(items.len(), PICKER_CAP + 2);
+        assert_eq!(items.last().unwrap().label, "+7 more");
+        assert!(items.last().unwrap().target.is_none());
+    }
+
+    #[test]
+    fn symbol_items_flatten_both_result_shapes() {
+        let nested = serde_json::json!([
+            {"name": "Doc", "kind": 23, "range": {"start": {"line": 10, "character": 0}, "end": {"line": 30, "character": 1}},
+             "selectionRange": {"start": {"line": 10, "character": 7}, "end": {"line": 10, "character": 10}},
+             "children": [
+                {"name": "relayout", "kind": 6, "selectionRange": {"start": {"line": 12, "character": 7}, "end": {"line": 12, "character": 15}}, "range": {"start": {"line": 12, "character": 0}, "end": {"line": 14, "character": 1}}}
+             ]},
+            {"name": "run", "kind": 12, "selectionRange": {"start": {"line": 40, "character": 7}, "end": {"line": 40, "character": 10}}, "range": {"start": {"line": 40, "character": 0}, "end": {"line": 90, "character": 1}}}
+        ]);
+        let items = symbol_items(&nested, Path::new("/r/a.rs"));
+        let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(labels, vec!["Doc  struct", "  relayout  fn", "run  fn"]);
+        assert_eq!(items[1].target.as_ref().unwrap().line, 12);
+        assert_eq!(
+            items[1].target.as_ref().unwrap().path,
+            PathBuf::from("/r/a.rs")
+        );
+        let flat = serde_json::json!([
+            {"name": "main", "kind": 12, "location": {"uri": "file:///r/b.rs", "range": {"start": {"line": 3, "character": 0}, "end": {"line": 3, "character": 4}}}},
+            {"name": "X", "kind": 99, "location": {"uri": "file:///r/b.rs", "range": {"start": {"line": 8, "character": 0}, "end": {"line": 8, "character": 1}}}}
+        ]);
+        let items = symbol_items(&flat, Path::new("/r/a.rs"));
+        assert_eq!(items[0].label, "main  fn");
+        assert_eq!(
+            items[0].target.as_ref().unwrap().path,
+            PathBuf::from("/r/b.rs")
+        );
+        assert_eq!(items[1].label, "X");
+        assert!(symbol_items(&serde_json::Value::Null, Path::new("/r/a.rs")).is_empty());
+    }
+
+    #[test]
+    fn hover_contents_normalise_to_markdown_and_fences_strip() {
+        let markup = serde_json::json!({"contents": {"kind": "markdown", "value": "```rust\nfn a()\n```\n\nDoc."}});
+        assert_eq!(
+            hover_markdown(&markup).unwrap(),
+            "```rust\nfn a()\n```\n\nDoc."
+        );
+        let marked =
+            serde_json::json!({"contents": [{"language": "rust", "value": "fn a()"}, "Doc."]});
+        assert_eq!(
+            hover_markdown(&marked).unwrap(),
+            "```rust\nfn a()\n```\n\nDoc."
+        );
+        let plain = serde_json::json!({"contents": "just text"});
+        assert_eq!(hover_markdown(&plain).unwrap(), "just text");
+        assert_eq!(hover_markdown(&serde_json::json!({"contents": []})), None);
+        assert_eq!(hover_markdown(&serde_json::Value::Null), None);
+        let lines = strip_fences("```rust\nfn a()\n```\n\nDoc.");
+        let texts: Vec<String> = lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect())
+            .collect();
+        assert_eq!(texts, vec!["fn a()", "", "Doc."]);
+    }
+
+    #[test]
+    fn overlay_menu_keys_and_clicks() {
+        let menu = || Overlay::Menu {
+            at: (5, 5),
+            pos: (3, 4),
+            entries: menu_entries(|_| false),
+            selected: 0,
+            rect: Rect::new(5, 6, 24, 8),
+        };
+        assert!(matches!(
+            overlay_key(menu(), KeyCode::Esc, 10),
+            OverlayOutcome::Close
+        ));
+        let OverlayOutcome::Keep(moved) = overlay_key(menu(), KeyCode::Char('j'), 10) else {
+            panic!()
+        };
+        let OverlayOutcome::Nav(kind, pos, at) = overlay_key(moved, KeyCode::Enter, 10) else {
+            panic!()
+        };
+        assert_eq!((kind, pos, at), (NavKind::References, (3, 4), (5, 5)));
+        // Click on the last row (Forward), inside the border.
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 7,
+            row: 6 + 1 + 5,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert!(matches!(
+            overlay_mouse(menu(), &click),
+            OverlayOutcome::History(true)
+        ));
+        let outside = MouseEvent {
+            column: 1,
+            row: 1,
+            ..click
+        };
+        assert!(matches!(
+            overlay_mouse(menu(), &outside),
+            OverlayOutcome::Close
+        ));
+    }
+
+    #[test]
+    fn source_position_maps_cells_through_gutter_wrap_and_tabs() {
+        // 12 lines → a 3-cell gutter ("nn ").
+        let mut text = String::new();
+        for i in 0..11 {
+            text.push_str(&format!("line{i}\n"));
+        }
+        text.push_str("\tfn 中文 is_wide(a_long_identifier_name) {}\n");
+        let lines: Vec<Line<'static>> = text.lines().map(|l| Line::raw(l.to_string())).collect();
+        let mut doc = Doc {
+            name: "x.rs".into(),
+            context: String::new(),
+            lines,
+            numbered: true,
+            scroll: 0,
+            wrap: true,
+            rendered_width: None,
+            rows: Vec::new(),
+            rows_key: None,
+            pending_src: None,
+            selection: PreviewSelection::default(),
+            source: Some(std::sync::Arc::new(text.clone())),
+        };
+        let body = Rect::new(2, 1, 24, 40); // 21 content cells after the gutter
+        doc.relayout(body.width, body.height);
+        assert_eq!(doc.gutter(), 3);
+        let last_rows: Vec<&Row> = doc.rows.iter().filter(|r| r.src == 11).collect();
+        assert!(last_rows.len() >= 2, "the long line wraps");
+        assert_eq!(last_rows[0].start, 0);
+        assert!(last_rows[1].start > 0);
+        // Row 11 (0-based) is the first row of the long line: y = body.y + 11.
+        let y = body.y + 11;
+        // Gutter cells map to nothing.
+        assert_eq!(doc.source_position_at(body, body.x + 1, y), None);
+        // The tab occupies display 0..4: any of those cells is column 0.
+        assert_eq!(doc.source_position_at(body, body.x + 3, y), Some((11, 0)));
+        assert_eq!(doc.source_position_at(body, body.x + 6, y), Some((11, 0)));
+        // "f" of fn is at display 4 → column 1; "n" → column 2.
+        assert_eq!(doc.source_position_at(body, body.x + 7, y), Some((11, 1)));
+        assert_eq!(doc.source_position_at(body, body.x + 8, y), Some((11, 2)));
+        // 中 is 2 cells wide at display 7..9 (col 4), 文 at 9..11 (col 5).
+        assert_eq!(doc.source_position_at(body, body.x + 10, y), Some((11, 4)));
+        assert_eq!(doc.source_position_at(body, body.x + 11, y), Some((11, 4)));
+        assert_eq!(doc.source_position_at(body, body.x + 12, y), Some((11, 5)));
+        // The continuation row starts at its wrap offset.
+        let start = last_rows[1].start;
+        assert_eq!(
+            doc.source_position_at(body, body.x + 3, y + 1),
+            Some((11, start))
+        );
+        assert_eq!(
+            doc.source_position_at(body, body.x + 4, y + 1),
+            Some((11, start + 1))
+        );
+        // Past the end of a short line: the line length.
+        assert_eq!(
+            doc.source_position_at(body, body.x + 20, body.y),
+            Some((0, 5))
+        );
+        // Outside the body, and without a source.
+        assert_eq!(doc.source_position_at(body, 0, y), None);
+        doc.source = None;
+        assert_eq!(doc.source_position_at(body, body.x + 7, y), None);
     }
 
     #[test]
@@ -3834,7 +5748,14 @@ mod tests {
             {"tab_id":"w1:t2","label":"a.rs · preview","tokens":{}},
             {"tab_id":"w1:t2","label":"pwsh","tokens":{}}
         ]}}"#;
+        // A custom-editor wrapper pane has no label of its own; its running
+        // heartbeat token is what marks it as ours.
+        let with_editor = r#"{"result":{"panes":[
+            {"tab_id":"w1:t2","label":"Sidebar","tokens":{"herdr-sidebar-explorer":"1"}},
+            {"tab_id":"w1:t2","tokens":{"herdr-sidebar-editor":"1","hs-editor-path":"abc"}}
+        ]}}"#;
         assert!(tab_is_plugin_only(plugin_only, "w1:t2"));
+        assert!(tab_is_plugin_only(with_editor, "w1:t2"));
         assert!(!tab_is_plugin_only(with_shell, "w1:t2"));
         assert!(tab_is_plugin_only(resumed, "w1:t2"));
         assert!(!tab_is_plugin_only(resumed_with_shell, "w1:t2"));
@@ -4181,7 +6102,7 @@ mod tests {
         let mut bytes = vec![b'a'; 9000];
         bytes.push(0);
         std::fs::write(&path, bytes).unwrap();
-        let doc = load_file(&path, None);
+        let doc = load_file(&path, None, None);
         let rendered: String = doc.lines[0]
             .spans
             .iter()
@@ -4467,22 +6388,155 @@ mod tests {
     #[test]
     fn requests_roundtrip() {
         assert_eq!(parse_request("close"), Some(Request::Close));
-        let f = file_request(Path::new("C:/x/y.rs"));
+        let plain = |path: &str, line: Option<usize>| Request::File {
+            path: PathBuf::from(path),
+            line,
+            renderer: None,
+            editor: None,
+            external: false,
+            lsp: None,
+        };
+        let f = file_request(Path::new("C:/x/y.rs"), None, None, None, false, None);
+        assert_eq!(f, "file\tC:/x/y.rs\t");
+        assert_eq!(parse_request(&f), Some(plain("C:/x/y.rs", None)));
+        let f = file_request(Path::new("C:/x/y.rs"), Some(42), None, None, false, None);
+        assert_eq!(parse_request(&f), Some(plain("C:/x/y.rs", Some(42))));
+        // Resolved previewer/editor commands ride along as trailing fields.
+        let f = file_request(
+            Path::new("/r/a.md"),
+            None,
+            Some("leaf --inline ansi:{width} {file}"),
+            Some("nvim {file}"),
+            false,
+            None,
+        );
         assert_eq!(
             parse_request(&f),
             Some(Request::File {
-                path: PathBuf::from("C:/x/y.rs"),
+                path: PathBuf::from("/r/a.md"),
                 line: None,
+                renderer: Some("leaf --inline ansi:{width} {file}".into()),
+                editor: Some("nvim {file}".into()),
+                external: false,
+                lsp: None,
             })
         );
-        let f = file_request_at(Path::new("C:/x/y.rs"), 42);
+        let f = file_request(
+            Path::new("/r/a.md"),
+            Some(3),
+            None,
+            Some("nvim {file}"),
+            false,
+            None,
+        );
+        let parsed = parse_request(&f).unwrap();
+        assert_eq!(request_payload(&parsed), f);
+        assert!(matches!(
+            parsed,
+            Request::File {
+                renderer: None,
+                editor: Some(_),
+                line: Some(3),
+                ..
+            }
+        ));
+        // External previewers carry a sixth field.
+        let f = file_request(
+            Path::new("/r/a.png"),
+            None,
+            Some("viu {file}"),
+            None,
+            true,
+            None,
+        );
+        assert_eq!(f, "file\t/r/a.png\t\tviu {file}\t\t1");
+        let parsed = parse_request(&f).unwrap();
+        assert!(matches!(
+            &parsed,
+            Request::File { external: true, renderer: Some(r), .. } if r == "viu {file}"
+        ));
+        assert_eq!(request_payload(&parsed), f);
+        assert_eq!(external_command_for(&parsed).as_deref(), Some("viu {file}"));
+        assert_eq!(external_command_for(&plain("/r/a.rs", None)), None);
+        // An internal renderer never hosts; a line-anchored image stays in the viewer.
+        let variant = |line: Option<usize>, external: bool| Request::File {
+            path: PathBuf::from("/r/a.png"),
+            line,
+            renderer: Some("viu {file}".into()),
+            editor: None,
+            external,
+            lsp: None,
+        };
+        assert_eq!(external_command_for(&variant(None, false)), None);
+        assert_eq!(external_command_for(&variant(Some(2), true)), None);
+        // The language server and its workspace are fields 7 and 8; the
+        // external flag is written empty so positions stay fixed.
+        let spec = LspSpec {
+            command: "rust-analyzer".into(),
+            root: PathBuf::from("/r/plugins/crate"),
+        };
+        let f = file_request(
+            Path::new("/r/plugins/crate/src/a.rs"),
+            None,
+            None,
+            None,
+            false,
+            Some(&spec),
+        );
         assert_eq!(
-            parse_request(&f),
-            Some(Request::File {
-                path: PathBuf::from("C:/x/y.rs"),
-                line: Some(42),
-            })
+            f,
+            "file\t/r/plugins/crate/src/a.rs\t\t\t\t\trust-analyzer\t/r/plugins/crate"
         );
+        let parsed = parse_request(&f).unwrap();
+        assert!(
+            matches!(&parsed, Request::File { lsp: Some(l), external: false, renderer: None, .. } if *l == spec)
+        );
+        assert_eq!(request_payload(&parsed), f);
+        assert_ne!(parsed, plain("/r/plugins/crate/src/a.rs", None));
+        let f = file_request(
+            Path::new("/r/a.png"),
+            None,
+            Some("viu {file}"),
+            Some("vi"),
+            true,
+            Some(&spec),
+        );
+        assert_eq!(
+            f,
+            "file\t/r/a.png\t\tviu {file}\tvi\t1\trust-analyzer\t/r/plugins/crate"
+        );
+        assert_eq!(request_payload(&parse_request(&f).unwrap()), f);
+        // A server without a root (a hand-written payload) is ignored.
+        assert!(matches!(
+            parse_request("file\t/r/a.rs\t\t\t\t\trust-analyzer"),
+            Some(Request::File { lsp: None, .. })
+        ));
+        // Legacy forms from an older sidebar still parse.
+        assert!(matches!(
+            parse_request("file\t/r/a.md\t\tglow\tvi"),
+            Some(Request::File {
+                lsp: None,
+                editor: Some(_),
+                ..
+            })
+        ));
+        assert!(matches!(
+            parse_request("file\t/r/a.md\t\tglow\tvi\t1"),
+            Some(Request::File {
+                lsp: None,
+                external: true,
+                ..
+            })
+        ));
+        assert_eq!(
+            parse_request("file\tC:/x/y.rs"),
+            Some(plain("C:/x/y.rs", None))
+        );
+        assert_eq!(
+            parse_request("file\tC:/x/y.rs\t7"),
+            Some(plain("C:/x/y.rs", Some(7)))
+        );
+        assert_eq!(parse_request("C:/x/y.rs"), Some(plain("C:/x/y.rs", None)));
         let s = show_request(Path::new("C:/repo"), "stash@{1}", None);
         assert_eq!(
             parse_request(&s),
@@ -4516,6 +6570,10 @@ mod tests {
             Some(Request::File {
                 path: PathBuf::from("C:/plain.txt"),
                 line: None,
+                renderer: None,
+                editor: None,
+                external: false,
+                lsp: None,
             })
         );
         assert_eq!(parse_request("  "), None);
@@ -4588,7 +6646,7 @@ mod tests {
         for name in ["sample.txt", "sample.md"] {
             let path = root.join(name);
             std::fs::write(&path, "one\ntwo\nthree\n").unwrap();
-            let doc = load_file(&path, Some(2));
+            let doc = load_file(&path, Some(2), None);
             assert_eq!(doc.pending_src, Some(1));
             assert!(
                 doc.numbered,
@@ -4599,61 +6657,37 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires the optional glow executable"]
-    fn glow_markdown_returns_styled_spans() {
-        let md = "# Heading\n\n**bold** and `code`\n";
-        let lines = glow_markdown(md, 80);
-        assert!(lines.is_some(), "glow_markdown returned None");
-        let lines = lines.unwrap();
-        assert!(!lines.is_empty(), "glow_markdown returned empty lines");
-        // At least one span must have a non-default style (proof that ANSI was parsed)
-        let has_styled = lines.iter().any(|l| {
-            l.spans
-                .iter()
-                .any(|s| s.style != ratatui::style::Style::default())
-        });
-        assert!(
-            has_styled,
-            "glow_markdown returned no styled spans — ANSI not parsed"
-        );
-    }
-
-    #[test]
-    fn glow_rendered_markdown_uses_the_body_width_without_generic_rewrap() {
-        let rendered = vec![Line::raw("preformatted table")];
-        let fallback = vec![Line::raw("markdown source")];
-        let (lines, numbered, glow_width) = choose_text_render(Some(rendered), || fallback, 80);
+    fn rendered_output_uses_the_body_width_without_generic_rewrap() {
         let doc = Doc {
             name: "table.md".into(),
             context: String::new(),
-            lines,
-            numbered,
-            media: None,
+            lines: vec![Line::raw("preformatted table")],
+            numbered: false,
             scroll: 0,
-            wrap: glow_width.is_none(),
-            glow_width,
+            wrap: false,
+            rendered_width: Some(80),
             rows: Vec::new(),
             rows_key: None,
             pending_src: None,
             selection: PreviewSelection::default(),
+            source: None,
         };
-        assert!(!doc.wrap, "glow output must not be generically re-wrapped");
-        assert!(!doc.numbered, "glow formats its own layout, no gutter");
-        assert_eq!(doc.glow_width, Some(80));
-        assert!(!glow_needs_reload(&doc, 80));
-        assert!(glow_needs_reload(&doc, 60));
-    }
-
-    #[test]
-    fn glow_arguments_always_carry_theme_width_and_stdin_sentinel() {
-        assert_eq!(
-            glow_args(39, true),
-            ["--style", "light", "--width", "39", "-"]
+        assert!(
+            !doc.wrap,
+            "renderer output must not be generically re-wrapped"
         );
-        assert_eq!(
-            glow_args(120, false),
-            ["--style", "dark", "--width", "120", "-"]
+        assert!(
+            !doc.numbered,
+            "a renderer formats its own layout, no gutter"
         );
+        assert!(!needs_rerender(&doc, 80));
+        assert!(needs_rerender(&doc, 60));
+        let plain = Doc {
+            rendered_width: None,
+            wrap: true,
+            ..doc
+        };
+        assert!(!needs_rerender(&plain, 60), "source views never re-render");
     }
 
     #[test]
@@ -4731,6 +6765,10 @@ mod tests {
         let file = Request::File {
             path: PathBuf::from("/repo/a.rs"),
             line: None,
+            renderer: None,
+            editor: None,
+            external: false,
+            lsp: None,
         };
         let restored = control_after_failed_close(&Some(file.clone()));
         assert_eq!(parse_request(&restored), Some(file));

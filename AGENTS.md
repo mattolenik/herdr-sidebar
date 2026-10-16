@@ -200,6 +200,18 @@ executed by Bash on Linux/macOS and mixed or CRLF endings fail before the launch
 
 ### Testing hooks headless (no TUI attached)
 
+- **Never drive the maintainer's live session for verification** (user-rejected: it steals focus,
+  reuses their pinned preview tabs, and pins/relabels tabs under them). Use a separate named
+  session: `herdr --session hs-test` started under a fake sized TTY with inherited `HERDR_*`
+  env cleared (herdr refuses a nested attach) and `NO_COLOR` removed —
+  `env -u NO_COLOR -u HERDR_SOCKET_PATH -u HERDR_PANE_ID -u HERDR_TAB_ID -u HERDR_WORKSPACE_ID
+  -u HERDR_ENV -u HERDR_BIN_PATH nohup script -q /dev/null /bin/zsh -c 'stty rows 50 cols 200;
+  exec herdr --session hs-test' &`. `herdr session list --json` gives its `socket_path`; export
+  it as `HERDR_SOCKET_PATH` and every `herdr tab/pane …` command targets that session. Plugin
+  registration is global, so the linked checkout's hooks dock sidebars there too; the plugin's
+  state dir (`state.json`, `preview-programs.toml`) is also shared, so settings edits made for a
+  test still reach the real session. `herdr session stop hs-test` ends it.
+
 - Bare `herdr server` STARTS a foreground server (it does not print help) and restores the
   persisted session — all workspaces and panes respawn. Handy for exercising plugin hooks
   from a script; test in throwaway workspaces and close them after.
@@ -675,6 +687,129 @@ HACKING.md — budget time for that before promising a patched build.
   again focuses the live pane through `focus_tab_for_client` instead of launching a duplicate. The
   token is cleared when the editor exits. The saved command wins over `HERDR_SIDEBAR_EDITOR`,
   `VISUAL`, and `EDITOR` fallbacks.
+- **Per-filetype previewers and editors** (`src/programs.rs`). Rules live in
+  `preview-programs.toml` in the plugin state dir (Settings → "Preview programs…" seeds a commented
+  template and opens it in the preview; `e` edits it) and optionally `.herdr-sidebar.toml` at the
+  Explorer root. The project layer is consulted FIRST but only while the persisted
+  `project_preview_rules` toggle is on (default off: a cloned repo must not run commands on a
+  click). Two tables: `[[preview]]` commands render the file to STDOUT and the built-in viewer
+  shows the result; `[[editor]]` commands get a real terminal in their own `<name> · editor` tab
+  through `open_in_editor_tab_with` (label, `hs-editor-path` token, heartbeat and reuse-by-file
+  unchanged). The phase-0 `[[rule]]` table loads as a rename error, never as a silent alias.
+  First matching rule wins; a pattern without `/` matches the file NAME, one with `/` the
+  root-relative slash path; matching is case-insensitive on every OS. `command` is a string or a
+  PREFERENCE-ORDERED list; each entry is tokenized with `split_editor_command` at load, rejected
+  for unknown `{placeholders}` (preview: file/width/height/theme/line; editor: file/line), and
+  resolved at use time with the shared `resolve_program` in the SIDEBAR
+  process's PATH. **The sidebar resolves, the viewer only runs**: `open_preview_at` passes the
+  resolved previewer and editor commands as trailing fields of the `file\t<path>\t<line>`
+  control request (`Request::File { renderer, editor }`), so the viewer never reads rule files and
+  the document key stays the path (tab labels, pinning, ephemeral reuse untouched). A rule with no
+  resolvable candidate falls through with a "tried …" notice.
+- **Where each mapping is used.** A click, Enter, Quick Open or search hit previews (previewer
+  rule → built-in default → source view). "Use editor on click" ON routes a tree/search click to
+  the file's editor rule, else the global custom editor. The `m` menu offers "Edit with <name>"
+  for a resolved editor rule; `e` inside the preview runs the editor (rule, else the global
+  `configured_editor()`) IN THE PREVIEW PANE through `run_external(.., preview = false)`:
+  whole screen, no chrome, `{line}` from the request, never killed under the user (a control
+  request arriving meanwhile is dropped and `restore_current_control` puts the document back),
+  `pin_own_tab` first so clicks elsewhere open a fresh preview, and the document reloads on
+  exit. `e` on HELD external previewer output (an image) does the same. Only with no editor
+  configured anywhere does `e` fall back to the in-pane editor. Keyboard Enter never opens an editor. A line-anchored
+  preview (search hit) always uses the built-in SOURCE view — rendered output has no line mapping.
+- **The plugin names no tool in code, with two decided exceptions.** `programs::load` seeds
+  `preview-programs.toml` from `TEMPLATE` on first load; its ACTIVE rules (glow for Markdown,
+  external viu for images, external pdfterm or tdf for PDFs, five `[[lsp]]` language servers) are
+  suggestions the user edits. The exceptions are `lspmux` (the shim the viewer spawns, the
+  `lspmux status` preflight and its install/start advice are lspmux-specific by nature) and
+  `leaf` for hover Markdown (a fixed inline renderer, never the user's Markdown previewer rule,
+  which may be external or slow). Both live in `src/lsp.rs` / `viewer::render_hover`.
+- **Code navigation (`src/lsp.rs`, the `Nav`/`Overlay` section of `viewer.rs`; design in
+  `docs/lsp-navigation.md`, plan in `docs/lsp-navigation-plan.md`).** Invariants:
+  - lspmux is a HARD external requirement. The plugin never starts, supervises, kills or falls
+    back to starting `lspmux server` or a language server, and never writes a service file;
+    `lsp::advice` only tells the user the command for their init system. Reaping is lspmux's
+    `instance_timeout` after the last shim disconnects.
+  - The `[[lsp]]` rule resolves in the SIDEBAR like previewers (`Kind::Lsp`, no placeholders,
+    `roots` markers). The workspace root is computed there too (`programs::workspace_root`: walk
+    up from the file for a marker, else `Git::owner_of`, else the Explorer root — NOT the git
+    root: this repo keeps its crate at `plugins/herdr-sidebar` with no root `Cargo.toml`) and
+    both ride in control fields 7 and 8 (`LspSpec`). Navigation requests the viewer writes for
+    itself copy both; the document key stays the path. Rules files seeded before the feature do
+    not gain the `[[lsp]]` rules (the template only seeds a missing file).
+  - **Scrub the shim's environment** (`lsp::shim_env`): lspmux keys an instance by server path,
+    args, environment and workspace, and every preview pane has its own `HERDR_*` values — an
+    inherited env gives every tab a private rust-analyzer. Only PATH/HOME/USER/LANG/TMPDIR/XDG_*/
+    CARGO_HOME/RUSTUP_HOME/GOPATH/GOROOT pass. The server path is passed ABSOLUTE (resolved in the
+    viewer) because the daemon's PATH is not ours. Verified live: two viewers, one rust-analyzer,
+    `lspmux status` lists two clients.
+  - Position encoding comes from the `initialize` RESULT (lspmux replays the first client's
+    negotiation; rust-analyzer answered utf-8 here), missing → UTF-16. There is no
+    `$/cancelRequest` (lspmux retags ids); staleness is "apply only while the document the gesture
+    was made on is still showing". The client ANSWERS `workspace/configuration` (nulls) and every
+    other server request (`null`) because lspmux forwards them and rust-analyzer blocks on them.
+  - `didOpen` sends exactly the on-screen text: `Doc.source` is set only for an untruncated,
+    warning-free source view, so a file over `MAX_LINES` (viewer.rs itself, at 5046 lines) gets
+    no navigation. `Row.start` + `wrap::char_width` map a clicked cell back through the gutter,
+    the wrap offset and tab expansion (`Doc::source_position_at`).
+  - The handshake, `lspmux status` and hover rendering run on workers; the UI thread only
+    `pump()`s the client once per iteration (`NAV_POLL` 50 ms while something is in flight). A
+    gesture during connect/indexing is parked in ONE slot and fires on progress `end`; `$/progress`
+    shows in the footer. Preflight failures are re-checked on the next gesture only, never on a
+    timer or a load. The session is never dropped for idle — an open preview tab is a client.
+  - Keys: `Ctrl+-` is byte 0x1F, which crossterm reports as `Char('7')`+CONTROL, and
+    `Ctrl+Alt+-` as the same with ALT (ESC 0x1F); `Ctrl+Shift+-` is byte-identical to `Ctrl+-` and
+    must not be used. Every document change pushes the previous (request, scroll) onto the back
+    history, sidebar clicks included; forward clears on push; cap 50 (`lsp::History`).
+  - Tests: `lsp::fake` is a language server over `std::io::pipe` (Rust ≥ 1.87; the crate floor is
+    1.89) that answers the six methods and issues the server→client traffic; the client is driven
+    against it hermetically. Live checks go through `pane.send_input` with SGR mouse sequences
+    (`ESC[<16;x;yM` = Ctrl+left press, `ESC[<2;x;yM` = right press, `ESC[<35;x;yM` = motion) in
+    `hs-test`; `pane send-keys` cannot send Space, Ctrl+- or mouse.
+- **`viewer::render_with` is the one spawn path** for previewers. argv[0] goes through `resolve_program_here` (absolute PATH entries only, cwd
+  excluded, exec bit, PATHEXT), the child gets `COLUMNS`/`LINES`/`CLICOLOR_FORCE`/`FORCE_COLOR`/
+  `COLORTERM=truecolor` with `NO_COLOR` removed and `CREATE_NO_WINDOW` on Windows, the file bytes
+  are piped on stdin (writer thread; EPIPE from a `{file}`-reading tool is expected) up to
+  `MAX_RENDER_INPUT` (32 MiB), stdout is capped at `MAX_RENDER_BYTES` (4 MiB) and stderr at 16 KiB
+  on reader threads, and `RENDER_TIMEOUT` (8 s) kills a stuck child. The old ffmpeg poster path
+  was the template for this (`run_captured`); glow previously had NO timeout or cap. A
+  renderer's failure prepends a dim `⚠ … — showing built-in preview` line to the source/binary
+  fallback.
+  `Doc.rendered_width` (ex `glow_width`) + `needs_rerender` re-run the renderer at the new body
+  width, scroll kept; `LAST_BODY_HEIGHT` joins `LAST_BODY_WIDTH` for `{height}`.
+- **No in-process image decoding and no ffmpeg anymore** (user decision): the `image` crate,
+  `MediaPreview`, the `▀` renderer and the video poster path are gone; a video file previews as
+  `(binary file …)`. The seeded image rule uses the EXTERNAL previewer mode below with viu, so
+  images are real Kitty graphics on Ghostty/Kitty/WezTerm (the handshake passes through herdr:
+  a query from a pane was answered `ESC_Gi=31;OK`). `viu` in a PIPE cannot do graphics (no
+  terminal answers its query; it emits the query `ESC_G…a=q…ESC\\` plus a DA1 probe `ESC[c`
+  and falls back to blocks — the ANSI parser consumes both whole). viu keeps the aspect ratio
+  with ONE of `-w`/`-h` but stretches with both, hence `-h {height}` in the seeded rule.
+- **External previewers (`mode = "external"`, `viewer::run_external`)** host the program on
+  the preview pane's own terminal: the viewer stays in its alternate screen but disables raw
+  mode and mouse capture, deletes prior Kitty images (`ESC_Ga=d,d=A`), clears, prints a dim
+  header line, and spawns the command with inherited stdio from row 2 (`{width}` = pane cols,
+  `{height}` = rows − 2, `COLUMNS`/`LINES` set). While the child runs only the control file and
+  the 5 s heartbeat are serviced (keys go to the child; a new request kills it). After a CLEAN
+  exit the output is HELD: raw mode back on, a dim ` q close (name)` footer on the last row,
+  q/Esc/Ctrl+C close the pane through `close_own_pane`, a crossterm `Resize` re-runs the
+  command, and a control-file change moves on. A non-zero exit or a missing program yields
+  `ExternalExit::Failed`; the loop then runs `start_fallback_load` (the plain request with the
+  reason prepended, tagged with the ORIGINAL request so the equality check accepts it) and
+  remembers `external_failed` so the same request is not re-hosted until a new request arrives.
+  On every exit path raw mode, mouse capture and `terminal.clear()` are restored. Line-anchored previews never host. Not verified on Windows.
+- **`ansi::to_lines` contract** (arbitrary renderers hit all of these): SGR style carries ACROSS
+  lines until reset; CSI is parsed per ECMA-48 (parameter bytes `0x30–0x3F`, intermediates
+  `0x20–0x2F`, one final `0x40–0x7E`) and only a plain `…m` applies, so `ESC[?25l` no longer
+  leaks `25l`; `ESC(B`-style nF and single-byte `ESC7`/`ESC8`/`ESC=` sequences are consumed
+  whole; OSC/DCS/APC/PM/SOS payloads are skipped through BEL or ST; `9`/`29` strikethrough,
+  `21` underline, `58;2;r;g;b`/`58;5;n` underline-colour parameters are consumed, colon-form
+  `38:2::r:g:b` with the empty colour-space slot parses. Cursor-positioned output (direct Kitty placement,
+  Sixel) cannot map onto a scrollable document and is dropped, not rendered.
+- `MenuEntry` labels are `Cow<'static, str>` (no `Copy`) because "Edit with <name>" names the
+  resolved candidate. The phase-0 "preview tab" hack (`hs-editor-preview`/origin tokens, Esc
+  closing a program tab from its docked sidebar, wrapper auto-close) was REMOVED with this
+  redesign: previews live in the viewer again, so the viewer's own Esc/`q` apply.
 - **Title-bar action buttons** (`ui.rs` `TitleAction`/`title_action_spans`): VS Code-style
   hover buttons at the header's top-right (Explorer: New File / New Folder / Refresh /
   Collapse All; SCM: Refresh / Collapse All), left of the standalone ⚙. Terminals emit NO
@@ -1032,15 +1167,9 @@ It replaced the original pane-ID-keyed park/restore implementation; the optional
 - `glow` receives the actual preview-body width and the configured light/dark color mode. Its
   terminal-formatted output bypasses the generic text wrapper; first-load and resize mismatches
   schedule one background reload at the new width while preserving the reader's scroll offset.
-- Raster image previews are decoded in-process and rendered as true-color `▀` cells (foreground
-  = upper pixel, background = lower pixel), so they work through herdr's terminal compositor
-  without Kitty/Sixel passthrough. They preserve aspect ratio, center, and rebuild from the
-  decoded source when the pane width or height changes. Common video extensions ask `ffmpeg`
-  for a bounded first-frame PNG and render it through the same path; lookup resolves an absolute
-  executable from PATH while rejecting relative/project-local entries (Windows process lookup
-  otherwise searches cwd first), and extraction has a 4s timeout plus a 16 MiB output cap.
-  Images stop at 32 MiB encoded / 12 megapixels / 64 MiB decoder allocation. Without `ffmpeg`,
-  the pane shows a capability message rather than launching an external app. Media stays read-only.
+- Image previews come from whatever the user's rules say (the seeded default is external viu,
+  see "Per-filetype previewers" above); there is no in-process decoder, no `image` crate, no
+  video preview, and no extension list in code.
 
 ### Syntax highlighting (file preview)
 
@@ -1112,7 +1241,7 @@ FileStream refuses pipe paths).
 
 ## README screenshots (how-to)
 
-The framed screenshots in `plugins/herdr-sidebar/docs/media/` are produced with the
+The framed screenshots in `docs/media/` are produced with the
 scripts in `tools/screenshots/` (capture → crop → frame). Full reshoot procedure, verified
 end-to-end twice:
 

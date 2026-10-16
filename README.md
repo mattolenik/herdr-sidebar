@@ -17,7 +17,7 @@ tabs — ephemeral until you double-click to pin one.
 
 <br><br>
 
-<img src="plugins/herdr-sidebar/docs/media/hero.png" alt="The sidebar docked beside a 2x2 fleet of Claude Code and Codex agents" width="920">
+<img src="docs/media/hero.png" alt="The sidebar docked beside a 2x2 fleet of Claude Code and Codex agents" width="920">
 
 </div>
 
@@ -39,7 +39,7 @@ Use the mouse or press `1`, `2`, and `3`.
 ### Explorer & Preview
 
 <div align="center">
-<img src="plugins/herdr-sidebar/docs/media/preview.png" alt="Explorer and file preview" width="920">
+<img src="docs/media/preview.png" alt="Explorer and file preview" width="920">
 </div>
 
 - Navigate a real expandable tree with file icons, hover actions, Git decorations, and
@@ -47,12 +47,19 @@ Use the mouse or press `1`, `2`, and `3`.
 - Click a file to reuse an ephemeral preview tab; double-click to pin it. Preview in the
   same tab with **Preview opens in: pane**, or opt into experimental `replace` mode:
   working panes move to a temporary tab while you preview; Esc / `q` brings them back.
-- Preview text, Markdown, images, and—when `ffmpeg` is available—video poster frames.
+- Preview text, Markdown (via `glow`), and images (via `viu`).
   Read-only previews support mouse selection and clipboard copy, including OSC 52 over SSH.
 - Find files with `Ctrl+P`; search project contents with `Ctrl+F` or `Ctrl+Shift+F`.
   Search supports case, whole-word, regex, and include/exclude filters.
 - Stage files or folders from the tree without crossing nested-repository boundaries.
 - Opt into a terminal editor for mouse clicks, while Enter keeps the built-in preview.
+- Per-filetype previewers (`*.md` → `dawn -P`, then `leaf --inline`: the first one on `PATH`
+  renders inside the preview pane) and editors (`*.md` → `dawn`, then `nvim`, in their own tab),
+  globally or per project.
+- IDE-style code navigation in code previews through a real language server: Ctrl+click a
+  symbol for its definition, Ctrl+right-click or `m` for references, hover, symbols, and
+  `Ctrl+-` / `Ctrl+Alt+-` to go back and forward. Needs the [lspmux](https://codeberg.org/p2502/lspmux)
+  service; every preview tab shares one server per workspace.
 - Press `e` in a text preview for the experimental editor with selection, find,
   clipboard actions, explicit save, and external-change protection.
 
@@ -63,7 +70,7 @@ working panes back manually. Third-party TUIs are not yet verified with takeover
 ### Source Control
 
 <div align="center">
-<img src="plugins/herdr-sidebar/docs/media/source-control.png" alt="Source Control view" width="920">
+<img src="docs/media/source-control.png" alt="Source Control view" width="920">
 </div>
 
 - Stage, unstage, discard, commit, inspect diffs, and sync with the upstream.
@@ -82,7 +89,7 @@ working panes back manually. Third-party TUIs are not yet verified with takeover
 ## Settings
 
 <div align="center">
-<img src="plugins/herdr-sidebar/docs/media/settings.png" alt="Sidebar settings" width="920">
+<img src="docs/media/settings.png" alt="Sidebar settings" width="920">
 </div>
 
 The current version appears at the top. Official GitHub installations offer **Update & refresh**
@@ -94,6 +101,9 @@ Settings persist across tabs and restarts. Configure:
 - Left/right docking and preferred width
 - Material/emoji icons and VS Code/light/terminal colors
 - Tab (default), split-pane, or temporary takeover previews and optional custom editor
+- Per-filetype previewers and editors (global rules file, optional per-project rules)
+- Code navigation: shows whether the lspmux service is installed and running, with the
+  command to start it
 - Source Control list/tree view (shared across sidebars)
 - Hidden files, Git decorations, Git footer, and footer hotkeys
 - Auto-open, strict open/close toggle, focus-on-open, and live folder following
@@ -118,7 +128,10 @@ folder stays put until that pane changes directory again.
 | `1` / `2` / `3` | change view | `1` / `2` / `3` | change view |
 
 Preview: drag to select, `Ctrl/Cmd+C` to copy, arrows/PageUp/PageDown or
-Space/`b` to scroll, `w` to toggle wrapping, and `q` or Esc to close.
+Space/`b` to scroll, `w` to toggle wrapping, and `q` or Esc to close. In a code preview
+with a language server: Ctrl+click goes to the definition, `m` or Ctrl+right-click opens
+the navigation menu, `Ctrl+-` goes back and `Ctrl+Alt+-` forward (on macOS, Option must
+act as Alt: Ghostty `macos-option-as-alt = true`).
 
 Host keybindings can invoke the direct `show-explorer`, `show-search`, `show-git`, and
 `quick-open` actions. For example, bind `cmd+p` to:
@@ -167,8 +180,8 @@ Useful development actions:
 Use the `-windows` suffix for each direct action on Windows.
 
 All docking, metadata, pane creation, and preview control use herdr's socket API directly.
-The plugin is one Rust crate; optional external tools only enhance Markdown (`glow`), video
-posters (`ffmpeg`), and AI commit drafts (`claude`).
+The plugin is one Rust crate; optional external tools only enhance Markdown (`glow`), images
+(`viu`), per-filetype previews you configure, and AI commit drafts (`claude`).
 
 <div align="center">
 <sub>Screenshots: herdr on Windows Terminal with a Nerd Font.</sub>

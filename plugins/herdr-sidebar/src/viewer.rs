@@ -2129,8 +2129,11 @@ impl Nav {
     ) -> Option<String> {
         self.drop_dead();
         let Some(spec) = nav_spec(request).cloned() else {
+            // The sidebar resolves the rule; it sends no server when no
+            // [[lsp]] rule matches OR none of the rule's commands is on its
+            // PATH (its footer names what it tried).
             return Some(format!(
-                "no [[lsp]] rule for {} (Settings → Preview programs…)",
+                "no language server for {}: no matching [[lsp]] rule, or its command is not on PATH (Settings → Preview programs…)",
                 doc.name
             ));
         };
@@ -2234,15 +2237,16 @@ impl Nav {
         if let Some((_, client)) = &mut self.session {
             client.pump();
         }
-        let was_dead = self
+        let closed = self
             .session
             .as_ref()
-            .is_some_and(|(_, client)| client.is_dead());
-        if was_dead {
+            .filter(|(_, client)| client.is_dead())
+            .map(|(_, client)| client.closed_reason());
+        if let Some(reason) = closed {
             self.drop_dead();
             self.inflight = None;
             self.queued = None;
-            events.push(NavEvent::Notice("language server connection closed".into()));
+            events.push(NavEvent::Notice(reason));
         }
         if let Some(inflight) = &self.inflight {
             match inflight.receiver.try_recv() {
@@ -3801,6 +3805,21 @@ pub fn run(control: &Path) -> std::io::Result<()> {
                                     Err(why) => notice = Some(why),
                                 }
                             }
+                            // The mouse's side buttons (xterm 8/9) step the
+                            // navigation history like Ctrl+- / Ctrl+Alt+-.
+                            MouseEventKind::Down(MouseButton::Back)
+                            | MouseEventKind::Down(MouseButton::Forward) => history_step(
+                                &mut nav,
+                                mouse.kind == MouseEventKind::Down(MouseButton::Forward),
+                                &mut current,
+                                &mut mode,
+                                &mut preview_load,
+                                control,
+                                &mut identity_pending,
+                                &mut notice,
+                            ),
+                            MouseEventKind::Up(MouseButton::Back)
+                            | MouseEventKind::Up(MouseButton::Forward) => {}
                             MouseEventKind::Down(MouseButton::Left) => {
                                 nav.last_cell = Some(cell);
                                 doc.on_mouse(&mouse, preview_body);

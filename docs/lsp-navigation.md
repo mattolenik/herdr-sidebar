@@ -85,9 +85,9 @@ roots = ["compile_commands.json", ".clangd"]
 command = "clangd --background-index"
 
 [[lsp]]
-patterns = ["*.ts", "*.tsx", "*.js", "*.jsx"]
+patterns = ["*.ts", "*.tsx", "*.mts", "*.js", "*.jsx", "*.mjs"]
 roots = ["tsconfig.json", "package.json"]
-command = ["tsgo --lsp --stdio", "typescript-language-server --stdio"]
+command = ["tsgo --lsp --stdio", "tsc --lsp --stdio", "typescript-language-server --stdio"]
 
 [[lsp]]
 patterns = ["*.py"]
@@ -97,7 +97,8 @@ command = ["ty server", "basedpyright-langserver --stdio", "pyright-langserver -
 
 - `command` is a string or a preference-ordered list; the first program on PATH wins
   (`programs::resolve_program`, unchanged). The resolved entry is the language server,
-  never the shim: the viewer wraps it as `lspmux client --server-path <argv0> <args…>`.
+  never the shim: the viewer wraps it as `lspmux client --server-path <argv0> -- <args…>` (the `--` keeps
+  clap from claiming server flags such as `--stdio`).
   (Verify during implementation that `lspmux client` forwards trailing arguments to
   the server; its README wrapper example passes `$@`, so it should.)
 - Placeholders: none. Servers take no file argument; the workspace is sent in
@@ -241,7 +242,7 @@ Cmd is not encoded in SGR mouse reports), so:
 | Ctrl+left click on a symbol | Go to definition. One result: jump. Several: picker overlay. None: notice `no definition`. |
 | Ctrl+right click | Menu at the pointer: Go to Definition, Go to Type Definition / Implementation (capability-gated), Find References, Hover, Document Symbols, Back. Acts on the position under the pointer. |
 | `m` (existing keyboard menu key) | Same menu, acting on the last clicked position (the selection anchor). |
-| `Ctrl+-` | Back: pop the history (request + scroll). `Ctrl+Alt+-` forward. |
+| `Ctrl+-` | Back: pop the history (request + scroll). `Ctrl+Alt+-` forward. The mouse's side back/forward buttons (xterm 8/9) do the same. |
 | Pointer dwell (~500 ms on one cell) or the menu's Hover | `textDocument/hover` for that position; the result is shown in a floating box at the pointer (see **Hover** below), dismissed by motion off the cell, any key, click or scroll, and by a timer since terminals send no "pointer left the pane" event. |
 
 - **Cell → text position.** Rows are tagged with their source line (`Row` in
@@ -266,7 +267,11 @@ Cmd is not encoded in SGR mouse reports), so:
   (herdr panes do not enable the kitty keyboard protocol) `Ctrl+-` arrives as `0x1F`
   and `Ctrl+Alt+-` as `ESC 0x1F`; crossterm reports them as Ctrl+`7` and Ctrl+Alt+`7`,
   so the viewer matches on `Char('7')` with CONTROL, with and without ALT. `Ctrl+Shift+-`
-  was rejected because it also encodes as `0x1F`. macOS users need Option to act as Alt
+  was rejected because it also encodes as `0x1F`. The mouse's side buttons arrive as SGR
+  button codes 128/129 (`ESC[<128;x;yM`); stock crossterm 0.29 rejects any button above 7,
+  so the crate pins a patched crossterm (`[patch.crates-io]` in Cargo.toml) that reports
+  them as `MouseButton::Back` / `Forward`, and herdr must forward them (its 0.9.3 client
+  drops them). macOS users need Option to act as Alt
   (Ghostty: `macos-option-as-alt = true`), which the README states. Verify the chords
   from a real terminal in `hs-test` first; `pane send-keys` injects synthetic keys and
   proves nothing about the terminal's encoding.
@@ -332,7 +337,9 @@ commit, Phase 0 being the live verification list below.
 
 ## Resolved from lspmux's source (0.3.x)
 
-- `lspmux client --server-path X args…` forwards trailing arguments to the server
+- `lspmux client --server-path X -- args…` forwards trailing arguments to the server; without
+  the `--`, clap rejects `--stdio` as an unknown lspmux flag and the shim exits 2 (bit live
+  with typescript-language-server: the viewer saw only "connection closed")
   (`SERVER_ARGS`), so rules may carry `--background-index` / `--stdio`. Server path,
   arguments, environment and workspace root form the instance key.
 - Server→client requests are not dropped: `window/workDoneProgress/create` and
@@ -371,3 +378,21 @@ rules.
   symbols picker (118 entries) all worked.
 - `tsgo` and `ty` are not installed on this machine; their seeded invocations
   (`tsgo --lsp --stdio`, `ty server`) follow their READMEs and are unverified.
+- TypeScript, probed 2026-10-14 on this host: Homebrew `typescript` is 7.0.2, whose binary is
+  the native `tsc` (no `tsserver.js` anywhere), so `typescript-language-server` 6.0.2 answers
+  `initialize` with the error "Could not find a valid TypeScript installation" and `tsc --lsp
+  --stdio` (now the second seeded candidate) is the working server. Both trip lspmux 0.3.0's
+  handshake, which demands that the FIRST server message be the initialize response: `tsc`
+  sends a `window/logMessage` notification first, and the error response is not a success.
+  lspmux `main` (post-0.3.0, `instance.rs` "ignoring message while waiting for initialize
+  response") tolerates the notification — verified with a `main` build on a private socket:
+  `tsc --lsp --stdio` initialized (server "typescript-go" 7.0.2, utf-16) while the error
+  response from typescript-language-server was still ignored forever. `main` still reports
+  version 0.3.0. TypeScript needs lspmux built from `main` until the next release.
+  With `main` live, `tsc` then rejected our `initialize` with InvalidParams at
+  `/clientInfo/version`: we sent `clientInfo: {name}` and lspmux re-serialised it with
+  `version: null`, which typescript-go's strict decoder refuses. The client now always sends
+  `version` (verified: initialize ok through a private `main` server, InvalidParams without
+  it). A hung handshake also wedges lspmux for every other client, because the daemon holds its
+  instance lock while waiting (its own FIXME); restart the service to clear one. lspmux then leaves the shim connected without a reply, so the viewer reports
+  "no answer after 60 s" rather than a failure.

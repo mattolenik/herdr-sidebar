@@ -104,7 +104,7 @@ New lib module, no viewer wiring yet. Everything here is testable without a term
 - **Env scrubbing.** `pub fn shim_env() -> Vec<(String, String)>` keeps exactly the
   allow-list in the design; test asserts no `HERDR_*` and that `PATH` survives.
 - **Transport.** `Transport::spawn(spec: &LspSpec) -> io::Result<Transport>` runs
-  `lspmux client --server-path <argv0> <args…>` (argv via `split_editor_command`),
+  `lspmux client --server-path <argv0> -- <args…>` (argv via `split_editor_command`),
   cwd = `spec.root`, env = `shim_env()`, stdio piped. Internally generic over
   `Read + Write` so tests drive it with `std::io::pipe()` (stable since 1.87; the
   crate already requires 1.89). Reader thread: Content-Length framing → `serde_json::

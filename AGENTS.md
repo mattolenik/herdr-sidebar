@@ -741,8 +741,26 @@ HACKING.md — budget time for that before promising a patched build.
     args, environment and workspace, and every preview pane has its own `HERDR_*` values — an
     inherited env gives every tab a private rust-analyzer. Only PATH/HOME/USER/LANG/TMPDIR/XDG_*/
     CARGO_HOME/RUSTUP_HOME/GOPATH/GOROOT pass. The server path is passed ABSOLUTE (resolved in the
-    viewer) because the daemon's PATH is not ours. Verified live: two viewers, one rust-analyzer,
-    `lspmux status` lists two clients.
+    viewer) because the daemon's PATH is not ours. Server arguments follow a `--`
+    (`lsp::shim_args`): lspmux's clap parser otherwise rejects `--stdio` as an unknown flag and
+    the shim exits 2 — bit live with typescript-language-server, where the viewer saw only
+    "connection closed"; the shim's stderr tail now rides in that message
+    (`Transport::closed_reason`). Verified live: two viewers, one rust-analyzer, `lspmux status`
+    lists two clients. **lspmux 0.3.0 requires the server's FIRST message to be the initialize
+    response** (`instance.rs` "first server message was not initialize response"); TypeScript 7's
+    native `tsc --lsp --stdio` sends a `window/logMessage` first and an initialize ERROR response
+    counts as "not a response" too, so both hang the shim (no reply ever, our 60 s timeout) rather
+    than failing. lspmux `main` already ignores pre-response messages (verified 2026-10-14 with a
+    `main` build on a private socket: `tsc --lsp --stdio` initialized; an initialize ERROR
+    response still hangs; `main` still calls itself 0.3.0); until a release ships it,
+    TypeScript needs lspmux built from source (`brew install --HEAD lspmux` after uninstalling
+    stable; the service runs `opt_bin`, so no service edit). **Always send
+    `clientInfo.version`**: lspmux re-serialises the first client's `clientInfo` with
+    `version: null` when absent, typescript-go rejects that with InvalidParams, and because lspmux
+    holds its instance lock for the whole handshake the hung instance then blocks EVERY new
+    client until the daemon restarts (verified both ways against a private `main` server). Homebrew `typescript` 7.x ships no `tsserver.js`,
+    so `typescript-language-server` cannot work against it — hence `tsc --lsp --stdio` is seeded
+    between `tsgo` and `typescript-language-server`.
   - Position encoding comes from the `initialize` RESULT (lspmux replays the first client's
     negotiation; rust-analyzer answered utf-8 here), missing → UTF-16. There is no
     `$/cancelRequest` (lspmux retags ids); staleness is "apply only while the document the gesture
@@ -761,6 +779,17 @@ HACKING.md — budget time for that before promising a patched build.
     `Ctrl+Alt+-` as the same with ALT (ESC 0x1F); `Ctrl+Shift+-` is byte-identical to `Ctrl+-` and
     must not be used. Every document change pushes the previous (request, scroll) onto the back
     history, sidebar clicks included; forward clears on push; cap 50 (`lsp::History`).
+    **Mouse back/forward buttons** (xterm buttons 8/9, SGR `cb` 128/129) also step history
+    (`MouseButton::Back`/`Forward` arms next to the right-click one). Two upstream facts, checked
+    from source 2026-10-13: Ghostty 1.3.1 emits them (macOS buttonNumber 3/4 → `.eight`/`.nine`
+    → 128/129), but herdr 0.9.3's client parser `raw_input.rs::parse_mouse_cb` returns `None` for a
+    press of button 8/9 and its wire `ClientMouseButton` has only Left/Right/Middle, so an
+    UNPATCHED herdr never delivers them to the pane; and stock crossterm 0.29 (master too)
+    `parse_cb` errors on any button > 7 and the unix reader clears the buffer, so the crate pins
+    a patched crossterm through `[patch.crates-io]` in Cargo.toml (fork
+    `mattolenik/crossterm`, branch `mouse-buttons-8-9`, 0.29 tag + the two variants). Drop the
+    patch when a crossterm release carries the change. Headless check: `pane.send_input`
+    `ESC[<128;x;yM` (back) / `ESC[<129;x;yM` (forward) into a viewer with history.
   - Tests: `lsp::fake` is a language server over `std::io::pipe` (Rust ≥ 1.87; the crate floor is
     1.89) that answers the six methods and issues the server→client traffic; the client is driven
     against it hermetically. Live checks go through `pane.send_input` with SGR mouse sequences

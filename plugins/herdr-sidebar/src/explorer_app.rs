@@ -162,6 +162,41 @@ struct BodyGeom {
     offset: usize,
 }
 
+/// Where a group's chrome was drawn last frame; `Rect::default()` = absent.
+#[derive(Clone, Copy, Default)]
+struct GroupZones {
+    divider: Rect,
+    header: Rect,
+    chevron: Rect,
+    git: Rect,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum GroupPart {
+    Divider,
+    Chevron,
+    Header,
+    Git,
+}
+
+/// Pure: which group's divider/header/git button a click lands on, from the zones list.
+fn group_part_at(zones: &[GroupZones], x: u16, y: u16) -> Option<(usize, GroupPart)> {
+    zones.iter().enumerate().find_map(|(i, z)| {
+        let part = if hits(z.divider, x, y) {
+            GroupPart::Divider
+        } else if hits(z.chevron, x, y) {
+            GroupPart::Chevron
+        } else if hits(z.git, x, y) {
+            GroupPart::Git
+        } else if hits(z.header, x, y) {
+            GroupPart::Header
+        } else {
+            return None;
+        };
+        Some((i, part))
+    })
+}
+
 /// One scroll region of the Explorer: a group of roots (one repository, or one
 /// non-repo directory) with its own rows, selection and scroll.
 struct Region {
@@ -594,9 +629,18 @@ enum Setting {
 type SettingRow = (Setting, &'static str, String, bool);
 
 pub struct App {
-    /// The tree regions; drawing currently renders only the focused one.
+    /// The tree regions, one per group, drawn stacked.
     regions: Vec<Region>,
     focused: usize,
+    /// Manually folded groups, by group key.
+    folded: BTreeSet<PathBuf>,
+    /// Divider-dragged group heights; `None` = equal split.
+    heights: Option<Vec<u16>>,
+    /// The divider being dragged (index of the group below it).
+    dragging: Option<usize>,
+    group_zones: Vec<GroupZones>,
+    /// The allocation the last draw used, for fold/drag decisions.
+    alloc: stack::Allocation,
     /// The directory this sidebar was spawned in.
     spawn_cwd: PathBuf,
     /// Repository root owning each stack root (`None` = not in a repo), so a
@@ -754,6 +798,14 @@ impl App {
         let mut app = Self {
             regions,
             focused: 0,
+            folded: BTreeSet::new(),
+            heights: None,
+            dragging: None,
+            group_zones: Vec::new(),
+            alloc: stack::Allocation {
+                heights: Vec::new(),
+                folded: Vec::new(),
+            },
             spawn_cwd,
             owner_cache,
             theme,
@@ -1113,6 +1165,7 @@ impl App {
             return false;
         }
         let show_hidden = self.region().show_hidden();
+        let focused_key = self.region().group.key.clone();
         let mut old = std::mem::take(&mut self.regions);
         self.regions = groups
             .into_iter()
@@ -1133,7 +1186,12 @@ impl App {
                 },
             )
             .collect();
-        self.focused = self.focused.min(self.regions.len() - 1);
+        self.focused = self
+            .regions
+            .iter()
+            .position(|r| r.group.key == focused_key)
+            .unwrap_or_else(|| self.focused.min(self.regions.len() - 1));
+        self.heights = None;
         self.invalidate_quick_index();
         self.rediscover_repos();
         self.request_decorations(true);
@@ -1538,9 +1596,46 @@ impl App {
             KeyCode::Char('1') => return self.switch_to(View::Explorer),
             KeyCode::Char('2') => self.open_content_search(false),
             KeyCode::Char('3') => return self.switch_to(View::SourceControl),
+            KeyCode::Tab => self.focus_region((self.focused + 1) % self.regions.len()),
+            KeyCode::BackTab => {
+                self.focus_region((self.focused + self.regions.len() - 1) % self.regions.len())
+            }
             _ => {}
         }
         None
+    }
+
+    /// The region whose body (as last drawn) contains pane row `y`.
+    fn region_at(&self, y: u16) -> Option<usize> {
+        self.regions
+            .iter()
+            .position(|r| y >= r.body.top && y < r.body.top + r.body.height)
+    }
+
+    fn group_at(&self, x: u16, y: u16) -> Option<(usize, GroupPart)> {
+        group_part_at(&self.group_zones, x, y)
+    }
+
+    fn focus_region(&mut self, index: usize) {
+        if index < self.regions.len() && index != self.focused {
+            self.focused = index;
+            self.last_click = None;
+        }
+    }
+
+    /// Flip the manual fold of group `index`; folding an auto-folded group is a no-op.
+    fn toggle_fold(&mut self, index: usize) {
+        let Some(region) = self.regions.get(index) else {
+            return;
+        };
+        let key = region.group.key.clone();
+        if !self.folded.remove(&key) {
+            if self.alloc.folded.get(index) == Some(&true) {
+                return;
+            }
+            self.folded.insert(key);
+        }
+        self.heights = None;
     }
 
     /// `Some(exit)` ends the event loop, mirroring on_key.
@@ -1609,10 +1704,29 @@ impl App {
         }
         match mouse.kind {
             MouseEventKind::Moved => {
-                self.region_mut().hovered = self.row_at(mouse.row);
+                for region in &mut self.regions {
+                    region.hovered = row_index_at(region.body, region.rows.len(), mouse.row);
+                }
             }
-            MouseEventKind::ScrollUp => self.scroll_view(-3),
-            MouseEventKind::ScrollDown => self.scroll_view(3),
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                let index = self.region_at(mouse.row).unwrap_or(self.focused);
+                let delta = if mouse.kind == MouseEventKind::ScrollUp {
+                    -3
+                } else {
+                    3
+                };
+                self.scroll_view(index, delta);
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if let Some(boundary) = self.dragging
+                    && let Some(zones) = self.group_zones.get(boundary)
+                {
+                    let delta = i32::from(mouse.row) - i32::from(zones.divider.y);
+                    stack::drag(&mut self.alloc, boundary, delta);
+                    self.heights = Some(self.alloc.heights.clone());
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) => self.dragging = None,
             MouseEventKind::Down(MouseButton::Left) => {
                 if let Some(&(_, action)) = self
                     .title_zones
@@ -1626,6 +1740,23 @@ impl App {
                 {
                     self.hide();
                     return None;
+                }
+                match self.group_at(mouse.column, mouse.row) {
+                    Some((i, GroupPart::Chevron | GroupPart::Header)) => {
+                        self.toggle_fold(i);
+                        return None;
+                    }
+                    Some((i, GroupPart::Divider)) => {
+                        self.dragging = Some(i);
+                        self.heights = Some(self.alloc.heights.clone());
+                        return None;
+                    }
+                    // Opening the group's Source Control is wired in Task 8.
+                    Some((_, GroupPart::Git)) => return None,
+                    None => {}
+                }
+                if let Some(i) = self.region_at(mouse.row) {
+                    self.focus_region(i);
                 }
                 let Some(index) = self.row_at(mouse.row) else {
                     self.clear_selection();
@@ -1681,6 +1812,9 @@ impl App {
             }
             MouseEventKind::Down(MouseButton::Right) => {
                 self.notice = None;
+                if let Some(i) = self.region_at(mouse.row) {
+                    self.focus_region(i);
+                }
                 self.open_context_menu(mouse.column, mouse.row);
             }
             _ => {}
@@ -3542,8 +3676,8 @@ impl App {
     }
 
     /// Wheel: move the VIEW only — the selection stays where it is.
-    fn scroll_view(&mut self, delta: isize) {
-        let region = self.region_mut();
+    fn scroll_view(&mut self, index: usize, delta: isize) {
+        let region = &mut self.regions[index];
         let max = region.rows.len().saturating_sub(1) as isize;
         region.scroll = (region.scroll as isize + delta).clamp(0, max) as usize;
     }
@@ -3641,7 +3775,6 @@ impl App {
             Constraint::Length(footer_height),
         ])
         .areas(frame.area());
-        self.page = body.height.saturating_sub(1).max(1) as usize;
 
         if self.merged() {
             self.draw_activity_bar(frame, activity);
@@ -3673,62 +3806,16 @@ impl App {
                 Paragraph::new("«".bold().fg(palette().header_accent)).alignment(Alignment::Center),
                 button,
             );
-            self.region_mut().body = BodyGeom::default();
+            for region in &mut self.regions {
+                region.body = BodyGeom::default();
+            }
+            self.group_zones.clear();
             return;
         }
         self.draw_header(frame, header);
 
-        if self.region().rows.is_empty() {
-            frame.render_widget(Paragraph::new("  (empty)".dim().italic()), body);
-        } else {
-            let h = (body.height as usize).max(1);
-            let region = self.region_mut();
-            region.scroll = region.scroll.min(region.rows.len().saturating_sub(h));
-            if region.snap {
-                if let Some(sel) = region.selected {
-                    if sel < region.scroll {
-                        region.scroll = sel;
-                    } else if sel >= region.scroll + h {
-                        region.scroll = sel + 1 - h;
-                    }
-                }
-                region.snap = false;
-            }
-            let theme = self.theme;
-            let hovered = self.region().hovered;
-            let selected = self.region().selected;
-            let items: Vec<ListItem> = self
-                .region()
-                .rows
-                .iter()
-                .enumerate()
-                .skip(self.region().scroll)
-                .take(h)
-                .map(|(i, r)| {
-                    row_item(
-                        r,
-                        theme,
-                        hovered == Some(i),
-                        selected == Some(i),
-                        self.row_deco(r),
-                        body.width,
-                    )
-                })
-                .collect();
-            frame.render_widget(List::new(items), body);
-            draw_scrollbar(
-                frame,
-                body,
-                self.region().rows.len(),
-                h,
-                self.region().scroll,
-            );
-        }
-        self.region_mut().body = BodyGeom {
-            top: body.y,
-            height: body.height,
-            offset: self.region().scroll,
-        };
+        self.draw_stack(frame, body);
+        self.page = self.region().body.height.saturating_sub(1).max(1) as usize;
 
         // Collapse button at the bottom-right of the LAST footer line,
         // mirroring herdr's own sidebar. hits_collapse_button targets the
@@ -3840,6 +3927,150 @@ impl App {
             Some(Overlay::QuickOpen { .. }) => self.draw_quick_open(frame),
             _ => {}
         }
+    }
+
+    /// Every group stacked in `area`: divider (groups after the first), header, body.
+    fn draw_stack(&mut self, frame: &mut Frame, area: Rect) {
+        let manual: Vec<bool> = self
+            .regions
+            .iter()
+            .map(|r| self.folded.contains(&r.group.key))
+            .collect();
+        self.alloc = stack::allocate(&manual, area.height, self.heights.as_deref());
+        self.group_zones = vec![GroupZones::default(); self.regions.len()];
+        let bottom = area.y + area.height;
+        let mut y = area.y;
+        for i in 0..self.regions.len() {
+            let h = self.alloc.heights.get(i).copied().unwrap_or(0);
+            let end = (y + h).min(bottom);
+            let row = |y: u16| Rect::new(area.x, y, area.width, 1);
+            if i > 0 && y < end {
+                self.group_zones[i].divider = row(y);
+                frame.render_widget(
+                    Paragraph::new("─".repeat(usize::from(area.width)))
+                        .style(Style::default().dim()),
+                    row(y),
+                );
+                y += 1;
+            }
+            if y < end {
+                self.draw_group_header(frame, row(y), i, self.alloc.folded[i]);
+                y += 1;
+            }
+            let body = Rect::new(area.x, y, area.width, end - y);
+            self.draw_region_body(frame, body, i);
+            y = end;
+        }
+    }
+
+    /// ` ▾ name ⎇ branch*`, plus the Source Control chip in unified mode.
+    fn draw_group_header(&mut self, frame: &mut Frame, area: Rect, index: usize, folded: bool) {
+        let group = &self.regions[index].group;
+        let mut name_style = Style::default().fg(palette().header_accent);
+        if index == self.focused {
+            name_style = name_style.bold();
+        }
+        let chevron = if folded { "▸" } else { "▾" };
+        let mut spans = vec![Span::styled(
+            format!(" {chevron} {}", group.name()),
+            name_style,
+        )];
+        if group.repo
+            && let Some(status) = self.repo_status.get(&group.key)
+        {
+            let dirty = if status.staged.is_empty() && status.unstaged.is_empty() {
+                ""
+            } else {
+                "*"
+            };
+            spans.push(Span::styled(
+                format!(" ⎇ {}{dirty}", status.branch),
+                Style::default().dim(),
+            ));
+        }
+        let mut zones = GroupZones {
+            header: area,
+            chevron: Rect::new(area.x, area.y, 3.min(area.width), 1),
+            ..self.group_zones[index]
+        };
+        let chip =
+            (group.repo && self.merged()).then(|| format!(" {} ", activity_icons(self.theme).2));
+        let chip_w = chip
+            .as_ref()
+            .map_or(0, |c| Span::raw(c.as_str()).width() as u16);
+        let avail = usize::from(area.width.saturating_sub(chip_w));
+        let line = Line::from(spans);
+        let mut spans: Vec<Span> = if line.width() > avail {
+            vec![Span::styled(
+                truncate_to(line.to_string(), avail),
+                name_style,
+            )]
+        } else {
+            line.spans
+        };
+        if let Some(chip) = chip
+            && chip_w <= area.width
+        {
+            zones.git = Rect::new(area.x + area.width - chip_w, area.y, chip_w, 1);
+            let hovered = self.mouse_pos.is_some_and(|(x, y)| hits(zones.git, x, y));
+            let used: usize = spans.iter().map(Span::width).sum();
+            spans.push(Span::raw(" ".repeat(avail.saturating_sub(used))));
+            spans.push(Span::styled(chip, activity_button_style(false, hovered)));
+        }
+        self.group_zones[index] = zones;
+        frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    }
+
+    /// One region's rows in `area`, with its scrollbar; records the body geometry.
+    fn draw_region_body(&mut self, frame: &mut Frame, area: Rect, index: usize) {
+        let focused = index == self.focused;
+        let theme = self.theme;
+        if area.height > 0 {
+            let region = &mut self.regions[index];
+            if region.rows.is_empty() {
+                frame.render_widget(Paragraph::new("  (empty)".dim().italic()), area);
+            } else {
+                let h = usize::from(area.height);
+                region.scroll = region.scroll.min(region.rows.len().saturating_sub(h));
+                if region.snap {
+                    if let Some(sel) = region.selected {
+                        if sel < region.scroll {
+                            region.scroll = sel;
+                        } else if sel >= region.scroll + h {
+                            region.scroll = sel + 1 - h;
+                        }
+                    }
+                    region.snap = false;
+                }
+                let region = &self.regions[index];
+                let items: Vec<ListItem> = region
+                    .rows
+                    .iter()
+                    .enumerate()
+                    .skip(region.scroll)
+                    .take(h)
+                    .map(|(i, r)| {
+                        row_item(
+                            r,
+                            theme,
+                            region.hovered == Some(i),
+                            region.selected == Some(i),
+                            focused,
+                            self.row_deco(r),
+                            area.width,
+                        )
+                    })
+                    .collect();
+                frame.render_widget(List::new(items), area);
+                draw_scrollbar(frame, area, region.rows.len(), h, region.scroll);
+            }
+        }
+        let region = &mut self.regions[index];
+        region.body = BodyGeom {
+            top: area.y,
+            height: area.height,
+            offset: region.scroll,
+        };
     }
 
     /// The workspace-name header (the root folder's name, uppercase like VS
@@ -5078,11 +5309,12 @@ fn row_item(
     theme: IconTheme,
     hovered: bool,
     selected: bool,
+    focused: bool,
     deco: Option<char>,
     width: u16,
 ) -> ListItem<'static> {
     let item = ListItem::new(row_line(row, theme, deco, width));
-    match row_bg(hovered, selected) {
+    match row_bg(hovered, selected, focused) {
         Some(style) => item.style(style),
         None => item,
     }
@@ -5090,9 +5322,10 @@ fn row_item(
 
 /// The selection / hover BACKGROUND for a row, if any. Kept apart from the
 /// content so a git decoration (foreground-only) can never collide with it.
-fn row_bg(hovered: bool, selected: bool) -> Option<Style> {
+/// Only the focused region shows a focused selection.
+fn row_bg(hovered: bool, selected: bool, focused: bool) -> Option<Style> {
     if selected {
-        Some(selection_style(true))
+        Some(selection_style(focused))
     } else if hovered {
         // Subtler than the selection bg — hover is a hint, not a choice.
         Some(hover_style())
@@ -5297,12 +5530,18 @@ mod tests {
     fn with_scratch_state(f: impl FnOnce(&Path)) {
         let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let state = scratch_dir("state");
-        let vars = ["HERDR_PLUGIN_STATE_DIR", "HERDR_SIDEBAR_ICONS"];
+        // HERDR_PANE_ID is cleared so `App::new` never talks to a live herdr.
+        let vars = [
+            "HERDR_PLUGIN_STATE_DIR",
+            "HERDR_SIDEBAR_ICONS",
+            "HERDR_PANE_ID",
+        ];
         let saved: Vec<_> = vars.iter().map(std::env::var_os).collect();
         // SAFETY: env edits are serialized by ENV_LOCK within this module.
         unsafe {
             std::env::set_var(vars[0], &state);
             std::env::set_var(vars[1], "emoji");
+            std::env::remove_var(vars[2]);
         }
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&state)));
         for (var, value) in vars.iter().zip(saved) {
@@ -5482,6 +5721,77 @@ mod tests {
             assert!(app.apply_groups(vec![g(&b)]));
             assert_eq!(app.regions[0].group.key, b);
             assert_eq!(app.focused, 0);
+            let _ = std::fs::remove_dir_all(&a);
+            let _ = std::fs::remove_dir_all(&b);
+        });
+    }
+
+    #[test]
+    fn group_parts_hit_test_from_zones() {
+        let z = GroupZones {
+            divider: Rect::new(0, 5, 30, 1),
+            header: Rect::new(0, 6, 30, 1),
+            chevron: Rect::new(0, 6, 3, 1),
+            git: Rect::new(27, 6, 3, 1),
+        };
+        assert_eq!(group_part_at(&[z], 10, 5), Some((0, GroupPart::Divider)));
+        assert_eq!(group_part_at(&[z], 1, 6), Some((0, GroupPart::Chevron)));
+        assert_eq!(group_part_at(&[z], 28, 6), Some((0, GroupPart::Git)));
+        assert_eq!(group_part_at(&[z], 10, 6), Some((0, GroupPart::Header)));
+        assert_eq!(group_part_at(&[z], 10, 7), None);
+    }
+
+    /// An app stacked over two scratch directories, drawn once at 40x30.
+    fn two_group_app(
+        tag: &str,
+    ) -> (
+        App,
+        ratatui::Terminal<ratatui::backend::TestBackend>,
+        PathBuf,
+        PathBuf,
+    ) {
+        let a = scratch_dir(&format!("{tag}-a"));
+        let b = scratch_dir(&format!("{tag}-b"));
+        let mut app = App::new(
+            a.clone(),
+            std::rc::Rc::new(std::cell::RefCell::new(
+                herdr_sidebar::viewnav::ViewHistory::new(),
+            )),
+        );
+        let g = |k: &PathBuf| stack::Group {
+            key: k.clone(),
+            repo: false,
+            roots: vec![k.clone()],
+        };
+        app.apply_groups(vec![g(&a), g(&b)]);
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(40, 30)).unwrap();
+        term.draw(|f| app.draw(f)).unwrap();
+        (app, term, a, b)
+    }
+
+    #[test]
+    fn region_bodies_follow_the_allocation() {
+        with_scratch_state(|_| {
+            let (app, _term, a, b) = two_group_app("geom");
+            assert_eq!(app.regions[0].body.top, app.group_zones[0].header.y + 1);
+            assert_eq!(
+                app.group_zones[1].divider.y,
+                app.regions[0].body.top + app.regions[0].body.height
+            );
+            assert_eq!(app.region_at(app.regions[1].body.top), Some(1));
+            let _ = std::fs::remove_dir_all(&a);
+            let _ = std::fs::remove_dir_all(&b);
+        });
+    }
+
+    #[test]
+    fn fold_gives_the_space_to_the_other_group() {
+        with_scratch_state(|_| {
+            let (mut app, mut term, a, b) = two_group_app("fold");
+            app.toggle_fold(0);
+            term.draw(|f| app.draw(f)).unwrap();
+            assert_eq!(app.regions[0].body.height, 0);
+            assert!(app.regions[1].body.height > 15);
             let _ = std::fs::remove_dir_all(&a);
             let _ = std::fs::remove_dir_all(&b);
         });
@@ -5726,14 +6036,14 @@ mod tests {
         // Selection owns the BACKGROUND; a decoration must only recolor the
         // name, or a selected changed row would be unreadable.
         assert_eq!(
-            row_bg(false, true).and_then(|s| s.bg),
+            row_bg(false, true, true).and_then(|s| s.bg),
             Some(palette().selection_bg)
         );
         assert_eq!(
-            row_bg(true, false).and_then(|s| s.bg),
+            row_bg(true, false, true).and_then(|s| s.bg),
             Some(palette().hover_bg)
         );
-        assert_eq!(row_bg(false, false), None);
+        assert_eq!(row_bg(false, false, true), None);
         // The decoration itself only ever sets a foreground.
         let name_spans = row_line(&file_row("app.rs"), IconTheme::Emoji, Some('M'), 30);
         assert!(name_spans.spans.iter().all(|s| s.style.bg.is_none()));

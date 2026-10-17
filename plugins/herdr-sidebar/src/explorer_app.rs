@@ -5636,11 +5636,16 @@ mod tests {
     fn with_scratch_state(f: impl FnOnce(&Path)) {
         let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let state = scratch_dir("state");
-        // HERDR_PANE_ID is cleared so `App::new` never talks to a live herdr.
+        // HERDR_PANE_ID / HERDR_ENV are cleared and the socket pointed at a
+        // path nothing listens on, so no test talks to (or moves) a live
+        // herdr. A dead path rather than unset: Windows falls back to the
+        // default socket. The tab journal (rundir) follows the state dir.
         let vars = [
             "HERDR_PLUGIN_STATE_DIR",
             "HERDR_SIDEBAR_ICONS",
             "HERDR_PANE_ID",
+            "HERDR_SOCKET_PATH",
+            "HERDR_ENV",
         ];
         let saved: Vec<_> = vars.iter().map(std::env::var_os).collect();
         // SAFETY: env edits are serialized by ENV_LOCK within this module.
@@ -5648,6 +5653,8 @@ mod tests {
             std::env::set_var(vars[0], &state);
             std::env::set_var(vars[1], "emoji");
             std::env::remove_var(vars[2]);
+            std::env::set_var(vars[3], state.join("no-herdr.sock"));
+            std::env::remove_var(vars[4]);
         }
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&state)));
         for (var, value) in vars.iter().zip(saved) {

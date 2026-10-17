@@ -573,7 +573,7 @@ struct QuickFile {
 }
 
 struct QuickIndex {
-    root: PathBuf,
+    roots: Vec<PathBuf>,
     show_hidden: bool,
     files: std::sync::Arc<Vec<QuickFile>>,
     truncated: bool,
@@ -589,7 +589,7 @@ struct ContentHit {
 }
 
 struct ContentSearchResult {
-    root: PathBuf,
+    roots: Vec<PathBuf>,
     show_hidden: bool,
     query: String,
     include: String,
@@ -877,6 +877,24 @@ impl App {
             .filter_map(|region| region.root_of(path))
             .max_by_key(|root| root.as_os_str().len())
             .unwrap_or_else(|| self.spawn_cwd.clone())
+    }
+
+    /// Every root in stack order, paired with its search/quick-open label prefix.
+    fn labelled_roots(&self) -> Vec<(PathBuf, String)> {
+        let groups: Vec<stack::Group> = self.regions.iter().map(|r| r.group.clone()).collect();
+        self.all_roots()
+            .into_iter()
+            .map(|root| {
+                let prefix = stack_label_prefix(&groups, &root);
+                (root, prefix)
+            })
+            .collect()
+    }
+
+    /// The focused group's repository, for the footer's branch picker and sync.
+    fn footer_repo(&self) -> Option<Git> {
+        let key = &self.region().group.key;
+        self.repos.iter().find(|git| git.root() == key).cloned()
     }
 
     /// The focused group's repository status, for the git footer.
@@ -2480,7 +2498,7 @@ impl App {
     }
 
     fn open_branch_picker(&mut self) {
-        let Some(git) = self.repos.first().cloned() else {
+        let Some(git) = self.footer_repo() else {
             return;
         };
         match BranchPicker::open(git) {
@@ -2537,7 +2555,7 @@ impl App {
             self.notice = Some("no upstream to sync with".into());
             return;
         }
-        let Some(git) = self.repos.first().cloned() else {
+        let Some(git) = self.footer_repo() else {
             return;
         };
         let (tx, rx) = std::sync::mpsc::channel();
@@ -2610,7 +2628,7 @@ impl App {
         match result {
             Some(Ok(index)) => {
                 self.quick_index_rx = None;
-                if index.root != self.region().root()
+                if index.roots != self.all_roots()
                     || index.show_hidden != self.region().show_hidden()
                 {
                     if let Some(Overlay::QuickOpen { loading, .. }) = self.overlay.as_mut() {
@@ -2651,24 +2669,24 @@ impl App {
     }
 
     pub fn open_quick_open(&mut self) {
-        let root = self.region().root();
+        let roots = self.all_roots();
         let show_hidden = self.region().show_hidden();
         let cached = self
             .quick_index
             .as_ref()
-            .filter(|index| index.root == root && index.show_hidden == show_hidden)
+            .filter(|index| index.roots == roots && index.show_hidden == show_hidden)
             .map(|index| (std::sync::Arc::clone(&index.files), index.truncated));
         let (files, truncated, loading) = if let Some((files, truncated)) = cached {
             (files, truncated, false)
         } else {
             if self.quick_index_rx.is_none() {
                 let (tx, rx) = std::sync::mpsc::channel();
-                let worker_root = root.clone();
+                let labelled = self.labelled_roots();
                 std::thread::spawn(move || {
                     let (files, truncated) =
-                        collect_quick_files(&worker_root, show_hidden, QUICK_OPEN_FILE_LIMIT);
+                        collect_quick_files_in(&labelled, show_hidden, QUICK_OPEN_FILE_LIMIT);
                     let _ = tx.send(QuickIndex {
-                        root: worker_root,
+                        roots,
                         show_hidden,
                         files: std::sync::Arc::new(files),
                         truncated,
@@ -2950,12 +2968,13 @@ impl App {
         self.search_scroll = 0;
         self.search_snap = true;
         let options = *options;
-        let root = self.region().root();
+        let roots = self.all_roots();
+        let labelled = self.labelled_roots();
         let show_hidden = self.region().show_hidden();
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let result = collect_content_hits(
-                &root,
+            let result = collect_content_hits_in(
+                &labelled,
                 show_hidden,
                 &query,
                 &include,
@@ -2968,7 +2987,7 @@ impl App {
                 Err(error) => (Vec::new(), false, Some(error)),
             };
             let _ = tx.send(ContentSearchResult {
-                root,
+                roots,
                 show_hidden,
                 query,
                 include,
@@ -2990,7 +3009,7 @@ impl App {
         match result {
             Some(Ok(result)) => {
                 self.content_search_rx = None;
-                if result.root != self.region().root()
+                if result.roots != self.all_roots()
                     || result.show_hidden != self.region().show_hidden()
                 {
                     return;
@@ -4977,6 +4996,80 @@ fn collect_quick_files(root: &Path, show_hidden: bool, limit: usize) -> (Vec<Qui
     (files, truncated)
 }
 
+/// Label prefix for a hit/file under `root`: "" with one group, else "<group name>/".
+fn stack_label_prefix(groups: &[stack::Group], root: &Path) -> String {
+    if groups.len() <= 1 {
+        return String::new();
+    }
+    groups
+        .iter()
+        .find(|group| group.roots.iter().any(|r| r == root))
+        .map(|group| format!("{}/", group.name()))
+        .unwrap_or_default()
+}
+
+fn prefix_label(prefix: &str, label: &mut String) {
+    if !prefix.is_empty() {
+        label.insert_str(0, prefix);
+    }
+}
+
+/// Walk every root in order on the worker; the shared `limit` is what is left after
+/// earlier roots; `truncated` if any root truncated or the limit ran out.
+fn collect_quick_files_in(
+    roots: &[(PathBuf, String)],
+    show_hidden: bool,
+    limit: usize,
+) -> (Vec<QuickFile>, bool) {
+    let mut all = Vec::new();
+    let mut truncated = false;
+    for (root, prefix) in roots {
+        let left = limit - all.len();
+        if left == 0 {
+            truncated = true;
+            break;
+        }
+        let (files, cut) = collect_quick_files(root, show_hidden, left);
+        truncated |= cut;
+        all.extend(files.into_iter().map(|mut file| {
+            prefix_label(prefix, &mut file.label);
+            file.label_lower = file.label.to_lowercase();
+            file
+        }));
+    }
+    (all, truncated)
+}
+
+/// Content search over every root in order, sharing one match `limit`. Include and
+/// exclude globs match each root's own relative paths; labels get the group prefix.
+fn collect_content_hits_in(
+    roots: &[(PathBuf, String)],
+    show_hidden: bool,
+    query: &str,
+    include: &str,
+    exclude: &str,
+    options: SearchOptions,
+    limit: usize,
+) -> Result<(Vec<ContentHit>, bool), String> {
+    let mut all = Vec::new();
+    let mut truncated = false;
+    for (root, prefix) in roots {
+        let left = limit - all.len();
+        if left == 0 {
+            truncated = true;
+            break;
+        }
+        let (hits, cut) =
+            collect_content_hits(root, show_hidden, query, include, exclude, options, left)?;
+        truncated |= cut;
+        all.extend(hits.into_iter().map(|mut hit| {
+            prefix_label(prefix, &mut hit.label);
+            hit
+        }));
+    }
+    Ok((all, truncated))
+}
+
 fn collect_content_hits(
     root: &Path,
     show_hidden: bool,
@@ -5547,6 +5640,77 @@ mod tests {
     use herdr_sidebar::viewnav::ViewHistory;
     use std::cell::RefCell;
     use std::rc::Rc;
+
+    #[test]
+    fn labels_are_prefixed_only_with_several_groups() {
+        let one = vec![stack::Group {
+            key: "/a".into(),
+            repo: false,
+            roots: vec!["/a".into()],
+        }];
+        assert_eq!(stack_label_prefix(&one, Path::new("/a")), "");
+        let two = vec![
+            one[0].clone(),
+            stack::Group {
+                key: "/w/mono".into(),
+                repo: true,
+                roots: vec!["/w/mono/apps".into()],
+            },
+        ];
+        assert_eq!(stack_label_prefix(&two, Path::new("/w/mono/apps")), "mono/");
+    }
+
+    #[test]
+    fn quick_index_spans_every_root_under_one_cap() {
+        let a = scratch_dir("qi-a");
+        let b = scratch_dir("qi-b");
+        for (d, n) in [(&a, "one.rs"), (&b, "two.rs")] {
+            std::fs::write(d.join(n), "").unwrap();
+        }
+        let (files, truncated) = collect_quick_files_in(
+            &[(a.clone(), "a/".into()), (b.clone(), "b/".into())],
+            false,
+            10,
+        );
+        assert_eq!(
+            files.iter().map(|f| f.label.as_str()).collect::<Vec<_>>(),
+            vec!["a/one.rs", "b/two.rs"]
+        );
+        assert!(!truncated);
+        let (files, truncated) = collect_quick_files_in(
+            &[(a.clone(), "a/".into()), (b.clone(), "b/".into())],
+            false,
+            1,
+        );
+        assert_eq!(files.len(), 1);
+        assert!(truncated);
+        let _ = std::fs::remove_dir_all(a);
+        let _ = std::fs::remove_dir_all(b);
+    }
+
+    #[test]
+    fn content_search_merges_hits_from_every_root() {
+        let a = scratch_dir("cs-a");
+        let b = scratch_dir("cs-b");
+        std::fs::write(a.join("x.txt"), "needle\n").unwrap();
+        std::fs::write(b.join("y.txt"), "needle\n").unwrap();
+        let (hits, _) = collect_content_hits_in(
+            &[(a.clone(), "a/".into()), (b.clone(), "b/".into())],
+            false,
+            "needle",
+            "",
+            "",
+            SearchOptions::default(),
+            100,
+        )
+        .unwrap();
+        assert_eq!(
+            hits.iter().map(|h| h.label.as_str()).collect::<Vec<_>>(),
+            vec!["a/x.txt", "b/y.txt"]
+        );
+        let _ = std::fs::remove_dir_all(a);
+        let _ = std::fs::remove_dir_all(b);
+    }
 
     /// Serializes tests that edit process env (state dir, icon theme).
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());

@@ -77,7 +77,7 @@ pub struct CwdFollower {
 }
 
 impl CwdFollower {
-    /// Start following afresh after the persisted setting is enabled.
+    /// Start following afresh: forget the chosen pane and the observed baseline.
     pub fn reset(&mut self) {
         *self = Self::default();
     }

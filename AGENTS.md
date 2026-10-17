@@ -855,6 +855,30 @@ HACKING.md — budget time for that before promising a patched build.
   button. The active view's selection chip always wins over hover.
   Hit zones come from each rendered glyph's actual width, so emoji and Nerd Font themes stay aligned.
 
+### Stacked pane trees (`src/stack.rs`, `src/explorer_app.rs` regions)
+
+- The Explorer is a stack of regions, one per group of roots taken from the tab's eligible
+  panes (`stack::stack_roots`), sampled on the 5s heartbeat AFTER the identity stamp.
+  `None` (snapshot unreadable / our pane missing) keeps the current stack; `Some(empty)`
+  falls back to the spawn cwd. Never fall back to a pane's stale `cwd`.
+- Roots fold (a nested dir collapses into the outer tree) and group by `Git::owner_of`,
+  with the owner cached per root. Group order is first appearance, then path.
+- `stack::allocate` splits rows with a 3-row body minimum and auto-folds from the bottom;
+  headers always stay visible. Dragged heights reset when the group set changes and are
+  not persisted.
+- Root rows of multi-root groups are synthetic: never offer Rename/Delete on them.
+- The ⎇ chip is per repo group and shown only when unified. Entering a repo's git view
+  writes `active_repo`; the in-process `viewnav::ViewHistory` layers over tab history
+  (back/forward step the view first, then fall through to `tabnav`).
+- Source Control cwd-follow is off when unified (the stack already follows the panes).
+- Preview-tab sidebars sample the ORIGIN tab via `hs-preview-origin-tab`, not their own.
+- Quick Open and content search walk every root in stack order under ONE shared cap;
+  labels carry a `<group name>/` prefix only with several groups, and include/exclude
+  globs still match each root's own relative paths. The git footer, its branch picker and
+  sync act on the FOCUSED region's repo (`repo_status[group.key]`), never `repos.first()`.
+- Tests that construct an `App` must run inside `with_scratch_state` (scratch state dir,
+  no `HERDR_PANE_ID`, dead `HERDR_SOCKET_PATH`) so they never touch a live session.
+
 ### Explorer git decorations & staging (`src/gitdeco.rs`, issues #19/#20)
 
 - The Explorer decorates rows from `Git::discover_all` (the SAME repo set the SCM view

@@ -143,11 +143,71 @@ pub fn drag(alloc: &mut Allocation, boundary: usize, delta: i32) {
     alloc.heights[b] = (i32::from(alloc.heights[b]) - moved) as u16;
 }
 
+/// The tab whose panes feed the stack: the origin tab recorded on a preview viewer in
+/// our tab when that tab still exists, else our own tab. None if our pane is not listed.
+pub fn stack_tab(pane_list_json: &str, my_pane_id: &str) -> Option<String> {
+    let mine = crate::launch::tab_of(pane_list_json, my_pane_id);
+    if mine.is_empty() {
+        return None;
+    }
+    let live = crate::launch::live_tabs(pane_list_json);
+    let v: serde_json::Value = serde_json::from_str(pane_list_json.trim_start_matches('\u{feff}')).ok()?;
+    let origin = v["result"]["panes"].as_array()?.iter().find_map(|p| {
+        let o = p["tokens"][crate::viewer::TOKEN_ORIGIN_TAB].as_str()?;
+        (p["tab_id"].as_str() == Some(&mine) && live.contains(o)).then(|| o.to_string())
+    });
+    Some(origin.unwrap_or(mine))
+}
+
+/// Folded roots of the eligible panes in `stack_tab`. None when the snapshot cannot be
+/// read or does not list our pane; Some(empty) when the tab has no eligible pane.
+pub fn stack_roots(pane_list_json: &str, my_pane_id: &str) -> Option<Vec<PathBuf>> {
+    let tab = stack_tab(pane_list_json, my_pane_id)?;
+    let cwds: Vec<PathBuf> = crate::launch::sibling_cwds_in_tab(pane_list_json, &tab)
+        .into_iter()
+        .map(|s| PathBuf::from(s.cwd))
+        .collect();
+    Some(fold_roots(&cwds))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::path::{Path, PathBuf};
     fn p(s: &str) -> PathBuf { PathBuf::from(s) }
+    fn panes(list: &[(&str, &str, Option<&str>, &str, &[(&str, &str)])]) -> String {
+        let panes: Vec<_> = list.iter().map(|(id, tab, cwd, label, toks)| {
+            let tokens: serde_json::Map<_, _> = toks.iter().map(|(k, v)| (k.to_string(), serde_json::json!(v))).collect();
+            serde_json::json!({"pane_id": id, "tab_id": tab, "foreground_cwd": cwd, "focused": false, "label": label, "tokens": tokens})
+        }).collect();
+        serde_json::json!({"result": {"panes": panes}}).to_string()
+    }
+    #[test] fn stack_roots_folds_the_tabs_live_cwds() {
+        let json = panes(&[("s","t1",None,"Sidebar",&[("herdr-sidebar-explorer","1")]),
+                           ("a","t1",Some("/w/proj"),"",&[]), ("b","t1",Some("/w/proj/src"),"",&[]),
+                           ("c","t2",Some("/elsewhere"),"",&[])]);
+        assert_eq!(stack_roots(&json, "s"), Some(vec![p("/w/proj")]));
+    }
+    #[test] fn stack_roots_is_none_when_our_pane_is_missing() {
+        assert_eq!(stack_roots("{\"result\":{\"panes\":[]}}", "s"), None);
+        assert_eq!(stack_roots("not json", "s"), None);
+    }
+    #[test] fn stack_roots_is_empty_for_a_tab_with_only_plugin_panes() {
+        let json = panes(&[("s","t1",None,"Sidebar",&[("herdr-sidebar-explorer","1")])]);
+        assert_eq!(stack_roots(&json, "s"), Some(vec![]));
+    }
+    #[test] fn preview_tab_samples_its_origin_tab() {
+        let json = panes(&[("s","t9",None,"Sidebar",&[("herdr-sidebar-explorer","1")]),
+                           ("v","t9",None,"a.rs · preview",&[("herdr-sidebar-preview","1"),("hs-preview-origin-tab","t1")]),
+                           ("a","t1",Some("/w/proj"),"",&[])]);
+        assert_eq!(stack_tab(&json, "s"), Some("t1".into()));
+        assert_eq!(stack_roots(&json, "s"), Some(vec![p("/w/proj")]));
+    }
+    #[test] fn preview_tab_with_dead_origin_samples_itself() {
+        let json = panes(&[("s","t9",None,"Sidebar",&[("herdr-sidebar-explorer","1")]),
+                           ("v","t9",None,"a.rs · preview",&[("herdr-sidebar-preview","1"),("hs-preview-origin-tab","gone")])]);
+        assert_eq!(stack_tab(&json, "s"), Some("t9".into()));
+    }
     #[test] fn fold_roots_collapses_duplicates_and_nested_dirs() {
         let out = fold_roots(&[p("/w/proj/src"), p("/w/proj"), p("/w/proj"), p("/notes")]);
         assert_eq!(out, vec![p("/notes"), p("/w/proj")]);

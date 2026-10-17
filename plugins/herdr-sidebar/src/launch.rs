@@ -61,10 +61,10 @@ struct Pane {
 
 /// A non-sidebar pane in the same tab whose live cwd can be followed.
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct SiblingCwd {
-    pane_id: String,
-    cwd: String,
-    focused: bool,
+pub(crate) struct SiblingCwd {
+    pub pane_id: String,
+    pub cwd: String,
+    pub focused: bool,
 }
 
 /// Process-local state shared by the Explorer and Source Control views.
@@ -415,21 +415,25 @@ pub(crate) fn is_preview_label(label: &str) -> bool {
 /// `foreground_cwd` is deliberately required: falling back to `cwd` would
 /// resurrect a stale spawn directory when the host has no live cwd signal.
 fn sibling_cwds(pane_list_json: &str, my_pane_id: &str) -> Vec<SiblingCwd> {
+    let tab = tab_of(pane_list_json, my_pane_id);
+    if tab.is_empty() {
+        return Vec::new();
+    }
+    let mut siblings = sibling_cwds_in_tab(pane_list_json, &tab);
+    siblings.retain(|s| s.pane_id != my_pane_id);
+    siblings
+}
+
+/// Eligible panes in `tab_id` (the same filter as `sibling_cwds`, minus "not me").
+pub(crate) fn sibling_cwds_in_tab(pane_list_json: &str, tab_id: &str) -> Vec<SiblingCwd> {
     let Ok(msg) = serde_json::from_str::<PaneListMsg>(strip_bom(pane_list_json)) else {
         return Vec::new();
     };
     let panes = &msg.result.panes;
-    let Some(me) = panes
-        .iter()
-        .find(|p| p.pane_id.as_deref() == Some(my_pane_id))
-    else {
-        return Vec::new();
-    };
     let mut siblings = panes
         .iter()
         .filter(|p| {
-            p.tab_id.as_deref() == me.tab_id.as_deref()
-                && p.pane_id.as_deref() != Some(my_pane_id)
+            p.tab_id.as_deref() == Some(tab_id)
                 && !p.is_explorer()
                 && !p.tokens.contains_key(SC_METADATA_SOURCE)
                 && !p.tokens.contains_key(PREVIEW_METADATA_SOURCE)

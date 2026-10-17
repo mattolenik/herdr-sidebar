@@ -462,7 +462,7 @@ HACKING.md — budget time for that before promising a patched build.
 ### Following the neighbour pane's folder
 
 - The Explorer shows a stack of trees, one per directory a pane on the tab is in, grouped by
-  repository: see `plugins/herdr-sidebar/docs/superpowers/specs/2026-10-16-stacked-pane-trees-design.md`.
+  repository: see `docs/superpowers/specs/2026-10-16-stacked-pane-trees-design.md`.
 - Only `foreground_cwd` is live (a pane's `cwd` is its spawn directory); there is deliberately
   NO fallback to `cwd`. Source Control follows the focused pane only in separated mode.
 

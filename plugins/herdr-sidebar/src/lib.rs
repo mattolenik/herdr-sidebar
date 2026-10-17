@@ -28,4 +28,5 @@ pub mod tree;
 pub mod ui;
 pub mod updates;
 pub mod viewer;
+pub mod viewnav;
 pub mod wrap;

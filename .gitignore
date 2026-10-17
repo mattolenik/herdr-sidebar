@@ -5,3 +5,6 @@ target/
 /.codex/prompts/
 __pycache__/
 tools/screenshots/attach.log
+
+# brainstorming companion sessions
+.superpowers/

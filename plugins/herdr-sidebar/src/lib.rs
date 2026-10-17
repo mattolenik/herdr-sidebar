@@ -19,6 +19,7 @@ pub mod lsp;
 pub mod programs;
 pub mod rundir;
 pub mod snooze;
+pub mod stack;
 pub mod state;
 pub mod suggest;
 pub mod syntax;

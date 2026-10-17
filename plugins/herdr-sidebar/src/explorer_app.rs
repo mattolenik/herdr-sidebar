@@ -24,6 +24,7 @@ use herdr_sidebar::gitdeco::{Decorations, RepoStatus};
 use herdr_sidebar::icons::{IconTheme, icon};
 use herdr_sidebar::ipc;
 use herdr_sidebar::programs;
+use herdr_sidebar::stack;
 use herdr_sidebar::state::{self as sidebar, View};
 use herdr_sidebar::tree::{Row, Tree};
 use herdr_sidebar::ui::{
@@ -159,6 +160,173 @@ struct BodyGeom {
     height: u16,
     /// Scroll offset of the list at draw time.
     offset: usize,
+}
+
+/// One scroll region of the Explorer: a group of roots (one repository, or one
+/// non-repo directory) with its own rows, selection and scroll.
+struct Region {
+    group: stack::Group,
+    /// One per `group.roots`, same order.
+    trees: Vec<Tree>,
+    rows: Vec<Row>,
+    /// The user's explicit selection — `None` until they pick something
+    /// (no row is highlighted by default; hover stays subtle).
+    selected: Option<usize>,
+    /// View scroll offset in rows, independent of the selection: the wheel
+    /// moves this alone.
+    scroll: usize,
+    /// Bring the selection into view on the next draw (keyboard nav only).
+    snap: bool,
+    /// Row index under the mouse cursor, for the hover highlight.
+    hovered: Option<usize>,
+    body: BodyGeom,
+}
+
+impl Region {
+    /// Mirror the tree the user was already looking at: each root's saved
+    /// expansion, and the first saved selection that is still a visible row.
+    fn new(group: stack::Group, show_hidden: bool) -> Self {
+        let saved: Vec<sidebar::TreeState> = group
+            .roots
+            .iter()
+            .map(|root| sidebar::load_tree_state(root))
+            .collect();
+        let trees = group
+            .roots
+            .iter()
+            .zip(&saved)
+            .map(|(root, state)| {
+                let mut tree = Tree::new(root.clone());
+                tree.show_hidden = show_hidden;
+                tree.set_expanded(state.expanded.clone());
+                tree
+            })
+            .collect();
+        let mut region = Self {
+            group,
+            trees,
+            rows: Vec::new(),
+            selected: None,
+            scroll: 0,
+            snap: false,
+            hovered: None,
+            body: BodyGeom::default(),
+        };
+        region.rebuild();
+        region.selected = saved
+            .iter()
+            .filter_map(|state| state.selected.as_ref())
+            .find_map(|want| region.rows.iter().position(|r| &r.path == want));
+        region.snap = region.selected.is_some();
+        region
+    }
+
+    /// Recompute visible rows, keeping the selection on the same path when it
+    /// still exists (else the nearest valid index).
+    fn rebuild(&mut self) {
+        self.hovered = None;
+        // ponytail: single-root rows; Task 6 adds root rows for multi-root groups.
+        rebuild_tree_rows(
+            &mut self.trees[0],
+            &mut self.rows,
+            &mut self.selected,
+            &mut self.scroll,
+        );
+    }
+
+    /// Index of the tree whose root is the longest prefix of `path`.
+    fn tree_for(&self, path: &Path) -> Option<usize> {
+        self.group
+            .roots
+            .iter()
+            .enumerate()
+            .filter(|(_, root)| path.starts_with(root))
+            .max_by_key(|(_, root)| root.as_os_str().len())
+            .map(|(i, _)| i)
+    }
+
+    fn root_of(&self, path: &Path) -> Option<PathBuf> {
+        self.tree_for(path).map(|i| self.group.roots[i].clone())
+    }
+
+    /// The tree owning `path`, else the first one.
+    fn tree_mut(&mut self, path: &Path) -> &mut Tree {
+        let i = self.tree_for(path).unwrap_or(0);
+        &mut self.trees[i]
+    }
+
+    /// The region's first root: where root-relative actions land when no row
+    /// says otherwise.
+    fn root(&self) -> PathBuf {
+        self.group.roots[0].clone()
+    }
+
+    fn selected_row(&self) -> Option<&Row> {
+        self.rows.get(self.selected?)
+    }
+
+    /// Publish each root's tree shape, with the selection under the root
+    /// that owns it. Other same-root sidebars adopt it on their next tick.
+    fn persist(&self) {
+        let selected = self.selected_row().map(|r| r.path.clone());
+        let owner = selected.as_deref().and_then(|p| self.tree_for(p));
+        for (i, tree) in self.trees.iter().enumerate() {
+            sidebar::save_tree_state(
+                &tree.root_path(),
+                &sidebar::TreeState {
+                    expanded: tree.expanded_paths(),
+                    selected: if owner == Some(i) {
+                        selected.clone()
+                    } else {
+                        None
+                    },
+                },
+            );
+        }
+    }
+
+    /// Adopt another sidebar's expansion/selection for these roots.
+    fn sync_shared(&mut self) -> bool {
+        // ponytail: single-root sync; Task 6 extends it to every root's rows.
+        let shared = sidebar::load_tree_state(&self.trees[0].root_path());
+        let changed = apply_shared_tree_state(
+            &mut self.trees[0],
+            &mut self.rows,
+            &mut self.selected,
+            &mut self.scroll,
+            shared,
+        );
+        if changed {
+            self.hovered = None;
+            self.snap = self.selected.is_some();
+        }
+        changed
+    }
+
+    /// Apply queued filesystem events on every tree; true if any listing changed.
+    fn drain_events(&mut self) -> bool {
+        self.trees
+            .iter_mut()
+            .fold(false, |changed, tree| tree.drain_events() | changed)
+    }
+
+    fn refresh(&mut self) {
+        self.trees.iter_mut().for_each(Tree::refresh);
+    }
+
+    fn collapse_all(&mut self) {
+        self.trees.iter_mut().for_each(Tree::collapse_all);
+    }
+
+    fn show_hidden(&self) -> bool {
+        self.trees[0].show_hidden
+    }
+
+    fn set_show_hidden(&mut self, on: bool) {
+        for tree in &mut self.trees {
+            tree.show_hidden = on;
+        }
+    }
 }
 
 /// What a prompt's input will be used for on Enter.
@@ -307,16 +475,11 @@ enum Setting {
 type SettingRow = (Setting, &'static str, String, bool);
 
 pub struct App {
-    tree: Tree,
-    rows: Vec<Row>,
-    /// The user's explicit selection — `None` until they pick something
-    /// (no row is highlighted by default; hover stays subtle).
-    selected: Option<usize>,
-    /// View scroll offset in rows, independent of the selection: the wheel
-    /// moves this alone.
-    scroll: usize,
-    /// Bring the selection into view on the next draw (keyboard nav only).
-    snap: bool,
+    /// The tree regions; drawing currently renders only the focused one.
+    regions: Vec<Region>,
+    focused: usize,
+    /// The directory this sidebar was spawned in.
+    spawn_cwd: PathBuf,
     theme: IconTheme,
     pane_ctl: Option<PaneCtl>,
     /// Pane size from the last draw; sizing decisions and PageUp/PageDown
@@ -327,9 +490,6 @@ pub struct App {
     last_layout_width: Option<i64>,
     last_height: u16,
     page: usize,
-    /// Row index under the mouse cursor, for the hover highlight.
-    hovered: Option<usize>,
-    body: BodyGeom,
     overlay: Option<Overlay>,
     /// A search overlay parked under a modal (Settings / branch picker) opened
     /// from the Search view, restored with its query when the modal closes so
@@ -377,9 +537,9 @@ pub struct App {
     /// One background decoration refresh. Keeping at most one receiver avoids
     /// multiplying git processes when a slow repository overlaps the timer.
     deco_rx: Option<std::sync::mpsc::Receiver<DecorationRefresh>>,
-    /// Status for the containing repository, populated by the same bounded
-    /// background refresh that drives decorations.
-    git_footer_status: Option<Status>,
+    /// Status per repository root, populated by the same bounded background
+    /// refresh that drives decorations; the footer shows the focused group's.
+    repo_status: HashMap<PathBuf, Status>,
     git_footer_zones: FooterZones,
     git_syncing: Option<std::sync::mpsc::Receiver<Result<String, String>>>,
     /// lspmux preflight for the Settings row, run on a worker when the modal
@@ -441,18 +601,19 @@ struct SearchZones {
 
 impl App {
     pub fn new(
-        root: PathBuf,
+        spawn_cwd: PathBuf,
         history: std::rc::Rc<std::cell::RefCell<herdr_sidebar::viewnav::ViewHistory>>,
     ) -> Self {
-        let mut tree = Tree::new(root);
-        // Mirror the tree the user was already looking at. Idle ticks keep
-        // same-root sidebars synchronized after startup too.
-        let saved = sidebar::load_tree_state(&tree.root_path());
-        tree.set_expanded(saved.expanded);
-        let rows = tree.rows();
-        let restored_selection = saved
-            .selected
-            .and_then(|want| rows.iter().position(|r| r.path == want));
+        let owner = Git::owner_of(&spawn_cwd).ok();
+        let group = stack::Group {
+            key: owner
+                .as_ref()
+                .map_or_else(|| spawn_cwd.clone(), |git| git.root().to_path_buf()),
+            repo: owner.is_some(),
+            roots: vec![spawn_cwd.clone()],
+        };
+        // Tree::new has always shown hidden files by default.
+        let regions = vec![Region::new(group, true)];
         let theme = IconTheme::resolve(
             std::env::var("HERDR_SIDEBAR_ICONS")
                 .or_else(|_| std::env::var("HERDR_AA_FILETREE_ICONS"))
@@ -466,25 +627,16 @@ impl App {
         let other_exe = std::env::current_exe().ok();
         let sidebar_state = sidebar::load_state();
         set_color_theme(sidebar_state.color_theme);
-        let repos = if sidebar_state.git_deco || sidebar_state.show_git_footer {
-            Git::discover_all(&tree.root_path())
-        } else {
-            Vec::new()
-        };
         let mut app = Self {
-            tree,
-            rows,
-            selected: restored_selection,
-            scroll: 0,
-            snap: restored_selection.is_some(),
+            regions,
+            focused: 0,
+            spawn_cwd,
             theme,
             pane_ctl,
             last_width: sidebar_state.sidebar_width,
             last_layout_width,
             last_height: 24,
             page: 20,
-            hovered: None,
-            body: BodyGeom::default(),
             overlay: None,
             suspended_search: None,
             notice: None,
@@ -500,13 +652,13 @@ impl App {
             last_preview: None,
             last_beat: std::time::Instant::now(),
             history,
-            repos,
+            repos: Vec::new(),
             deco: Decorations::empty(),
             // Overwritten when the first background refresh is queued below.
             last_deco: std::time::Instant::now(),
             last_tree_sync: std::time::Instant::now(),
             deco_rx: None,
-            git_footer_status: None,
+            repo_status: HashMap::new(),
             git_footer_zones: FooterZones::default(),
             git_syncing: None,
             lsp_status: None,
@@ -522,18 +674,55 @@ impl App {
             search_snap: false,
             pending_unified_width: None,
         };
+        app.rediscover_repos();
         app.apply_identity();
         app.request_decorations(true);
         app
+    }
+
+    fn region(&self) -> &Region {
+        &self.regions[self.focused]
+    }
+
+    fn region_mut(&mut self) -> &mut Region {
+        &mut self.regions[self.focused]
+    }
+
+    fn all_roots(&self) -> Vec<PathBuf> {
+        self.regions
+            .iter()
+            .flat_map(|region| region.group.roots.iter().cloned())
+            .collect()
+    }
+
+    /// The root owning `path` across all regions, else the spawn directory.
+    fn root_of(&self, path: &Path) -> PathBuf {
+        self.regions
+            .iter()
+            .filter_map(|region| region.root_of(path))
+            .max_by_key(|root| root.as_os_str().len())
+            .unwrap_or_else(|| self.spawn_cwd.clone())
+    }
+
+    /// The focused group's repository status, for the git footer.
+    fn footer_status(&self) -> Option<&Status> {
+        self.repo_status.get(&self.region().group.key)
     }
 
     /// Idle work: keep the git decorations current so changes made outside
     /// the sidebar (an agent editing files, a commit in another pane) show up
     /// on their own. Self-throttling, so the event loop may call it freely.
     pub fn tick(&mut self) {
-        if self.tree.drain_events() {
+        let mut drained = false;
+        for region in &mut self.regions {
+            if region.drain_events() {
+                region.rebuild();
+                region.persist();
+                drained = true;
+            }
+        }
+        if drained {
             self.invalidate_quick_index();
-            self.rebuild();
         }
         self.sync_shared_settings();
         self.sync_shared_tree();
@@ -592,16 +781,8 @@ impl App {
             return;
         }
         self.last_tree_sync = std::time::Instant::now();
-        let shared = sidebar::load_tree_state(&self.tree.root_path());
-        if apply_shared_tree_state(
-            &mut self.tree,
-            &mut self.rows,
-            &mut self.selected,
-            &mut self.scroll,
-            shared,
-        ) {
-            self.hovered = None;
-            self.snap = self.selected.is_some();
+        for region in &mut self.regions {
+            region.sync_shared();
         }
     }
 
@@ -633,7 +814,7 @@ impl App {
         if !self.sidebar_state.git_deco && !self.sidebar_state.show_git_footer {
             self.deco = Decorations::empty();
             self.deco_rx = None;
-            self.git_footer_status = None;
+            self.repo_status.clear();
             self.ignored_cache.clear();
             self.deco_backoff_until.clear();
             return;
@@ -680,9 +861,11 @@ impl App {
         let Some(rx) = &self.deco_rx else { return };
         match rx.try_recv() {
             Ok(refresh) => {
-                self.git_footer_status = refresh.repos.first().map(|repo| repo.status.clone());
+                self.repo_status.clear();
                 let mut statuses = Vec::with_capacity(refresh.repos.len());
                 for repo in refresh.repos {
+                    self.repo_status
+                        .insert(repo.root.clone(), repo.status.clone());
                     if let Some(ignored) = &repo.ignored {
                         self.ignored_cache
                             .insert(repo.root.clone(), ignored.clone());
@@ -729,15 +912,21 @@ impl App {
             .is_some_and(|json| pane_focused_in(&json, pane_id))
     }
 
-    /// Rediscover the repositories under the current root — after a re-root,
-    /// or an explicit refresh that may have added or removed one.
+    /// Rediscover the repositories under every root — at startup, or after an
+    /// explicit refresh that may have added or removed one.
     fn rediscover_repos(&mut self) {
         self.deco_rx = None;
-        self.repos = if self.sidebar_state.git_deco || self.sidebar_state.show_git_footer {
-            Git::discover_all(&self.tree.root_path())
-        } else {
-            Vec::new()
-        };
+        let mut repos: Vec<Git> = Vec::new();
+        if self.sidebar_state.git_deco || self.sidebar_state.show_git_footer {
+            for root in self.all_roots() {
+                for git in Git::discover_all(&root) {
+                    if !repos.iter().any(|r| r.root() == git.root()) {
+                        repos.push(git);
+                    }
+                }
+            }
+        }
+        self.repos = repos;
     }
 
     /// The decoration letter for a row, if any (see [`Decorations::letter`]).
@@ -840,7 +1029,7 @@ impl App {
                     path,
                     &server.roots,
                     || Git::owner_of(path).ok().map(|git| git.root().to_path_buf()),
-                    &self.tree.root_path(),
+                    &self.root_of(path),
                 ),
                 command: server.command,
             }
@@ -854,12 +1043,8 @@ impl App {
             lsp.as_ref(),
         );
         let doc_key = herdr_sidebar::viewer::doc_key_for_file(path);
-        match herdr_sidebar::viewer::open_in_pane(
-            &pane_id,
-            &self.tree.root_path(),
-            &doc_key,
-            &payload,
-        ) {
+        match herdr_sidebar::viewer::open_in_pane(&pane_id, &self.root_of(path), &doc_key, &payload)
+        {
             // Remember where it landed: a double click pins THIS tab rather
             // than re-opening, which would race the viewer's first stamp.
             Ok(target) => self.last_preview = Some((doc_key, target)),
@@ -986,13 +1171,8 @@ impl App {
         );
         let other = MY_VIEW.other();
         #[cfg(unix)]
-        let _ = herdr_sidebar::ipc::open_plugin_pane(
-            &ctl.pane_id,
-            other,
-            &self.tree.root_path(),
-            false,
-            None,
-        );
+        let _ =
+            herdr_sidebar::ipc::open_plugin_pane(&ctl.pane_id, other, &self.spawn_cwd, false, None);
         #[cfg(windows)]
         {
             let response = herdr_sidebar::ipc::call_text(
@@ -1002,7 +1182,7 @@ impl App {
                     "direction": "right",
                     "ratio": 0.5,
                     "focus": false,
-                    "cwd": self.tree.root_path().display().to_string(),
+                    "cwd": self.spawn_cwd.display().to_string(),
                     "env": sidebar::spawn_env(),
                 }),
             );
@@ -1141,7 +1321,9 @@ impl App {
             KeyCode::PageUp => self.move_by(-(self.page as isize)),
             KeyCode::PageDown => self.move_by(self.page as isize),
             KeyCode::Home | KeyCode::Char('g') => self.select(0),
-            KeyCode::End | KeyCode::Char('G') => self.select(self.rows.len().saturating_sub(1)),
+            KeyCode::End | KeyCode::Char('G') => {
+                self.select(self.region().rows.len().saturating_sub(1))
+            }
             KeyCode::Right | KeyCode::Char('l') => self.expand_or_enter(),
             KeyCode::Left | KeyCode::Char('h') => self.collapse_or_parent(),
             KeyCode::Enter | KeyCode::Char(' ') => self.toggle(),
@@ -1149,9 +1331,13 @@ impl App {
                 self.refresh_tree();
             }
             KeyCode::Char('.') => {
-                self.tree.show_hidden = !self.tree.show_hidden;
+                let on = !self.region().show_hidden();
+                for region in &mut self.regions {
+                    region.set_show_hidden(on);
+                    region.rebuild();
+                    region.persist();
+                }
                 self.invalidate_quick_index();
-                self.rebuild();
             }
             KeyCode::Char('i') => self.set_theme(self.theme.toggled()),
             KeyCode::Char('b') => self.hide(),
@@ -1231,7 +1417,7 @@ impl App {
         }
         match mouse.kind {
             MouseEventKind::Moved => {
-                self.hovered = self.row_at(mouse.row);
+                self.region_mut().hovered = self.row_at(mouse.row);
             }
             MouseEventKind::ScrollUp => self.scroll_view(-3),
             MouseEventKind::ScrollDown => self.scroll_view(3),
@@ -1254,7 +1440,7 @@ impl App {
                     return None;
                 };
                 self.select(index);
-                let row = &self.rows[index];
+                let row = &self.region().rows[index];
                 let (is_dir, path) = (row.is_dir, row.path.clone());
                 let on_chevron = is_dir && hits_chevron(mouse.column, row.depth);
                 // Double click = second click on the same row inside the window.
@@ -1317,8 +1503,8 @@ impl App {
             TitleAction::NewFolder => self.open_create_prompt(true),
             TitleAction::Refresh => self.refresh_tree(),
             TitleAction::CollapseAll => {
-                self.tree.collapse_all();
-                self.scroll = 0;
+                self.region_mut().collapse_all();
+                self.region_mut().scroll = 0;
                 self.rebuild();
             }
             TitleAction::ViewAsTree | TitleAction::ViewAsList => {}
@@ -1328,7 +1514,10 @@ impl App {
     /// The title-bar New File / New Folder buttons: prompt for a name,
     /// creating in the VS Code target (see [`create_target_dir`]).
     fn open_create_prompt(&mut self, folder: bool) {
-        let dir = create_target_dir(self.selected_row(), self.tree.root_path());
+        let root = self
+            .selected_row()
+            .map_or_else(|| self.region().root(), |row| self.root_of(&row.path));
+        let dir = create_target_dir(self.selected_row(), root);
         self.overlay = Some(Overlay::Prompt {
             title: if folder { "New folder" } else { "New file" }.into(),
             input: String::new(),
@@ -1345,7 +1534,7 @@ impl App {
     fn open_context_menu(&mut self, x: u16, y: u16) {
         let target = self.row_at(y).map(|index| {
             self.select(index);
-            let row = &self.rows[index];
+            let row = &self.region().rows[index];
             (row.path.clone(), row.is_dir)
         });
         self.show_menu(x, y, target);
@@ -1366,17 +1555,18 @@ impl App {
     /// Where a keyboard-opened popup anchors: just under the selected row when
     /// it is on screen, else the top of the body.
     fn selection_anchor(&self) -> (u16, u16) {
-        let Some(index) = self.selected else {
-            return (0, self.body.top);
+        let region = self.region();
+        let body = region.body;
+        let Some(index) = region.selected else {
+            return (0, body.top);
         };
-        let visible =
-            index >= self.body.offset && index < self.body.offset + usize::from(self.body.height);
+        let visible = index >= body.offset && index < body.offset + usize::from(body.height);
         let y = if visible {
-            self.body.top + (index - self.body.offset) as u16
+            body.top + (index - body.offset) as u16
         } else {
-            self.body.top
+            body.top
         };
-        let depth = self.rows.get(index).map(|r| r.depth).unwrap_or(0);
+        let depth = region.rows.get(index).map(|r| r.depth).unwrap_or(0);
         let x = ((depth * 2) as u16).min(self.last_width.saturating_sub(1));
         (x, y)
     }
@@ -1948,7 +2138,7 @@ impl App {
         if self.git_syncing.is_some() {
             return;
         }
-        let Some(status) = &self.git_footer_status else {
+        let Some(status) = self.footer_status() else {
             return;
         };
         if !status.has_upstream {
@@ -2002,7 +2192,7 @@ impl App {
     fn open_settings(&mut self) {
         herdr_sidebar::updates::check();
         // The rule count row reads the loaded rules; make them current.
-        self.reload_rules();
+        self.reload_rules(&self.region().root());
         // `lspmux status` is a subprocess: never on the TUI thread.
         if self.lsp_check.is_none() {
             let (tx, rx) = std::sync::mpsc::channel();
@@ -2028,7 +2218,8 @@ impl App {
         match result {
             Some(Ok(index)) => {
                 self.quick_index_rx = None;
-                if index.root != self.tree.root_path() || index.show_hidden != self.tree.show_hidden
+                if index.root != self.region().root()
+                    || index.show_hidden != self.region().show_hidden()
                 {
                     if let Some(Overlay::QuickOpen { loading, .. }) = self.overlay.as_mut() {
                         *loading = false;
@@ -2068,8 +2259,8 @@ impl App {
     }
 
     pub fn open_quick_open(&mut self) {
-        let root = self.tree.root_path();
-        let show_hidden = self.tree.show_hidden;
+        let root = self.region().root();
+        let show_hidden = self.region().show_hidden();
         let cached = self
             .quick_index
             .as_ref()
@@ -2367,8 +2558,8 @@ impl App {
         self.search_scroll = 0;
         self.search_snap = true;
         let options = *options;
-        let root = self.tree.root_path();
-        let show_hidden = self.tree.show_hidden;
+        let root = self.region().root();
+        let show_hidden = self.region().show_hidden();
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let result = collect_content_hits(
@@ -2407,8 +2598,8 @@ impl App {
         match result {
             Some(Ok(result)) => {
                 self.content_search_rx = None;
-                if result.root != self.tree.root_path()
-                    || result.show_hidden != self.tree.show_hidden
+                if result.root != self.region().root()
+                    || result.show_hidden != self.region().show_hidden()
                 {
                     return;
                 }
@@ -2469,7 +2660,7 @@ impl App {
         self.notice = Some(
             match actions::open_in_editor_tab_with(
                 &pane_id,
-                &self.tree.root_path(),
+                &self.root_of(path),
                 path,
                 command,
                 line,
@@ -2485,8 +2676,8 @@ impl App {
     /// problems and a rule with nothing installed become notices; neither
     /// applies the rule.
     fn resolve_rule(&mut self, path: &Path, kind: programs::Kind) -> Option<programs::Resolved> {
-        let root = self.tree.root_path();
-        self.reload_rules();
+        let root = self.root_of(path);
+        self.reload_rules(&root);
         if let Some(error) = self.programs.first_error() {
             self.notice = Some(format!("preview programs: {error}"));
         }
@@ -2514,11 +2705,8 @@ impl App {
 
     /// The rule files are tiny: re-read them whenever rules are consulted so
     /// an edit to either file applies on the next click.
-    fn reload_rules(&mut self) {
-        self.programs = programs::load(
-            &self.tree.root_path(),
-            self.sidebar_state.project_preview_rules,
-        );
+    fn reload_rules(&mut self, root: &Path) {
+        self.programs = programs::load(root, self.sidebar_state.project_preview_rules);
     }
 
     /// What "Use editor on click" opens: the file's editor rule, else the
@@ -2632,7 +2820,7 @@ impl App {
             (
                 Setting::HiddenFiles,
                 "Hidden files",
-                if self.tree.show_hidden {
+                if self.region().show_hidden() {
                     "shown"
                 } else {
                     "hidden"
@@ -2779,7 +2967,7 @@ impl App {
                 self.sidebar_state = sidebar::update_state(|state| {
                     state.project_preview_rules = !state.project_preview_rules;
                 });
-                self.reload_rules();
+                self.reload_rules(&self.region().root());
             }
             Setting::CodeNavigation => {
                 self.notice = Some(match self.lsp_status {
@@ -2790,9 +2978,13 @@ impl App {
                 });
             }
             Setting::HiddenFiles => {
-                self.tree.show_hidden = !self.tree.show_hidden;
+                let on = !self.region().show_hidden();
+                for region in &mut self.regions {
+                    region.set_show_hidden(on);
+                    region.rebuild();
+                    region.persist();
+                }
                 self.invalidate_quick_index();
-                self.rebuild();
             }
             Setting::Hotkeys => {
                 self.sidebar_state =
@@ -2925,8 +3117,8 @@ impl App {
             Some((path, false)) => path
                 .parent()
                 .map(Path::to_path_buf)
-                .unwrap_or_else(|| self.tree.root_path()),
-            None => self.tree.root_path(),
+                .unwrap_or_else(|| self.root_of(path)),
+            None => self.region().root(),
         };
         match action {
             MenuAction::NewFile => {
@@ -2948,7 +3140,7 @@ impl App {
                 let text = if action == MenuAction::CopyPath {
                     path.display().to_string()
                 } else {
-                    path.strip_prefix(self.tree.root_path())
+                    path.strip_prefix(self.root_of(path))
                         .unwrap_or(path)
                         .display()
                         .to_string()
@@ -3000,7 +3192,7 @@ impl App {
                 self.stage(&path);
             }
             MenuAction::Reveal => {
-                let (path, directory) = target.unwrap_or_else(|| (self.tree.root_path(), true));
+                let (path, directory) = target.unwrap_or_else(|| (self.region().root(), true));
                 actions::reveal(&path, directory);
             }
         }
@@ -3031,10 +3223,10 @@ impl App {
         match result {
             Ok(created) => {
                 if let PromptKind::NewFile(dir) | PromptKind::NewFolder(dir) = &kind {
-                    self.tree.expand(dir);
+                    self.region_mut().tree_mut(dir).expand(dir);
                 }
                 self.refresh_tree();
-                if let Some(index) = self.rows.iter().position(|r| r.path == created) {
+                if let Some(index) = self.region().rows.iter().position(|r| r.path == created) {
                     self.select(index);
                 }
             }
@@ -3074,7 +3266,7 @@ impl App {
     }
 
     fn refresh_tree(&mut self) {
-        self.tree.refresh();
+        self.region_mut().refresh();
         self.invalidate_quick_index();
         self.rediscover_repos();
         self.request_decorations(true);
@@ -3083,24 +3275,25 @@ impl App {
 
     /// The visible row index at a pane-local mouse row, if it lands on one.
     fn row_at(&self, mouse_row: u16) -> Option<usize> {
-        row_index_at(self.body, self.rows.len(), mouse_row)
+        row_index_at(self.region().body, self.region().rows.len(), mouse_row)
     }
 
     fn selected_row(&self) -> Option<&Row> {
-        self.rows.get(self.selected?)
+        self.region().selected_row()
     }
 
     fn select(&mut self, index: usize) {
-        if !self.rows.is_empty() {
-            self.selected = Some(index.min(self.rows.len() - 1));
-            self.snap = true;
+        let region = self.region_mut();
+        if !region.rows.is_empty() {
+            region.selected = Some(index.min(region.rows.len() - 1));
+            region.snap = true;
             self.persist_tree();
         }
     }
 
     fn clear_selection(&mut self) {
-        if self.selected.take().is_some() {
-            self.hovered = None;
+        if self.region_mut().selected.take().is_some() {
+            self.region_mut().hovered = None;
             self.last_click = None;
             self.persist_tree();
         }
@@ -3109,32 +3302,28 @@ impl App {
     /// Publish this root's tree shape and selection. Other same-root sidebars
     /// adopt it during their next idle tick.
     fn persist_tree(&self) {
-        sidebar::save_tree_state(
-            &self.tree.root_path(),
-            &sidebar::TreeState {
-                expanded: self.tree.expanded_paths(),
-                selected: self.selected_row().map(|r| r.path.clone()),
-            },
-        );
+        self.region().persist();
     }
 
     fn move_by(&mut self, delta: isize) {
-        if self.rows.is_empty() {
+        if self.region().rows.is_empty() {
             return;
         }
         // First keyboard step on a selection-less list picks the first row.
-        let Some(current) = self.selected else {
+        let Some(current) = self.region().selected else {
             self.select(0);
             return;
         };
-        let next = (current as isize + delta).clamp(0, self.rows.len().saturating_sub(1) as isize);
+        let next = (current as isize + delta)
+            .clamp(0, self.region().rows.len().saturating_sub(1) as isize);
         self.select(next as usize);
     }
 
     /// Wheel: move the VIEW only — the selection stays where it is.
     fn scroll_view(&mut self, delta: isize) {
-        let max = self.rows.len().saturating_sub(1) as isize;
-        self.scroll = (self.scroll as isize + delta).clamp(0, max) as usize;
+        let region = self.region_mut();
+        let max = region.rows.len().saturating_sub(1) as isize;
+        region.scroll = (region.scroll as isize + delta).clamp(0, max) as usize;
     }
 
     /// Right/l: expand a collapsed directory, step into an expanded one.
@@ -3147,8 +3336,9 @@ impl App {
         }
         if row.expanded {
             // First child, if any, sits directly below at depth + 1.
-            let index = self.selected.unwrap_or(0);
+            let index = self.region().selected.unwrap_or(0);
             if self
+                .region()
                 .rows
                 .get(index + 1)
                 .is_some_and(|next| next.depth == row.depth + 1)
@@ -3157,7 +3347,7 @@ impl App {
             }
         } else {
             let path = row.path.clone();
-            self.tree.expand(&path);
+            self.region_mut().tree_mut(&path).expand(&path);
             self.rebuild();
         }
     }
@@ -3169,16 +3359,16 @@ impl App {
         };
         if row.is_dir && row.expanded {
             let path = row.path.clone();
-            self.tree.collapse(&path);
+            self.region_mut().tree_mut(&path).collapse(&path);
             self.rebuild();
             return;
         }
-        let index = self.selected.unwrap_or(0);
+        let index = self.region().selected.unwrap_or(0);
         let depth = row.depth;
         if depth == 0 {
             return;
         }
-        if let Some(parent) = self.rows[..index]
+        if let Some(parent) = self.region().rows[..index]
             .iter()
             .rposition(|r| r.depth == depth - 1)
         {
@@ -3196,20 +3386,14 @@ impl App {
             self.open_preview(&path);
             return;
         }
-        self.tree.toggle(&path);
+        self.region_mut().tree_mut(&path).toggle(&path);
         self.rebuild();
     }
 
     /// Recompute visible rows, keeping the selection on the same path when it
     /// still exists (else the nearest valid index).
     fn rebuild(&mut self) {
-        self.hovered = None;
-        rebuild_tree_rows(
-            &mut self.tree,
-            &mut self.rows,
-            &mut self.selected,
-            &mut self.scroll,
-        );
+        self.region_mut().rebuild();
         self.persist_tree();
     }
 
@@ -3252,7 +3436,7 @@ impl App {
                 Layout::horizontal([Constraint::Min(0), Constraint::Length(3)]).areas(footer);
             self.git_footer_zones = FooterZones::default();
             if self.sidebar_state.show_git_footer
-                && let Some(status) = &self.git_footer_status
+                && let Some(status) = self.footer_status()
             {
                 self.git_footer_zones = draw_git_footer(
                     frame,
@@ -3267,34 +3451,36 @@ impl App {
                 Paragraph::new("«".bold().fg(palette().header_accent)).alignment(Alignment::Center),
                 button,
             );
-            self.body = BodyGeom::default();
+            self.region_mut().body = BodyGeom::default();
             return;
         }
         self.draw_header(frame, header);
 
-        if self.rows.is_empty() {
+        if self.region().rows.is_empty() {
             frame.render_widget(Paragraph::new("  (empty)".dim().italic()), body);
         } else {
             let h = (body.height as usize).max(1);
-            self.scroll = self.scroll.min(self.rows.len().saturating_sub(h));
-            if self.snap {
-                if let Some(sel) = self.selected {
-                    if sel < self.scroll {
-                        self.scroll = sel;
-                    } else if sel >= self.scroll + h {
-                        self.scroll = sel + 1 - h;
+            let region = self.region_mut();
+            region.scroll = region.scroll.min(region.rows.len().saturating_sub(h));
+            if region.snap {
+                if let Some(sel) = region.selected {
+                    if sel < region.scroll {
+                        region.scroll = sel;
+                    } else if sel >= region.scroll + h {
+                        region.scroll = sel + 1 - h;
                     }
                 }
-                self.snap = false;
+                region.snap = false;
             }
             let theme = self.theme;
-            let hovered = self.hovered;
-            let selected = self.selected;
+            let hovered = self.region().hovered;
+            let selected = self.region().selected;
             let items: Vec<ListItem> = self
+                .region()
                 .rows
                 .iter()
                 .enumerate()
-                .skip(self.scroll)
+                .skip(self.region().scroll)
                 .take(h)
                 .map(|(i, r)| {
                     row_item(
@@ -3308,12 +3494,18 @@ impl App {
                 })
                 .collect();
             frame.render_widget(List::new(items), body);
-            draw_scrollbar(frame, body, self.rows.len(), h, self.scroll);
+            draw_scrollbar(
+                frame,
+                body,
+                self.region().rows.len(),
+                h,
+                self.region().scroll,
+            );
         }
-        self.body = BodyGeom {
+        self.region_mut().body = BodyGeom {
             top: body.y,
             height: body.height,
-            offset: self.scroll,
+            offset: self.region().scroll,
         };
 
         // Collapse button at the bottom-right of the LAST footer line,
@@ -3370,7 +3562,7 @@ impl App {
                 _ => Vec::new(),
             }
         };
-        let git_footer = self.sidebar_state.show_git_footer && self.git_footer_status.is_some();
+        let git_footer = self.sidebar_state.show_git_footer && self.footer_status().is_some();
         let menu_hint = git_footer && footer_lines.is_empty();
         let footer_empty = footer_lines.is_empty();
         let content_height = footer.height.saturating_sub(u16::from(git_footer));
@@ -3392,7 +3584,7 @@ impl App {
                 last_line.width.saturating_sub(3),
                 1,
             );
-            if let Some(status) = &self.git_footer_status {
+            if let Some(status) = self.footer_status() {
                 self.git_footer_zones = draw_git_footer(
                     frame,
                     status_area,
@@ -3459,7 +3651,7 @@ impl App {
         };
         // The name yields to the buttons and gear in narrow panes.
         let avail = usize::from(area.width.saturating_sub(gear_w + actions_w));
-        let root_label = truncate_to(format!(" {}", self.tree.root_name().to_uppercase()), avail);
+        let root_label = truncate_to(" EXPLORER".to_string(), avail);
         let name = Span::styled(
             root_label,
             Style::default().bold().fg(palette().header_accent),
@@ -3525,7 +3717,7 @@ impl App {
     /// (y/N)" mid-question); the name prompt stays one line (its input
     /// shrinks instead); hints wrap as before.
     fn footer_height(&self, width: u16) -> u16 {
-        let git_footer = self.sidebar_state.show_git_footer && self.git_footer_status.is_some();
+        let git_footer = self.sidebar_state.show_git_footer && self.footer_status().is_some();
         let content = if let Some((msg, _)) = self.footer_message() {
             wrap_footer_message(&msg, width, 4).len() as u16
         } else if matches!(self.overlay, Some(Overlay::Prompt { .. })) {
@@ -4850,6 +5042,51 @@ fn rebuild_tree_rows(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Serializes tests that edit process env (state dir, icon theme).
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// A fresh, empty directory unique to this test process and tag.
+    fn scratch_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "herdr-sidebar-{tag}-{}-{}",
+            std::process::id(),
+            sidebar::unix_now()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn single_root_region_rows_match_the_tree() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let state = scratch_dir("single-root-state");
+        // SAFETY: env edits are serialized by ENV_LOCK within this module.
+        unsafe {
+            std::env::set_var("HERDR_PLUGIN_STATE_DIR", &state);
+            std::env::set_var("HERDR_SIDEBAR_ICONS", "emoji");
+        }
+        let dir = scratch_dir("single-root");
+        std::fs::write(dir.join("a.txt"), "").unwrap();
+        let group = stack::Group {
+            key: dir.clone(),
+            repo: false,
+            roots: vec![dir.clone()],
+        };
+        let region = Region::new(group, false);
+        assert_eq!(
+            region
+                .rows
+                .iter()
+                .map(|r| r.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a.txt"]
+        );
+        assert_eq!(region.tree_for(&dir.join("a.txt")), Some(0));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&state);
+    }
 
     #[test]
     fn collapse_button_hit_region_is_header_right_edge() {

@@ -862,7 +862,8 @@ HACKING.md — budget time for that before promising a patched build.
   `None` (snapshot unreadable / our pane missing) keeps the current stack; `Some(empty)`
   falls back to the spawn cwd. Never fall back to a pane's stale `cwd`.
 - Roots fold (a nested dir collapses into the outer tree) and group by `Git::owner_of`,
-  with the owner cached per root. Group order is first appearance, then path.
+  with the owner cached per root. Groups already shown keep their order; new groups follow,
+  sorted by key path (`pane.list` order is never meaningful).
 - `stack::allocate` splits rows with a 3-row body minimum and auto-folds from the bottom;
   headers always stay visible. Dragged heights reset when the group set changes and are
   not persisted.

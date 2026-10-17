@@ -6,7 +6,7 @@
 //! - `merged`: the unified sidebar is on (survives restarts).
 //! - `active`: the view shown last, so a fresh sidebar opens where the user
 //!   left off.
-//! - `follow_cwd`: follow the live cwd of the neighbouring pane.
+//! - `active_repo`: the repository Source Control showed last.
 //! - `dock_right`: dock at the right edge instead of the default left edge.
 //! - `sidebar_width`: preferred sidebar width in terminal columns.
 //!
@@ -258,7 +258,7 @@ impl PreviewPlacement {
 }
 
 /// The sticky sidebar setting, shared by both plugins.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub struct State {
     pub merged: bool,
     pub active: View,
@@ -293,9 +293,9 @@ pub struct State {
     /// Focus the sidebar once the toggle opens it. Off docks it in the
     /// background: focus stays in the pane the toggle was invoked from.
     pub focus_on_open: bool,
-    /// Follow the live foreground cwd of a non-sidebar pane in this tab.
-    /// Manual folder choices win until an already-observed pane changes cwd.
-    pub follow_cwd: bool,
+    /// The repository Source Control showed last; a fresh unified sidebar
+    /// re-enters it only while that repository is still in the tab's stack.
+    pub active_repo: Option<PathBuf>,
     /// Decorate the Explorer tree with git status (issue #19). Off stops the
     /// background `git status` polling entirely — the escape hatch for a repo
     /// where status is slow.
@@ -335,7 +335,7 @@ impl Default for State {
             auto_open: true,
             strict_toggle: false,
             focus_on_open: true,
-            follow_cwd: true,
+            active_repo: None,
             git_deco: true,
             dock_right: false,
             sidebar_width: DEFAULT_SIDEBAR_WIDTH,
@@ -344,15 +344,6 @@ impl Default for State {
             scm_tree_view: false,
             project_preview_rules: false,
         }
-    }
-}
-
-pub fn follow_cwd_setting_value(enabled: bool) -> String {
-    let value = if enabled { "on" } else { "off" };
-    if cfg!(windows) {
-        format!("{value} (host n/a)")
-    } else {
-        value.to_string()
     }
 }
 
@@ -460,7 +451,7 @@ pub fn load_state() -> State {
     // One-time migration from the legacy config-dir file.
     if let Some(json) = legacy_state_path().and_then(|p| std::fs::read_to_string(p).ok()) {
         let state = parse_state(&json);
-        save_state(state);
+        save_state(state.clone());
         return state;
     }
     State::default()
@@ -475,7 +466,7 @@ pub fn save_state(state: State) {
     let Some(_lock) = StateWriteLock::acquire(&path) else {
         return;
     };
-    write_state(&path, state);
+    write_state(&path, &state);
 }
 
 /// Atomically-with-respect-to-other-sidebar-processes update one or more
@@ -498,17 +489,23 @@ pub fn update_state(update: impl FnOnce(&mut State)) -> State {
         state = parse_state(&json);
     }
     update(&mut state);
-    write_state(&path, state);
+    write_state(&path, &state);
     state
 }
 
-fn write_state(path: &Path, state: State) {
-    let icons = match state.icons {
+fn write_state(path: &Path, state: &State) {
+    let mut icons = match state.icons {
         Some(theme) => format!(",\"icons\":\"{}\"", theme.state_name()),
         None => String::new(),
     };
+    if let Some(repo) = &state.active_repo {
+        icons.push_str(&format!(
+            ",\"active_repo\":{}",
+            serde_json::json!(repo.display().to_string())
+        ));
+    }
     let json = format!(
-        "{{\"merged\":{},\"active\":\"{}\",\"search_active\":{},\"hotkeys\":{},\"git_footer\":{},\"font_prompt\":{},\"auto_open\":{},\"strict_toggle\":{},\"focus_on_open\":{},\"follow_cwd\":{},\"git_deco\":{},\"dock_right\":{},\"sidebar_width\":{},\"colors\":\"{}\",\"preview_placement\":\"{}\",\"custom_editor_on_click\":{},\"scm_tree_view\":{},\"project_preview_rules\":{}{icons}}}",
+        "{{\"merged\":{},\"active\":\"{}\",\"search_active\":{},\"hotkeys\":{},\"git_footer\":{},\"font_prompt\":{},\"auto_open\":{},\"strict_toggle\":{},\"focus_on_open\":{},\"git_deco\":{},\"dock_right\":{},\"sidebar_width\":{},\"colors\":\"{}\",\"preview_placement\":\"{}\",\"custom_editor_on_click\":{},\"scm_tree_view\":{},\"project_preview_rules\":{}{icons}}}",
         state.merged,
         state.active.state_name(),
         state.search_active,
@@ -518,7 +515,6 @@ fn write_state(path: &Path, state: State) {
         state.auto_open,
         state.strict_toggle,
         state.focus_on_open,
-        state.follow_cwd,
         state.git_deco,
         state.dock_right,
         clamp_sidebar_width(state.sidebar_width),
@@ -824,71 +820,6 @@ fn merge_scm_drafts(stored: &mut std::collections::BTreeMap<String, String>, sta
 // The root each space's tree is built from.
 // ---------------------------------------------------------------------------
 
-/// Remembered tree roots, keyed by workspace LABEL.
-///
-/// Not by workspace id: ids identify a space *instance*, not a project —
-/// closing and recreating `tremor` moved it from `wG` to `wH` within one
-/// session — so an id key would hand a new space a root chosen for an
-/// unrelated one. The label is intrinsic to the project and survives a server
-/// restart; renaming a space forgets its root, which is the accepted cost.
-type RootsFile = serde_json::Map<String, serde_json::Value>;
-
-fn roots_path() -> Option<PathBuf> {
-    Some(state_dir()?.join("roots.json"))
-}
-
-/// Forgiving decode: anything missing or garbled yields an empty map, so a
-/// hand-edited file forgets a choice rather than wedging the tree.
-fn decode_roots_file(json: &str) -> RootsFile {
-    serde_json::from_str::<serde_json::Value>(json.trim_start_matches('\u{feff}'))
-        .ok()
-        .and_then(|v| match v {
-            serde_json::Value::Object(m) => Some(m),
-            _ => None,
-        })
-        .unwrap_or_default()
-}
-
-/// The root remembered for `key`, if any. An empty key never matches — it
-/// would collide across every pane that failed to report its project identity.
-fn root_for_key(file: &RootsFile, key: &str) -> Option<PathBuf> {
-    if key.is_empty() {
-        return None;
-    }
-    file.get(key).and_then(|v| v.as_str()).map(PathBuf::from)
-}
-
-/// The root this project's tree should use, or `None` to fall back to the
-/// pane's cwd.
-pub fn load_root(key: &str) -> Option<PathBuf> {
-    let json = roots_path().and_then(|p| std::fs::read_to_string(p).ok())?;
-    root_for_key(&decode_roots_file(&json), key)
-}
-
-/// Remember `root` for `key`, leaving other projects' choices alone.
-pub fn save_root(key: &str, root: &Path) {
-    if key.is_empty() {
-        return;
-    }
-    let Some(path) = roots_path() else { return };
-    if let Some(dir) = path.parent() {
-        let _ = std::fs::create_dir_all(dir);
-    }
-    let Some(_lock) = StateWriteLock::acquire(&path) else {
-        return;
-    };
-    let mut file = std::fs::read_to_string(&path)
-        .map(|json| decode_roots_file(&json))
-        .unwrap_or_default();
-    file.insert(
-        key.to_string(),
-        serde_json::json!(root.display().to_string()),
-    );
-    if let Ok(json) = serde_json::to_string(&file) {
-        let _ = std::fs::write(path, json);
-    }
-}
-
 /// Forgiving parse: any missing/garbled field falls back to the default, so a
 /// hand-edited or truncated file can never wedge the panels.
 pub fn parse_state(json: &str) -> State {
@@ -944,10 +875,10 @@ pub fn parse_state(json: &str) -> State {
             .get("focus_on_open")
             .and_then(|v| v.as_bool())
             .unwrap_or(default.focus_on_open),
-        follow_cwd: value
-            .get("follow_cwd")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(default.follow_cwd),
+        active_repo: value
+            .get("active_repo")
+            .and_then(|v| v.as_str())
+            .map(PathBuf::from),
         git_deco: value
             .get("git_deco")
             .and_then(|v| v.as_bool())
@@ -985,39 +916,6 @@ pub fn parse_state(json: &str) -> State {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// A workspace can hold several unrelated project tabs. The caller
-    /// combines its workspace label and normalized spawn cwd so a volatile tab
-    /// id cannot leak state or grow the file on every server restart.
-    #[test]
-    fn remembered_roots_are_keyed_by_workspace_and_project() {
-        let file = decode_roots_file(
-            r#"{"acme::/repo/web":"/repo/web","acme::/repo/admin":"/repo/admin"}"#,
-        );
-        assert_eq!(
-            root_for_key(&file, "acme::/repo/web"),
-            Some(PathBuf::from("/repo/web"))
-        );
-        assert_eq!(
-            root_for_key(&file, "acme::/repo/admin"),
-            Some(PathBuf::from("/repo/admin"))
-        );
-        // An unknown space has made no choice yet — the caller falls back to cwd.
-        assert_eq!(root_for_key(&file, "acme::/repo/jobs"), None);
-        // An empty label must never match; it would collide across spaces.
-        assert_eq!(root_for_key(&file, ""), None);
-    }
-
-    #[test]
-    fn a_garbled_roots_file_forgets_rather_than_wedges() {
-        for junk in ["garbage", "[]", r#"{"tremor":42}"#, ""] {
-            assert_eq!(
-                root_for_key(&decode_roots_file(junk), "acme::/repo/web"),
-                None,
-                "{junk}"
-            );
-        }
-    }
 
     /// One state file serves every sidebar in the session, so it has to be
     /// keyed by tree ROOT. Keyed globally, a sidebar spawned in another
@@ -1117,7 +1015,7 @@ mod tests {
             auto_open: false,
             strict_toggle: true,
             focus_on_open: false,
-            follow_cwd: false,
+            active_repo: Some(PathBuf::from("/w/mono")),
             git_deco: false,
             dock_right: true,
             sidebar_width: 44,
@@ -1126,7 +1024,7 @@ mod tests {
             scm_tree_view: true,
             project_preview_rules: true,
         };
-        let json = "{\"merged\":true,\"active\":\"source-control\",\"search_active\":true,\"hotkeys\":true,\"git_footer\":false,\"font_prompt\":true,\"auto_open\":false,\"strict_toggle\":true,\"focus_on_open\":false,\"follow_cwd\":false,\"git_deco\":false,\"dock_right\":true,\"sidebar_width\":44,\"colors\":\"terminal\",\"preview_placement\":\"pane\",\"custom_editor_on_click\":true,\"scm_tree_view\":true,\"project_preview_rules\":true,\"icons\":\"emoji\"}";
+        let json = "{\"merged\":true,\"active\":\"source-control\",\"search_active\":true,\"hotkeys\":true,\"git_footer\":false,\"font_prompt\":true,\"auto_open\":false,\"strict_toggle\":true,\"focus_on_open\":false,\"git_deco\":false,\"dock_right\":true,\"sidebar_width\":44,\"colors\":\"terminal\",\"preview_placement\":\"pane\",\"custom_editor_on_click\":true,\"scm_tree_view\":true,\"project_preview_rules\":true,\"icons\":\"emoji\",\"active_repo\":\"/w/mono\"}";
         assert_eq!(parse_state(json), state);
         // Files written before per-project rules existed keep them OFF.
         assert!(!parse_state("{\"merged\":true}").project_preview_rules);
@@ -1160,8 +1058,8 @@ mod tests {
                 .color_theme
                 .is_light()
         );
-        // Existing installs get neighbour following by default.
-        assert!(parse_state("{\"merged\":true}").follow_cwd);
+        // Keys of retired settings in older files are ignored, not fatal.
+        assert!(!parse_state("{\"merged\":false,\"retired_setting\":false}").merged);
         assert!(parse_state("{\"merged\":true}").git_deco);
         assert!(parse_state("{\"merged\":true}").show_git_footer);
         // Files written before the dock setting existed stay left-docked.
@@ -1227,14 +1125,10 @@ mod tests {
     }
 
     #[test]
-    fn follow_cwd_status_stays_compact() {
-        if cfg!(windows) {
-            assert_eq!(follow_cwd_setting_value(true), "on (host n/a)");
-            assert_eq!(follow_cwd_setting_value(false), "off (host n/a)");
-        } else {
-            assert_eq!(follow_cwd_setting_value(true), "on");
-            assert_eq!(follow_cwd_setting_value(false), "off");
-        }
+    fn active_repo_round_trips_and_defaults_to_none() {
+        assert_eq!(parse_state("{}").active_repo, None);
+        let s = parse_state(r#"{"active":"SourceControl","active_repo":"/w/mono"}"#);
+        assert_eq!(s.active_repo, Some(PathBuf::from("/w/mono")));
     }
 
     #[test]

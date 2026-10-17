@@ -16,8 +16,8 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use crossterm::event::{self, DisableMouseCapture, EnableMouseCapture, Event};
-use herdr_sidebar::{ensure, launch, state, viewer};
-use state::{Exit, View};
+use herdr_sidebar::{ensure, launch, state, viewer, viewnav};
+use state::{Exit, State, View};
 
 /// How often the source-control view re-reads `git status` while idle.
 const REFRESH_EVERY: Duration = Duration::from_millis(1500);
@@ -195,16 +195,6 @@ fn main() -> std::io::Result<()> {
         .ok()
         .and_then(|value| ensure::Target::from_env_value(&value));
     herdr_sidebar::ui::set_color_theme(persisted.color_theme);
-    let mut view = initial_activity.map_or_else(
-        || {
-            pinned.unwrap_or(if persisted.merged {
-                persisted.active
-            } else {
-                View::Explorer
-            })
-        },
-        ensure::Target::initial_view,
-    );
 
     // Unix launchers use plugin.pane.open so Herdr starts this argv directly,
     // with no shell prompt between the split and the TUI. Keep the host's cwd
@@ -213,6 +203,43 @@ fn main() -> std::io::Result<()> {
     if let Some(cwd) = std::env::var_os(state::SPAWN_CWD_ENV).filter(|cwd| !cwd.is_empty()) {
         std::env::set_current_dir(cwd)?;
     }
+    let spawn_cwd = std::env::current_dir()?;
+    let owner = |path: &std::path::Path| {
+        herdr_sidebar::git::Git::owner_of(path)
+            .ok()
+            .map(|git| git.root().to_path_buf())
+    };
+    // The repositories in this tab's stack: only a unified, unpinned
+    // sidebar can re-enter a remembered Source Control repo, so the
+    // pane.list round trip is skipped for every other start.
+    let group_keys: Vec<std::path::PathBuf> = if pinned.is_none() && persisted.merged {
+        let pane_id = std::env::var("HERDR_PANE_ID").unwrap_or_default();
+        let roots = (!pane_id.is_empty())
+            .then(|| herdr_sidebar::ipc::call_text("pane.list", serde_json::json!({})).ok())
+            .flatten()
+            .and_then(|json| herdr_sidebar::stack::stack_roots(&json, &pane_id))
+            .map(|roots| {
+                if roots.is_empty() {
+                    vec![spawn_cwd.clone()]
+                } else {
+                    roots
+                }
+            })
+            .unwrap_or_default();
+        herdr_sidebar::stack::group_roots(&roots, owner, &[])
+            .into_iter()
+            .map(|group| group.key)
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let spawn_owner = if initial_activity == Some(ensure::Target::SourceControl) {
+        owner(&spawn_cwd)
+    } else {
+        None
+    };
+    let (mut view, start_repo) =
+        startup_view(&persisted, pinned, initial_activity, spawn_owner, &group_keys);
     // Mark the short interval before App::new applies its live identity. The
     // launcher also writes a live stamp after plugin.pane.open returns, so any
     // ordering between the two ends with App::new clearing this marker before
@@ -247,9 +274,12 @@ fn main() -> std::io::Result<()> {
     // REPLACE-killed by the corpse rule while the user reads the prompt).
     herdr_sidebar::fontsetup::maybe_prompt(&mut terminal, view, persisted.merged)?;
     let cwd_follower = Rc::new(RefCell::new(launch::CwdFollower::default()));
-    let workspace_label = workspace_label();
-    let spawn_cwd = std::env::current_dir()?;
-    let root_key = remembered_root_key(&workspace_label, &spawn_cwd);
+    let history = Rc::new(RefCell::new(viewnav::ViewHistory::new()));
+    if let Some(repo) = &start_repo {
+        history
+            .borrow_mut()
+            .visit(viewnav::ViewEntry::Git(repo.clone()));
+    }
     // Some(focus_query) opens the Search view on the next Explorer render;
     // None doesn't. A resumed search restores unfocused (a switch, not a find).
     let mut search_on_open: Option<bool> = if initial_activity == Some(ensure::Target::Search) {
@@ -266,9 +296,7 @@ fn main() -> std::io::Result<()> {
         let exit = match view {
             View::Explorer => run_explorer(
                 &mut terminal,
-                Rc::clone(&cwd_follower),
-                &root_key,
-                &workspace_label,
+                Rc::clone(&history),
                 &spawn_cwd,
                 std::mem::take(&mut search_on_open),
                 std::mem::take(&mut quick_open_on_open),
@@ -276,15 +304,14 @@ fn main() -> std::io::Result<()> {
             View::SourceControl => run_scm(
                 &mut terminal,
                 Rc::clone(&cwd_follower),
-                &root_key,
-                &workspace_label,
-                &spawn_cwd,
+                Rc::clone(&history),
+                start_repo.as_deref().unwrap_or(&spawn_cwd),
             ),
         };
         match exit {
             Ok(Exit::Quit) => break Ok(()),
             Ok(Exit::Switch) => {
-                view = view.other();
+                view = state::load_state().active;
             }
             Ok(Exit::Search { focus_query }) => {
                 view = View::Explorer;
@@ -308,71 +335,57 @@ fn read_stdin() -> std::io::Result<String> {
     Ok(buf)
 }
 
-/// The label of the space this pane lives in, or "" when it can't be
-/// resolved — the caller then falls back to the pane's cwd.
-fn workspace_label() -> String {
-    let Ok(ws_id) = std::env::var("HERDR_WORKSPACE_ID") else {
-        return String::new();
-    };
-    herdr_sidebar::ipc::call_text("workspace.list", serde_json::json!({}))
-        .map(|json| herdr_sidebar::launch::workspace_label(&json, &ws_id))
-        .unwrap_or_default()
-}
-
-/// Roots are project state, not workspace state: one Herdr workspace may host
-/// unrelated project tabs, while tab ids change across server restarts.
-fn remembered_root_key(workspace_label: &str, spawn_cwd: &std::path::Path) -> String {
-    let mut cwd = spawn_cwd.display().to_string().replace('\\', "/");
-    if cfg!(windows) {
-        cwd.make_ascii_lowercase();
+/// (view to start in, repo for a git view). Source Control is entered only when the
+/// unified sidebar is on and `repo` is one of `group_keys`; `Target::SourceControl` with
+/// no persisted repo falls back to `spawn_owner`.
+fn startup_view(
+    persisted: &State,
+    pinned: Option<View>,
+    initial: Option<ensure::Target>,
+    spawn_owner: Option<std::path::PathBuf>,
+    group_keys: &[std::path::PathBuf],
+) -> (View, Option<std::path::PathBuf>) {
+    let view = initial.map_or_else(
+        || {
+            pinned.unwrap_or(if persisted.merged {
+                persisted.active
+            } else {
+                View::Explorer
+            })
+        },
+        ensure::Target::initial_view,
+    );
+    if view == View::Explorer {
+        return (View::Explorer, None);
     }
-    format!("{workspace_label}::{cwd}")
-}
-
-/// The directory the tree is built from: the root this tab remembers,
-/// else the cwd the pane was spawned with.
-///
-/// A remembered root that has since been deleted is ignored rather than
-/// yielding an empty tree. The guarded legacy lookup migrates v0.10's
-/// workspace-keyed entry only when it contains this tab's spawn cwd.
-fn resolve_root(
-    root_key: &str,
-    legacy_workspace_label: &str,
-    spawn_cwd: &std::path::Path,
-) -> std::io::Result<std::path::PathBuf> {
-    let root = if let Some(root) = herdr_sidebar::state::load_root(root_key)
-        && root.is_dir()
-    {
-        root
-    } else if let Some(root) = herdr_sidebar::state::load_root(legacy_workspace_label)
-        && root.is_dir()
-        && spawn_cwd.starts_with(&root)
-    {
-        // v0.10 keyed roots by workspace label. Migrate that choice only
-        // when it contains this tab's live spawn cwd; sibling project tabs
-        // must not all inherit the same old entry.
-        root
-    } else {
-        spawn_cwd.to_path_buf()
-    };
-    herdr_sidebar::state::save_root(root_key, &root);
-    Ok(root)
+    // A separated (pinned) Source Control pane starts at its spawn cwd and
+    // follows focus; it never re-enters a remembered repo.
+    if pinned.is_some() || !persisted.merged {
+        return (View::SourceControl, None);
+    }
+    let in_stack = |repo: &std::path::PathBuf| group_keys.contains(repo);
+    let repo = persisted.active_repo.clone().filter(in_stack).or_else(|| {
+        (initial == Some(ensure::Target::SourceControl))
+            .then_some(spawn_owner)
+            .flatten()
+            .filter(in_stack)
+    });
+    match repo {
+        Some(repo) => (View::SourceControl, Some(repo)),
+        None => (View::Explorer, None),
+    }
 }
 
 /// The explorer's event loop: short poll so the liveness heartbeat keeps
 /// stamping even while idle.
 fn run_explorer(
     terminal: &mut ratatui::DefaultTerminal,
-    cwd_follower: Rc<RefCell<launch::CwdFollower>>,
-    root_key: &str,
-    legacy_workspace_label: &str,
+    history: Rc<RefCell<viewnav::ViewHistory>>,
     spawn_cwd: &std::path::Path,
     search_on_open: Option<bool>,
     quick_open_on_open: bool,
 ) -> std::io::Result<Exit> {
-    let root = resolve_root(root_key, legacy_workspace_label, spawn_cwd)?;
-    let mut remembered_root = root.clone();
-    let mut app = explorer_app::App::new(root, cwd_follower);
+    let mut app = explorer_app::App::new(spawn_cwd.to_path_buf(), history);
     if let Some(focus_query) = search_on_open {
         app.open_content_search(focus_query);
     }
@@ -381,8 +394,7 @@ fn run_explorer(
     }
     loop {
         terminal.draw(|frame| app.draw(frame))?;
-        // 500ms: quick enough that a finished folder pick lands promptly,
-        // still cheap for the heartbeat.
+        // 500ms: cheap for the heartbeat, prompt for background results.
         let timeout = if app.is_syncing() {
             ANIMATION_FRAME
         } else {
@@ -406,13 +418,7 @@ fn run_explorer(
             }
         }
         app.heartbeat();
-        app.poll_picker();
         app.tick();
-        let root = app.root_path();
-        if root != remembered_root {
-            herdr_sidebar::state::save_root(root_key, &root);
-            remembered_root = root;
-        }
     }
 }
 
@@ -421,13 +427,10 @@ fn run_explorer(
 fn run_scm(
     terminal: &mut ratatui::DefaultTerminal,
     cwd_follower: Rc<RefCell<launch::CwdFollower>>,
-    root_key: &str,
-    legacy_workspace_label: &str,
-    spawn_cwd: &std::path::Path,
+    history: Rc<RefCell<viewnav::ViewHistory>>,
+    cwd: &std::path::Path,
 ) -> std::io::Result<Exit> {
-    let cwd = resolve_root(root_key, legacy_workspace_label, spawn_cwd)?;
-    let mut remembered_root = cwd.clone();
-    let mut app = scm_app::App::new(cwd, cwd_follower);
+    let mut app = scm_app::App::new(cwd.to_path_buf(), cwd_follower, history);
     let mut last_tick = std::time::Instant::now();
     loop {
         terminal.draw(|frame| app.draw(frame))?;
@@ -459,15 +462,9 @@ fn run_scm(
             }
         }
         app.heartbeat();
-        app.poll_picker();
         if last_tick.elapsed() >= REFRESH_EVERY {
             app.tick();
             last_tick = std::time::Instant::now();
-        }
-        let root = app.root_path().to_path_buf();
-        if root != remembered_root {
-            herdr_sidebar::state::save_root(root_key, &root);
-            remembered_root = root;
         }
     }
 }
@@ -477,13 +474,54 @@ mod tests {
     use super::*;
 
     #[test]
-    fn remembered_root_keys_are_project_stable_not_tab_scoped() {
-        let key = remembered_root_key("acme", std::path::Path::new(r"C:\Repo\Web"));
-        assert!(key.starts_with("acme::"));
-        assert!(!key.contains('\\'));
-        assert!(!key.contains("w1:t"));
-        if cfg!(windows) {
-            assert_eq!(key, "acme::c:/repo/web");
-        }
+    fn startup_enters_git_view_only_for_a_repo_in_the_stack() {
+        let mut s = State::default();
+        s.merged = true;
+        s.active = View::SourceControl;
+        s.active_repo = Some("/w/mono".into());
+        assert_eq!(
+            startup_view(&s, None, None, None, &["/w/mono".into()]),
+            (View::SourceControl, Some("/w/mono".into()))
+        );
+        assert_eq!(
+            startup_view(&s, None, None, None, &["/other".into()]),
+            (View::Explorer, None)
+        );
+        s.active_repo = None;
+        assert_eq!(
+            startup_view(&s, None, None, None, &["/w/mono".into()]),
+            (View::Explorer, None)
+        );
+    }
+
+    #[test]
+    fn show_git_action_uses_the_spawn_owner_when_nothing_is_remembered() {
+        let mut s = State::default();
+        s.merged = true;
+        assert_eq!(
+            startup_view(
+                &s,
+                None,
+                Some(ensure::Target::SourceControl),
+                Some("/w/x".into()),
+                &["/w/x".into()]
+            ),
+            (View::SourceControl, Some("/w/x".into()))
+        );
+    }
+
+    #[test]
+    fn pinned_panes_ignore_persisted_view() {
+        let mut s = State::default();
+        s.active = View::SourceControl;
+        s.active_repo = Some("/r".into());
+        assert_eq!(
+            startup_view(&s, Some(View::Explorer), None, None, &["/r".into()]),
+            (View::Explorer, None)
+        );
+        assert_eq!(
+            startup_view(&s, Some(View::SourceControl), None, None, &[]),
+            (View::SourceControl, None)
+        );
     }
 }

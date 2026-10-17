@@ -461,24 +461,10 @@ HACKING.md — budget time for that before promising a patched build.
 
 ### Following the neighbour pane's folder
 
-- A pane's `cwd` is its SPAWN directory; only `foreground_cwd` is live after a shell
-  `cd` or an agent project switch. Following therefore requires `foreground_cwd` and
-  deliberately has NO fallback to `cwd`: an absent live value is safer than silently
-  re-rooting to a stale directory.
-- "Follow pane folder" is persisted as `follow_cwd` in `state.json` and defaults on,
-  including for state files written before the field existed. Both views sample on the
-  existing ~5s heartbeat and share one process-local `CwdFollower`, so precedence survives
-  an app rebuild and unified-view switch.
-- Multi-pane precedence is deterministic: focused eligible sibling, then the previously
-  followed sibling, then lexical pane id. Candidate lists are sorted before selection;
-  `pane.list` response order is never treated as meaningful. Explorer, Source Control,
-  Sidebar, and Preview panes are ineligible so plugin panes cannot chase each other.
-- A successful typed/native folder choice is a manual override. Focus changes, response
-  reordering, and newly-created panes do not overwrite it; following resumes only when an
-  already-observed eligible pane's `foreground_cwd` changes. Turning following back on
-  resets the baseline and immediately adopts the deterministic neighbour on the next beat.
-- Source Control pauses cwd-follow while any repository has a non-empty commit-message draft;
-  rebuilding the app for another cwd would otherwise destroy that in-memory draft.
+- The Explorer shows a stack of trees, one per directory a pane on the tab is in, grouped by
+  repository: see `plugins/herdr-sidebar/docs/superpowers/specs/2026-10-16-stacked-pane-trees-design.md`.
+- Only `foreground_cwd` is live (a pane's `cwd` is its spawn directory); there is deliberately
+  NO fallback to `cwd`. Source Control follows the focused pane only in separated mode.
 
 ### Pane liveness (heartbeat tokens)
 
@@ -575,13 +561,6 @@ HACKING.md — budget time for that before promising a patched build.
 - The unified pane reports BOTH identity tokens (`herdr-sidebar-explorer`,
   `herdr-sidebar-git`) so either launcher decision finds it; turning unified off clears
   the other token (null value — report_metadata MERGES token maps).
-- `c` (or "Change Folder…" in the context menu / both ⚙ Settings modals) re-roots the
-  sidebar via the native OS folder picker: `rfd`/IFileDialog on Windows and an `osascript`
-  `choose folder` subprocess on macOS; Linux keeps the typed-path prompt. The dialog runs
-  on a BACKGROUND thread polled from the event loop — a blocking call would freeze the TUI
-  and the liveness heartbeat would declare the pane a corpse after 20s. "Change Folder
-  (Type Path)…" accepts absolute, relative, or ~-prefixed paths. A successful choice marks
-  the shared cwd follower as manually overridden before rebuilding either view.
 - "Open with Default App" (`actions::open_external`, in the Explorer menu for FILE rows
   only and in the SCM file menu unless the entry's status letter is `D`) hands the path to
   the OS shell association. Windows uses `explorer.exe <path>`, NOT `cmd /c start`: explorer
@@ -1134,12 +1113,6 @@ It replaced the original pane-ID-keyed park/restore implementation; the optional
   the writer's OS lock and normalize expansion order before comparing, avoiding partial JSON and
   needless rebuild loops. SCM remains startup-only and saves on user-action paths to avoid timer
   write-churn. Paths outside the tree's root are dropped, since one file serves every workspace.
-- Sidebar roots are remembered per **workspace label + normalized spawn cwd**. A workspace
-  can hold unrelated project tabs, so label-only keys race and leak roots across those tabs;
-  tab ids change across server restarts and would grow `roots.json` forever. The project-path
-  key also preserves an explicit manual root across restarts. v0.10 label-only entries migrate
-  only when the remembered path contains the tab's spawn cwd. Every successful manual or
-  followed re-root is written to `roots.json`; a read-only `load_root` API is dead behavior.
 - The ensure hook roots a docked sidebar from **the event's own tab**
   (`event_scope_in` → `launch_decision_in` / `focused_pane_in`): during a workspace
   switch the globally focused pane is still the space you came from. Both the Unix main-binary
@@ -1515,15 +1488,6 @@ First clean install of both plugins on a Mac (driven over SSH), findings:
 - The `merged` (unified sidebar) default was still `false` from the experiment era — fresh
   installs came up as a pinned separate Explorer. Flipped to `true` (existing users keep
   their persisted value).
-- **Do not use rfd for the background picker on macOS.** Its Cocoa backend requires the
-  main thread or a running `NSApplication`; a terminal TUI has neither, so the worker-thread
-  call aborts the pane. Moving it to the main thread would freeze the heartbeat instead.
-  `actions::pick_folder` uses `osascript -e 'POSIX path of (choose folder …)'`: omit
-  `default location` when the old root is no longer a directory, escape backslashes before
-  quotes in AppleScript literals, treat a non-zero status (including cancel `-128`) as no
-  selection, and trim the returned trailing slash without turning `/` into an empty path.
-  The parser is separated from process launch so all of these cases run in cross-platform
-  unit tests. `rfd` remains Windows-only; Linux behavior is unchanged.
 - Everything else verified working on macOS unchanged: ensure hook docks on tab focus,
   unified view switch, SCM drawers/commit box in a real repo, the diff preview
   (full-size park/restore at the time; preview TABS on the trial branch),

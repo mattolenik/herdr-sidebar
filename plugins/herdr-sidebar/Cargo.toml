@@ -55,11 +55,7 @@ toml = "1.1.6"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
-# Native folder picker for "Change Folder" on Windows. macOS uses osascript:
-# rfd's Cocoa backend aborts when called from the background thread required
-# to keep the TUI heartbeat alive. Linux keeps the typed-path fallback.
 [target.'cfg(windows)'.dependencies]
-rfd = { version = "0.17", default-features = false }
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Security",

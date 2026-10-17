@@ -70,54 +70,26 @@ pub(crate) struct SiblingCwd {
 /// Process-local state shared by the Explorer and Source Control views.
 ///
 /// `pane.list` order is not an API guarantee, so candidates are sorted by id.
-/// A manual folder choice suppresses focus-only changes; it is released only
-/// when an already-observed sibling actually changes its live cwd.
 #[derive(Default, Debug)]
 pub struct CwdFollower {
     seen: BTreeMap<String, String>,
     selected: Option<String>,
-    initialized: bool,
-    manual_override: bool,
 }
 
 impl CwdFollower {
-    /// Record a successful user-selected folder. The next samples still
-    /// refresh the baseline, but do not re-root until a known pane moves.
-    pub fn mark_manual_folder(&mut self) {
-        self.manual_override = true;
-    }
-
     /// Start following afresh after the persisted setting is enabled.
     pub fn reset(&mut self) {
         *self = Self::default();
     }
 
     /// Return the next live cwd to follow, if this sample changes the chosen
-    /// root according to the deterministic/manual-precedence rules above.
+    /// root according to the deterministic precedence rules above.
     pub fn next_cwd(&mut self, pane_list_json: &str, my_pane_id: &str) -> Option<String> {
         let siblings = sibling_cwds(pane_list_json, my_pane_id);
         let next_seen = siblings
             .iter()
             .map(|s| (s.pane_id.clone(), s.cwd.clone()))
             .collect::<BTreeMap<_, _>>();
-        let changed = siblings
-            .iter()
-            .filter(|s| self.seen.get(&s.pane_id).is_some_and(|old| old != &s.cwd))
-            .collect::<Vec<_>>();
-        let was_initialized = self.initialized;
-        self.initialized = true;
-
-        if self.manual_override {
-            self.seen = next_seen;
-            if !was_initialized || changed.is_empty() {
-                return None;
-            }
-            let picked = pick_sibling(&changed, self.selected.as_deref())?;
-            self.selected = Some(picked.pane_id.clone());
-            self.manual_override = false;
-            return Some(picked.cwd.clone());
-        }
-
         let prior_selected = self.selected.clone();
         let prior_cwd = prior_selected
             .as_ref()
@@ -625,41 +597,6 @@ pub fn event_kind(event_json: &str) -> String {
         && kind.chars().all(|c| c.is_ascii_lowercase() || c == '_')
         && kind.len() <= 64;
     if safe { kind } else { String::new() }
-}
-
-/// A workspace's label from a `workspace list` JSON, empty when unknown.
-///
-/// The label is how a remembered tree root is keyed: workspace IDs identify a
-/// space *instance* and get reassigned when a space is closed and recreated,
-/// so they cannot carry a choice across that boundary.
-pub fn workspace_label(workspace_list_json: &str, workspace_id: &str) -> String {
-    #[derive(Deserialize)]
-    struct Msg {
-        result: Res,
-    }
-    #[derive(Deserialize)]
-    struct Res {
-        #[serde(default)]
-        workspaces: Vec<Ws>,
-    }
-    #[derive(Deserialize)]
-    struct Ws {
-        workspace_id: Option<String>,
-        label: Option<String>,
-    }
-    if workspace_id.is_empty() {
-        return String::new();
-    }
-    serde_json::from_str::<Msg>(strip_bom(workspace_list_json))
-        .ok()
-        .and_then(|msg| {
-            msg.result
-                .workspaces
-                .into_iter()
-                .find(|w| w.workspace_id.as_deref() == Some(workspace_id))
-                .and_then(|w| w.label)
-        })
-        .unwrap_or_default()
 }
 
 /// The focused pane's tab id from a `pane list` JSON (flag-safe, else empty).
@@ -1198,23 +1135,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn workspace_labels_resolve_by_id_and_degrade_quietly() {
-        let json = r#"{"result":{"workspaces":[
-            {"workspace_id":"wG","label":"tremor"},
-            {"workspace_id":"w4","label":"faultline"},
-            {"workspace_id":"wZ"}
-        ]}}"#;
-        assert_eq!(workspace_label(json, "wG"), "tremor");
-        assert_eq!(workspace_label(json, "w4"), "faultline");
-        // A space with no label, an id that is gone, and a missing id all
-        // yield "" so the caller falls back to the pane's cwd.
-        assert_eq!(workspace_label(json, "wZ"), "");
-        assert_eq!(workspace_label(json, "wQ"), "");
-        assert_eq!(workspace_label(json, ""), "");
-        assert_eq!(workspace_label("garbage", "wG"), "");
-    }
-
     fn pane_list(panes: &str) -> String {
         format!(r#"{{"id":"cli:pane:list","result":{{"panes":[{panes}]}}}}"#)
     }
@@ -1262,41 +1182,6 @@ mod tests {
         assert_eq!(
             follower.next_cwd(&focused, "w1:p3").as_deref(),
             Some("/nine")
-        );
-    }
-
-    #[test]
-    fn manual_folder_wins_until_an_observed_pane_moves() {
-        let mut follower = CwdFollower::default();
-        let initial = pane_list(
-            r#"{"pane_id":"w1:p3","tab_id":"w1:t1","label":"Sidebar"},
-               {"pane_id":"w1:p1","tab_id":"w1:t1","foreground_cwd":"/one"},
-               {"pane_id":"w1:p2","tab_id":"w1:t1","foreground_cwd":"/two"}"#,
-        );
-        assert_eq!(
-            follower.next_cwd(&initial, "w1:p3").as_deref(),
-            Some("/one")
-        );
-        follower.mark_manual_folder();
-
-        // Focus alone, pane-list reordering, and a newly-created pane do not
-        // override an explicit folder choice.
-        let focus_only = pane_list(
-            r#"{"pane_id":"w1:p3","tab_id":"w1:t1","label":"Sidebar"},
-               {"pane_id":"w1:p4","tab_id":"w1:t1","foreground_cwd":"/new"},
-               {"pane_id":"w1:p2","tab_id":"w1:t1","foreground_cwd":"/two","focused":true},
-               {"pane_id":"w1:p1","tab_id":"w1:t1","foreground_cwd":"/one"}"#,
-        );
-        assert_eq!(follower.next_cwd(&focus_only, "w1:p3"), None);
-
-        let moved = pane_list(
-            r#"{"pane_id":"w1:p3","tab_id":"w1:t1","label":"Sidebar"},
-               {"pane_id":"w1:p1","tab_id":"w1:t1","foreground_cwd":"/one"},
-               {"pane_id":"w1:p2","tab_id":"w1:t1","foreground_cwd":"/two/next","focused":true}"#,
-        );
-        assert_eq!(
-            follower.next_cwd(&moved, "w1:p3").as_deref(),
-            Some("/two/next")
         );
     }
 

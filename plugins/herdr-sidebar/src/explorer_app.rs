@@ -166,9 +166,6 @@ enum PromptKind {
     NewFile(PathBuf),
     NewFolder(PathBuf),
     Rename(PathBuf),
-    /// Re-root the whole sidebar at a typed path (absolute, relative to the
-    /// current root, or ~-prefixed).
-    ChangeFolder,
     CustomEditor,
 }
 
@@ -299,12 +296,10 @@ enum Setting {
     AutoOpen,
     StrictToggle,
     FocusOnOpen,
-    FollowCwd,
     HiddenFiles,
     Hotkeys,
     GitDecorations,
     GitFooter,
-    Folder,
 }
 
 /// (setting, label, current value, enabled) — disabled rows render dimmed and
@@ -367,12 +362,8 @@ pub struct App {
     last_preview: Option<(String, herdr_sidebar::viewer::PreviewTarget)>,
     /// Last heartbeat stamp, throttling the token refresh.
     last_beat: std::time::Instant,
-    /// A native folder picker running on a background thread; its result
-    /// arrives here (None = cancelled).
-    picking: Option<std::sync::mpsc::Receiver<Option<PathBuf>>>,
-    /// Shared across full app rebuilds and unified-view switches so manual
-    /// folder precedence is not lost when this view is recreated.
-    cwd_follower: std::rc::Rc<std::cell::RefCell<herdr_sidebar::launch::CwdFollower>>,
+    #[allow(dead_code)] // read in Task 8
+    history: std::rc::Rc<std::cell::RefCell<herdr_sidebar::viewnav::ViewHistory>>,
     /// Every repository the tree can see — the containing one plus child
     /// repos, exactly the set the Source Control view shows.
     repos: Vec<Git>,
@@ -451,7 +442,7 @@ struct SearchZones {
 impl App {
     pub fn new(
         root: PathBuf,
-        cwd_follower: std::rc::Rc<std::cell::RefCell<herdr_sidebar::launch::CwdFollower>>,
+        history: std::rc::Rc<std::cell::RefCell<herdr_sidebar::viewnav::ViewHistory>>,
     ) -> Self {
         let mut tree = Tree::new(root);
         // Mirror the tree the user was already looking at. Idle ticks keep
@@ -508,8 +499,7 @@ impl App {
             programs: programs::Rules::default(),
             last_preview: None,
             last_beat: std::time::Instant::now(),
-            picking: None,
-            cwd_follower,
+            history,
             repos,
             deco: Decorations::empty(),
             // Overwritten when the first background refresh is queued below.
@@ -535,10 +525,6 @@ impl App {
         app.apply_identity();
         app.request_decorations(true);
         app
-    }
-
-    pub fn root_path(&self) -> PathBuf {
-        self.tree.root_path()
     }
 
     /// Idle work: keep the git decorations current so changes made outside
@@ -771,7 +757,6 @@ impl App {
         if let Some(ctl) = &self.pane_ctl {
             ctl.report_tokens(MY_VIEW, self.merged());
         }
-        self.follow_sibling_cwd();
     }
 
     fn poll_unified_close(&mut self) -> bool {
@@ -802,25 +787,6 @@ impl App {
             self.notice = Some("Source Control stayed open; unified mode cancelled".into());
         }
         false
-    }
-
-    fn follow_sibling_cwd(&mut self) {
-        if !self.sidebar_state.follow_cwd || self.overlay.is_some() || self.picking.is_some() {
-            return;
-        }
-        let Some(ctl) = &self.pane_ctl else { return };
-        let Ok(panes) = herdr_sidebar::ipc::call_text("pane.list", serde_json::json!({})) else {
-            return;
-        };
-        let target = self
-            .cwd_follower
-            .borrow_mut()
-            .next_cwd(&panes, &ctl.pane_id);
-        if let Some(target) = target
-            && Path::new(&target) != self.tree.root_path()
-        {
-            self.change_folder_impl(&target, false);
-        }
     }
 
     /// The merged sidebar is on and actually usable (other plugin present).
@@ -1189,7 +1155,6 @@ impl App {
             }
             KeyCode::Char('i') => self.set_theme(self.theme.toggled()),
             KeyCode::Char('b') => self.hide(),
-            KeyCode::Char('c') => self.change_folder_dialog(),
             KeyCode::Char('m') => self.open_menu_for_selection(),
             KeyCode::Char('s') => self.open_settings(),
             KeyCode::Char('1') => return self.switch_to(View::Explorer),
@@ -2720,12 +2685,6 @@ impl App {
                 true,
             ),
             (
-                Setting::FollowCwd,
-                "Follow pane folder",
-                sidebar::follow_cwd_setting_value(self.sidebar_state.follow_cwd),
-                true,
-            ),
-            (
                 Setting::GitDecorations,
                 "Git decorations",
                 if self.sidebar_state.git_deco {
@@ -2745,12 +2704,6 @@ impl App {
                     "hidden"
                 }
                 .to_string(),
-                true,
-            ),
-            (
-                Setting::Folder,
-                "Change folder…",
-                self.tree.root_name(),
                 true,
             ),
         ]
@@ -2809,7 +2762,7 @@ impl App {
             }
             Setting::PreviewPrograms => {
                 // Opening the preview moves focus to its tab; a modal left
-                // behind would strand the sidebar, as with Change Folder.
+                // behind would strand the sidebar.
                 self.overlay = None;
                 match programs::ensure_global_file() {
                     Ok(path) => {
@@ -2857,11 +2810,6 @@ impl App {
                 self.sidebar_state =
                     sidebar::update_state(|state| state.focus_on_open = !state.focus_on_open);
             }
-            Setting::FollowCwd => {
-                self.sidebar_state =
-                    sidebar::update_state(|state| state.follow_cwd = !state.follow_cwd);
-                self.cwd_follower.borrow_mut().reset();
-            }
             Setting::GitDecorations => {
                 self.sidebar_state =
                     sidebar::update_state(|state| state.git_deco = !state.git_deco);
@@ -2874,10 +2822,6 @@ impl App {
                 });
                 self.rediscover_repos();
                 self.request_decorations(true);
-            }
-            Setting::Folder => {
-                self.overlay = None;
-                self.change_folder_dialog();
             }
         }
     }
@@ -3059,102 +3003,6 @@ impl App {
                 let (path, directory) = target.unwrap_or_else(|| (self.tree.root_path(), true));
                 actions::reveal(&path, directory);
             }
-            MenuAction::ChangeFolder => self.change_folder_dialog(),
-            MenuAction::ChangeFolderTyped => self.change_folder_prompt(),
-        }
-    }
-
-    /// `c` / the context menu: the NATIVE folder picker, on a background
-    /// thread so the pane's liveness heartbeat keeps beating while the
-    /// dialog is open (a frozen TUI would read as a corpse after 20s).
-    #[cfg(any(windows, target_os = "macos"))]
-    fn change_folder_dialog(&mut self) {
-        if self.picking.is_some() {
-            return;
-        }
-        let (tx, rx) = std::sync::mpsc::channel();
-        let start = self.tree.root_path();
-        std::thread::spawn(move || {
-            let _ = tx.send(actions::pick_folder(&start));
-        });
-        self.picking = Some(rx);
-        self.notice = Some("folder picker open… (check your other windows)".into());
-    }
-
-    /// No native dialogs here — fall back to the typed prompt.
-    #[cfg(not(any(windows, target_os = "macos")))]
-    fn change_folder_dialog(&mut self) {
-        self.change_folder_prompt();
-    }
-
-    /// Collect a finished folder pick, if any (called from the poll loop).
-    pub fn poll_picker(&mut self) {
-        let Some(rx) = &self.picking else { return };
-        match rx.try_recv() {
-            Ok(Some(path)) => {
-                self.picking = None;
-                self.change_folder(&path.display().to_string());
-            }
-            Ok(None) => {
-                self.picking = None;
-                self.notice = None;
-            }
-            Err(std::sync::mpsc::TryRecvError::Empty) => {}
-            Err(_) => self.picking = None,
-        }
-    }
-
-    /// `c` / the context menu: prompt for a new root folder, prefilled with
-    /// the current one so relative tweaks are quick.
-    fn change_folder_prompt(&mut self) {
-        self.overlay = Some(Overlay::Prompt {
-            title: "Folder".into(),
-            input: self.tree.root_path().display().to_string(),
-            kind: PromptKind::ChangeFolder,
-        });
-    }
-
-    /// Re-root everything at `target` (also the PROCESS cwd, so the Source
-    /// Control view follows on the next view switch).
-    fn change_folder(&mut self, raw: &str) {
-        self.change_folder_impl(raw, true);
-    }
-
-    fn change_folder_impl(&mut self, raw: &str, manual: bool) {
-        let raw = raw.trim();
-        if raw.is_empty() {
-            self.notice = Some("empty path".into());
-            return;
-        }
-        let expanded = match raw.strip_prefix('~') {
-            Some(rest) => {
-                let home = std::env::var("USERPROFILE")
-                    .or_else(|_| std::env::var("HOME"))
-                    .unwrap_or_default();
-                format!("{home}{rest}")
-            }
-            None => raw.to_string(),
-        };
-        let target = PathBuf::from(&expanded);
-        let target = if target.is_relative() {
-            self.tree.root_path().join(target)
-        } else {
-            target
-        };
-        if !target.is_dir() || std::env::set_current_dir(&target).is_err() {
-            self.notice = Some(format!("not a folder: {raw}"));
-            return;
-        }
-        let root = std::env::current_dir().unwrap_or(target);
-        if manual && self.sidebar_state.follow_cwd {
-            self.cwd_follower.borrow_mut().mark_manual_folder();
-        }
-        let cwd_follower = std::rc::Rc::clone(&self.cwd_follower);
-        *self = App::new(root, cwd_follower);
-        // Only confirm an explicit folder change; an automatic cwd-follow
-        // re-root must not pop an unprompted "folder: …" notice.
-        if manual {
-            self.notice = Some(format!("folder: {}", self.tree.root_name()));
         }
     }
 
@@ -3162,11 +3010,6 @@ impl App {
         let Some(Overlay::Prompt { input, kind, .. }) = self.overlay.take() else {
             return;
         };
-        // Folder changes take a full PATH — they skip the name validation.
-        if matches!(kind, PromptKind::ChangeFolder) {
-            self.change_folder(&input);
-            return;
-        }
         if matches!(kind, PromptKind::CustomEditor) {
             if sidebar::save_editor_command(&input) {
                 self.notice = Some("custom editor saved; Enter still previews files".into());
@@ -3183,7 +3026,6 @@ impl App {
             PromptKind::NewFile(dir) => actions::create_file(dir, name),
             PromptKind::NewFolder(dir) => actions::create_folder(dir, name),
             PromptKind::Rename(path) => actions::rename(path, name),
-            PromptKind::ChangeFolder => unreachable!("handled above"),
             PromptKind::CustomEditor => unreachable!("handled above"),
         };
         match result {
@@ -3665,7 +3507,6 @@ impl App {
             ("⏎", "toggle"),
             ("r", "refresh"),
             (".", "dotfiles"),
-            ("c", "folder"),
             ("ctrl+p", "files"),
             ("ctrl+f", "text"),
             ("m", "menu"),

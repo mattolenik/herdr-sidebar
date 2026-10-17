@@ -22,8 +22,6 @@ pub enum MenuAction {
     EditWith,
     OpenExternal,
     Reveal,
-    ChangeFolder,
-    ChangeFolderTyped,
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -79,9 +77,6 @@ pub fn menu_entries(target: Option<bool>, in_repo: bool, editor: Option<&str>) -
     entries.extend([
         MenuEntry::Separator,
         item(MenuAction::Reveal, "Reveal in File Explorer"),
-        MenuEntry::Separator,
-        item(MenuAction::ChangeFolder, "Change Folder…"),
-        item(MenuAction::ChangeFolderTyped, "Change Folder (Type Path)…"),
     ]);
     entries
 }
@@ -765,70 +760,6 @@ fn tab_create_ids(response: &str) -> Option<(String, String)> {
     Some((tab_id, pane_id))
 }
 
-/// Quote text embedded in a double-quoted AppleScript string literal.
-#[cfg(any(test, target_os = "macos"))]
-fn applescript_escape(text: &str) -> String {
-    text.replace('\\', "\\\\").replace('"', "\\\"")
-}
-
-/// Parse a completed osascript picker invocation. Keeping this separate from
-/// process launch makes cancel/error and path normalization testable on every
-/// platform, including CI hosts that do not provide osascript.
-#[cfg(any(test, target_os = "macos"))]
-fn parse_osascript_folder(success: bool, stdout: &[u8]) -> Option<PathBuf> {
-    if !success {
-        return None;
-    }
-    let picked = String::from_utf8_lossy(stdout).trim().to_string();
-    if picked.is_empty() {
-        return None;
-    }
-    let trimmed = picked.trim_end_matches('/');
-    Some(if trimmed.is_empty() {
-        PathBuf::from("/")
-    } else {
-        PathBuf::from(trimmed)
-    })
-}
-
-/// Native "choose a folder" dialog. The apps call this from a worker thread
-/// so their heartbeat continues while the dialog is open.
-///
-/// macOS deliberately uses an osascript subprocess: rfd's Cocoa backend needs
-/// the main thread or a running NSApplication and aborts a terminal TUI when
-/// invoked from the worker. Windows keeps its existing rfd/IFileDialog path.
-#[cfg(any(windows, target_os = "macos"))]
-pub fn pick_folder(start: &Path) -> Option<PathBuf> {
-    #[cfg(target_os = "macos")]
-    {
-        // An invalid default location makes choose-folder fail instead of
-        // opening, so omit it if the former root has disappeared.
-        let location = if start.is_dir() {
-            format!(
-                " default location POSIX file \"{}\"",
-                applescript_escape(&start.display().to_string())
-            )
-        } else {
-            String::new()
-        };
-        let output = std::process::Command::new("osascript")
-            .arg("-e")
-            .arg(format!(
-                "POSIX path of (choose folder with prompt \"Open Folder\"{location})"
-            ))
-            .output()
-            .ok()?;
-        parse_osascript_folder(output.status.success(), &output.stdout)
-    }
-    #[cfg(windows)]
-    {
-        rfd::FileDialog::new()
-            .set_title("Open Folder")
-            .set_directory(start)
-            .pick_folder()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1081,28 +1012,6 @@ mod tests {
         assert_eq!(
             editor_tab_for_file(&panes, "w2", &first, 100),
             Some(("w2:t1".into(), "w2:p1".into()))
-        );
-    }
-
-    #[test]
-    fn applescript_literals_escape_backslashes_before_quotes() {
-        assert_eq!(applescript_escape("/tmp/plain"), "/tmp/plain");
-        assert_eq!(applescript_escape(r#"/tmp/a"b"#), r#"/tmp/a\"b"#);
-        assert_eq!(applescript_escape(r"/tmp/a\b"), r"/tmp/a\\b");
-        assert_eq!(applescript_escape(r#"/tmp/a\"b"#), r#"/tmp/a\\\"b"#);
-    }
-
-    #[test]
-    fn osascript_picker_output_parsing_handles_cancel_root_and_trailing_slash() {
-        assert_eq!(parse_osascript_folder(false, b"/ignored/\n"), None);
-        assert_eq!(parse_osascript_folder(true, b"\n"), None);
-        assert_eq!(
-            parse_osascript_folder(true, b"/\n"),
-            Some(PathBuf::from("/"))
-        );
-        assert_eq!(
-            parse_osascript_folder(true, b"/Users/alex/My Folder/\n"),
-            Some(PathBuf::from("/Users/alex/My Folder"))
         );
     }
 

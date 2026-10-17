@@ -9,7 +9,7 @@
 //! When herdr-aa-filetree is also installed, the panel can merge with it into
 //! a single "Sidebar" pane with an activity-bar view switcher (see sidebar.rs).
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::mpsc::Receiver;
 
 use crossterm::event::{
@@ -764,11 +764,9 @@ enum Setting {
     AutoOpen,
     StrictToggle,
     FocusOnOpen,
-    FollowCwd,
     GitDecorations,
     GitFooter,
     Hotkeys,
-    Folder,
     ScmViewMode,
 }
 
@@ -971,12 +969,10 @@ pub struct App {
     pane_ctl: Option<PaneCtl>,
     /// Last heartbeat stamp, throttling the token refresh.
     last_beat: std::time::Instant,
-    /// A native folder picker running on a background thread; its result
-    /// arrives here (None = cancelled).
-    picking: Option<std::sync::mpsc::Receiver<Option<std::path::PathBuf>>>,
-    /// Shared across rebuilds and unified-view switches so a manual folder
-    /// choice keeps its precedence until a known neighbour actually moves.
+    /// Shared across rebuilds and unified-view switches so the followed
+    /// neighbour's precedence survives this view being recreated.
     cwd_follower: std::rc::Rc<std::cell::RefCell<herdr_sidebar::launch::CwdFollower>>,
+    history: std::rc::Rc<std::cell::RefCell<herdr_sidebar::viewnav::ViewHistory>>,
     /// Draft roots this pane loaded or successfully persisted. An empty box
     /// only clears one of these roots, so a stale sibling pane cannot erase a
     /// newer draft it never observed.
@@ -991,6 +987,7 @@ impl App {
     pub fn new(
         cwd: PathBuf,
         cwd_follower: std::rc::Rc<std::cell::RefCell<herdr_sidebar::launch::CwdFollower>>,
+        history: std::rc::Rc<std::cell::RefCell<herdr_sidebar::viewnav::ViewHistory>>,
     ) -> Self {
         let mut repos: Vec<Repo> = Git::discover_all(&cwd).into_iter().map(Repo::new).collect();
         let discover_err = if repos.is_empty() {
@@ -1094,8 +1091,8 @@ impl App {
             other_exe,
             pane_ctl,
             last_beat: std::time::Instant::now(),
-            picking: None,
             cwd_follower,
+            history,
             persisted_draft_roots,
             pending_unified_width: None,
             tree_view,
@@ -1111,10 +1108,6 @@ impl App {
         }
         app.scroll = saved_scroll.min(app.rows.len().saturating_sub(1));
         app
-    }
-
-    pub fn root_path(&self) -> &Path {
-        &self.cwd
     }
 
     fn active_repo(&self) -> Option<&Repo> {
@@ -1266,9 +1259,10 @@ impl App {
     }
 
     fn follow_sibling_cwd(&mut self) {
-        if !self.sidebar_state.follow_cwd
+        // The unified sidebar's stack owns roots; only a separated Source
+        // Control pane follows the focused neighbour.
+        if self.merged()
             || self.overlay.is_some()
-            || self.picking.is_some()
             || self.suggesting.is_some()
             || self.syncing.is_some()
             || commit_draft_present(self.repos.iter().map(|repo| repo.message.as_slice()))
@@ -1290,7 +1284,8 @@ impl App {
         }
         let root = std::env::current_dir().unwrap_or(target);
         let cwd_follower = std::rc::Rc::clone(&self.cwd_follower);
-        *self = App::new(root, cwd_follower);
+        let history = std::rc::Rc::clone(&self.history);
+        *self = App::new(root, cwd_follower, history);
     }
 
     /// Periodic timer tick: retry repo discovery if we started outside one,
@@ -2585,12 +2580,6 @@ impl App {
                 true,
             ),
             (
-                Setting::FollowCwd,
-                "Follow pane folder",
-                sidebar::follow_cwd_setting_value(self.sidebar_state.follow_cwd),
-                true,
-            ),
-            (
                 Setting::GitDecorations,
                 "Git decorations",
                 if self.sidebar_state.git_deco {
@@ -2616,15 +2605,6 @@ impl App {
                 Setting::ScmViewMode,
                 "View as",
                 if self.tree_view { "tree" } else { "list" }.to_string(),
-                true,
-            ),
-            (
-                Setting::Folder,
-                "Change folder…",
-                self.cwd
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| self.cwd.display().to_string()),
                 true,
             ),
         ]
@@ -2685,11 +2665,6 @@ impl App {
                 self.sidebar_state =
                     sidebar::update_state(|state| state.focus_on_open = !state.focus_on_open);
             }
-            Setting::FollowCwd => {
-                self.sidebar_state =
-                    sidebar::update_state(|state| state.follow_cwd = !state.follow_cwd);
-                self.cwd_follower.borrow_mut().reset();
-            }
             Setting::GitDecorations => {
                 self.sidebar_state =
                     sidebar::update_state(|state| state.git_deco = !state.git_deco);
@@ -2698,10 +2673,6 @@ impl App {
                 self.sidebar_state = sidebar::update_state(|state| {
                     state.show_git_footer = !state.show_git_footer;
                 });
-            }
-            Setting::Folder => {
-                self.overlay = None;
-                self.change_folder_dialog();
             }
         }
     }
@@ -2716,59 +2687,6 @@ impl App {
                 self.sidebar_state.sidebar_width,
                 self.sidebar_state.dock_right,
             );
-        }
-    }
-
-    /// The NATIVE folder picker on a background thread (the pane's liveness
-    /// heartbeat must keep beating while the dialog is open).
-    #[cfg(any(windows, target_os = "macos"))]
-    fn change_folder_dialog(&mut self) {
-        if self.picking.is_some() {
-            return;
-        }
-        let (tx, rx) = std::sync::mpsc::channel();
-        let start = self.cwd.clone();
-        std::thread::spawn(move || {
-            let _ = tx.send(herdr_sidebar::actions::pick_folder(&start));
-        });
-        self.picking = Some(rx);
-        self.flash = Some((
-            "folder picker open… (check your other windows)".into(),
-            false,
-        ));
-    }
-
-    #[cfg(not(any(windows, target_os = "macos")))]
-    fn change_folder_dialog(&mut self) {
-        self.flash = Some((
-            "no native picker here — use c in the Files view".into(),
-            true,
-        ));
-    }
-
-    /// Collect a finished folder pick, if any (called from the tick loop).
-    pub fn poll_picker(&mut self) {
-        let Some(rx) = &self.picking else { return };
-        match rx.try_recv() {
-            Ok(Some(path)) => {
-                self.picking = None;
-                if std::env::set_current_dir(&path).is_ok() {
-                    let root = std::env::current_dir().unwrap_or(path);
-                    if self.sidebar_state.follow_cwd {
-                        self.cwd_follower.borrow_mut().mark_manual_folder();
-                    }
-                    let cwd_follower = std::rc::Rc::clone(&self.cwd_follower);
-                    *self = App::new(root, cwd_follower);
-                } else {
-                    self.flash = Some((format!("cannot open {}", path.display()), true));
-                }
-            }
-            Ok(None) => {
-                self.picking = None;
-                self.flash = None;
-            }
-            Err(std::sync::mpsc::TryRecvError::Empty) => {}
-            Err(_) => self.picking = None,
         }
     }
 

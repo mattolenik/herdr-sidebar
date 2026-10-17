@@ -262,20 +262,12 @@ pub fn step_notice(forward: bool) -> Option<String> {
     }
 }
 
-/// The `tab-back` / `tab-forward` actions. A focused preview viewer gets the
-/// transport key so its in-document history goes first; anything else steps
-/// the tab history directly.
+/// The `tab-back` / `tab-forward` actions. A focused preview viewer or sidebar
+/// gets the transport key so its in-process history goes first (each falls
+/// through to [`step`] itself); anything else steps the tab history directly.
 pub fn action(forward: bool) -> io::Result<()> {
     let panes = ipc::call_text("pane.list", serde_json::json!({}))?;
-    let focused = launch::focused_pane_in(&panes, "")
-        .split_once('\t')
-        .map(|(pane, _)| pane.to_string())
-        .unwrap_or_default();
-    if !focused.is_empty()
-        && crate::viewer::previews_in(&panes)
-            .iter()
-            .any(|preview| preview.pane_id == focused)
-    {
+    if let Some(focused) = transport_target(&panes) {
         let key = if forward { FORWARD_KEY } else { BACK_KEY };
         ipc::call_text(
             "pane.send_input",
@@ -284,6 +276,19 @@ pub fn action(forward: bool) -> io::Result<()> {
         return Ok(());
     }
     step(forward).map(|_| ()).map_err(io::Error::other)
+}
+
+/// The focused pane, when it is one of ours that keeps its own history.
+fn transport_target(panes: &str) -> Option<String> {
+    let focused = launch::focused_pane_in(panes, "")
+        .split_once('\t')
+        .map(|(pane, _)| pane.to_string())
+        .filter(|pane| !pane.is_empty())?;
+    (launch::pane_has_token(panes, &focused)
+        || crate::viewer::previews_in(panes)
+            .iter()
+            .any(|preview| preview.pane_id == focused))
+    .then_some(focused)
 }
 
 /// Which way a key steps the history, if it is one of ours: the transport
@@ -444,6 +449,20 @@ mod tests {
         assert_eq!(j.panes.len(), CAP);
         assert_eq!(j.entries[0], "w1:t10");
         assert_eq!(j.index, CAP - 1);
+    }
+
+    #[test]
+    fn action_sends_transport_key_to_a_focused_sidebar() {
+        let list = |tokens: &str| {
+            format!(
+                r#"{{"result":{{"panes":[{{"pane_id":"w1:p1","tab_id":"w1:t1","cwd":"/r","focused":true,"tokens":{{{tokens}}}}},{{"pane_id":"w1:p2","tab_id":"w1:t1","cwd":"/r"}}]}}}}"#
+            )
+        };
+        let sidebar = list(r#""herdr-sidebar-explorer":"1""#);
+        assert_eq!(transport_target(&sidebar).as_deref(), Some("w1:p1"));
+        let git = list(r#""herdr-sidebar-git":"1""#);
+        assert_eq!(transport_target(&git).as_deref(), Some("w1:p1"));
+        assert_eq!(transport_target(&list("")), None); // a shell steps directly
     }
 
     #[test]

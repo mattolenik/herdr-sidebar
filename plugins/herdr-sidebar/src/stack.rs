@@ -86,14 +86,21 @@ pub fn chrome_rows(index: usize) -> u16 {
 /// else equal split. Auto-folds from the bottom until every unfolded group has
 /// at least MIN_BODY_ROWS of body.
 pub fn allocate(folded: &[bool], body_rows: u16, dragged: Option<&[u16]>) -> Allocation {
-    let n = folded.len();
+    let mut a = equal_split(folded, body_rows);
+    // Checked against the COMPUTED fold pattern (manual and auto folds), so a drag still
+    // holds while some other group is auto-folded.
     if let Some(d) = dragged
-        && d.len() == n
+        && d.len() == a.folded.len()
         && d.iter().sum::<u16>() == body_rows
-        && (0..n).all(|i| if folded[i] { d[i] == chrome_rows(i) } else { d[i] >= chrome_rows(i) + MIN_BODY_ROWS })
+        && (0..d.len()).all(|i| if a.folded[i] { d[i] == chrome_rows(i) } else { d[i] >= chrome_rows(i) + MIN_BODY_ROWS })
     {
-        return Allocation { heights: d.to_vec(), folded: folded.to_vec() };
+        a.heights = d.to_vec();
     }
+    a
+}
+
+fn equal_split(folded: &[bool], body_rows: u16) -> Allocation {
+    let n = folded.len();
     let mut fold = folded.to_vec();
     let chrome_total: u16 = (0..n).map(chrome_rows).sum();
     if body_rows < chrome_total {
@@ -257,6 +264,12 @@ mod tests {
         assert_eq!(a.heights, vec![6, 14]);
         let a = allocate(&[false, false], 20, Some(&[3, 17]));
         assert_eq!(a.heights, vec![10, 10]);
+    }
+    #[test] fn allocate_honors_dragged_heights_with_an_auto_folded_group() {
+        assert_eq!(allocate(&[false; 3], 12, None).heights, vec![5, 5, 2]);
+        let a = allocate(&[false; 3], 12, Some(&[4, 6, 2]));
+        assert_eq!(a.heights, vec![4, 6, 2]);
+        assert_eq!(a.folded, vec![false, false, true]);
     }
     #[test] fn allocate_survives_fewer_rows_than_headers() {
         let a = allocate(&[false; 5], 3, None);

@@ -1618,6 +1618,7 @@ impl App {
                 state.active = View::Explorer;
                 state.search_active = false;
             });
+            self.history.borrow_mut().visit(ViewEntry::Stack);
             return Some(Exit::QuickOpen);
         }
         // View switching has to reach past the commit message box, where bare
@@ -3447,7 +3448,13 @@ impl App {
             }
             Some(ViewEntry::Git(root)) if root == self.cwd => None,
             Some(ViewEntry::Git(root)) => {
-                self.sidebar_state = sidebar::update_state(|s| s.active_repo = Some(root));
+                // Exit::Switch re-reads the SHARED `active`, which another sidebar may
+                // have changed: pin it to this view too.
+                self.sidebar_state = sidebar::update_state(|s| {
+                    s.active = View::SourceControl;
+                    s.search_active = false;
+                    s.active_repo = Some(root);
+                });
                 Some(Exit::Switch)
             }
             None => {
@@ -5426,6 +5433,43 @@ fn no_repo_layout(area: Rect, merged: bool) -> [Rect; 2] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scm_history_step_stack_and_other_repo() {
+        use crate::explorer_app::tests::{scratch_dir, with_scratch_state};
+        use std::{cell::RefCell, rc::Rc};
+        with_scratch_state(|_| {
+            let cwd = scratch_dir("scm-hist");
+            let follower = Rc::new(RefCell::new(herdr_sidebar::launch::CwdFollower::default()));
+            let h = Rc::new(RefCell::new(herdr_sidebar::viewnav::ViewHistory::new()));
+            h.borrow_mut().visit(ViewEntry::Git("/other".into()));
+            h.borrow_mut().visit(ViewEntry::Git(cwd.clone()));
+            let mut app = App::new(cwd.clone(), Rc::clone(&follower), Rc::clone(&h));
+            app.sidebar_state.merged = true;
+            app.other_exe = Some(std::env::current_exe().unwrap());
+
+            // Another sidebar process moved the shared view meanwhile.
+            sidebar::update_state(|s| {
+                s.active = View::Explorer;
+                s.search_active = true;
+            });
+            assert_eq!(app.history_step(false), Some(Exit::Switch));
+            let state = sidebar::load_state();
+            assert_eq!(state.active, View::SourceControl);
+            assert!(!state.search_active);
+            assert_eq!(state.active_repo, Some("/other".into()));
+
+            // Quick Open from the git view records the stack it lands on.
+            let ctrl_p = KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL);
+            assert_eq!(app.on_key(ctrl_p), Some(Exit::QuickOpen));
+            assert_eq!(h.borrow().current(), &ViewEntry::Stack);
+            assert_eq!(
+                h.borrow_mut().back(),
+                Some(&ViewEntry::Git("/other".into()))
+            );
+            let _ = std::fs::remove_dir_all(&cwd);
+        });
+    }
 
     #[test]
     fn clean_diverged_repo_uses_sync_as_the_primary_action() {

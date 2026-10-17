@@ -430,6 +430,7 @@ fn run_explorer(
                 if exit == Exit::Quit {
                     app.clear_identity();
                 }
+                app.save_layout();
                 return Ok(exit);
             }
         }

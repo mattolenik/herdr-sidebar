@@ -405,10 +405,14 @@ impl Region {
         }
     }
 
-    /// Adopt another sidebar's expansion/selection for these roots.
-    fn sync_shared(&mut self) -> bool {
+    /// Adopt another sidebar's expansion for these roots, and its selection only
+    /// when `focused` (spec: only the focused region restores a selected row).
+    fn sync_shared(&mut self, focused: bool) -> bool {
         let changed = if self.trees.len() == 1 {
-            let shared = sidebar::load_tree_state(&self.trees[0].root_path());
+            let mut shared = sidebar::load_tree_state(&self.trees[0].root_path());
+            if !focused {
+                shared.selected = self.selected_row().map(|row| row.path.clone());
+            }
             apply_shared_tree_state(
                 &mut self.trees[0],
                 &mut self.rows,
@@ -417,7 +421,7 @@ impl Region {
                 shared,
             )
         } else {
-            self.sync_shared_multi()
+            self.sync_shared_multi(focused)
         };
         if changed {
             self.hovered = None;
@@ -428,7 +432,7 @@ impl Region {
 
     /// `apply_shared_tree_state` across every root: each tree adopts its own
     /// saved expansion; the selection follows whichever root saved one.
-    fn sync_shared_multi(&mut self) -> bool {
+    fn sync_shared_multi(&mut self, focused: bool) -> bool {
         let current = self.selected_row().map(|row| row.path.clone());
         let mut expansion_changed = false;
         let mut wanted = None;
@@ -443,6 +447,9 @@ impl Region {
                 expansion_changed = true;
             }
             wanted = wanted.or(shared.selected);
+        }
+        if !focused {
+            wanted = current.clone();
         }
         if expansion_changed {
             self.rebuild();
@@ -629,6 +636,22 @@ enum Setting {
 /// don't toggle.
 type SettingRow = (Setting, &'static str, String, bool);
 
+/// The stack layout a git-view round trip must not lose: kept process-local (heights
+/// are deliberately never persisted) and adopted by the next Explorer `App` only when
+/// its group key set is the same.
+struct StackLayout {
+    /// Group keys in region order.
+    keys: Vec<PathBuf>,
+    folded: BTreeSet<PathBuf>,
+    heights: Option<Vec<u16>>,
+    focused_key: PathBuf,
+}
+
+thread_local! {
+    static LAYOUT_MEMO: std::cell::RefCell<Option<StackLayout>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 pub struct App {
     /// The tree regions, one per group, drawn stacked.
     regions: Vec<Region>,
@@ -644,6 +667,8 @@ pub struct App {
     alloc: stack::Allocation,
     /// The directory this sidebar was spawned in.
     spawn_cwd: PathBuf,
+    /// The previous Explorer's layout, offered to the first group sample.
+    layout_memo: Option<StackLayout>,
     /// Repository root owning each stack root (`None` = not in a repo), so a
     /// stack sample runs `git rev-parse` only for roots it has not seen.
     owner_cache: HashMap<PathBuf, Option<PathBuf>>,
@@ -805,6 +830,7 @@ impl App {
                 folded: Vec::new(),
             },
             spawn_cwd,
+            layout_memo: LAYOUT_MEMO.with(|memo| memo.borrow_mut().take()),
             owner_cache,
             theme,
             pane_ctl,
@@ -851,8 +877,41 @@ impl App {
         };
         app.rediscover_repos();
         app.apply_identity();
+        // Sample now so the first draw shows the whole stack, not the spawn tree alone.
+        app.sample_stack();
         app.request_decorations(true);
         app
+    }
+
+    /// Remember the stack layout for the next Explorer `App` in this process.
+    pub fn save_layout(&self) {
+        let layout = StackLayout {
+            keys: self.regions.iter().map(|r| r.group.key.clone()).collect(),
+            folded: self.folded.clone(),
+            heights: self.heights.clone(),
+            focused_key: self.region().group.key.clone(),
+        };
+        LAYOUT_MEMO.with(|memo| *memo.borrow_mut() = Some(layout));
+    }
+
+    /// Adopt the remembered layout once, if it describes exactly these groups.
+    fn restore_layout(&mut self) {
+        let Some(memo) = self.layout_memo.take() else {
+            return;
+        };
+        let keys: BTreeSet<&PathBuf> = self.regions.iter().map(|r| &r.group.key).collect();
+        if keys != memo.keys.iter().collect() {
+            return;
+        }
+        self.regions
+            .sort_by_key(|r| memo.keys.iter().position(|k| *k == r.group.key));
+        self.focused = self
+            .regions
+            .iter()
+            .position(|r| r.group.key == memo.focused_key)
+            .unwrap_or(0);
+        self.folded = memo.folded;
+        self.heights = memo.heights;
     }
 
     fn region(&self) -> &Region {
@@ -974,8 +1033,8 @@ impl App {
             return;
         }
         self.last_tree_sync = std::time::Instant::now();
-        for region in &mut self.regions {
-            region.sync_shared();
+        for (i, region) in self.regions.iter_mut().enumerate() {
+            region.sync_shared(i == self.focused);
         }
     }
 
@@ -1178,6 +1237,9 @@ impl App {
         let unchanged = groups.len() == self.regions.len()
             && groups.iter().zip(&self.regions).all(|(g, r)| *g == r.group);
         if unchanged || groups.is_empty() {
+            if unchanged {
+                self.restore_layout();
+            }
             return false;
         }
         let show_hidden = self.region().show_hidden();
@@ -1209,6 +1271,7 @@ impl App {
             .unwrap_or_else(|| self.focused.min(self.regions.len() - 1));
         self.heights = None;
         self.dragging = None;
+        self.restore_layout();
         self.invalidate_quick_index();
         self.rediscover_repos();
         self.request_decorations(true);
@@ -1781,6 +1844,8 @@ impl App {
                 if let Some(boundary) = self.dragging
                     && let Some(zones) = self.group_zones.get(boundary)
                 {
+                    // Measured from the divider row of the LAST DRAW: relies on main.rs
+                    // drawing between events; batching drags without a redraw double-moves.
                     let delta = i32::from(mouse.row) - i32::from(zones.divider.y);
                     stack::drag(&mut self.alloc, boundary, delta);
                     self.heights = Some(self.alloc.heights.clone());
@@ -4996,16 +5061,32 @@ fn collect_quick_files(root: &Path, show_hidden: bool, limit: usize) -> (Vec<Qui
     (files, truncated)
 }
 
-/// Label prefix for a hit/file under `root`: "" with one group, else "<group name>/".
+/// Label prefix for a hit/file under `root`: "" with one group, else "<group name>/",
+/// plus the root's row name ("<root rel to key>/") in a multi-root group. A group whose
+/// name another group shares is named by its full key instead.
 fn stack_label_prefix(groups: &[stack::Group], root: &Path) -> String {
     if groups.len() <= 1 {
         return String::new();
     }
-    groups
+    let Some(group) = groups
         .iter()
         .find(|group| group.roots.iter().any(|r| r == root))
-        .map(|group| format!("{}/", group.name()))
-        .unwrap_or_default()
+    else {
+        return String::new();
+    };
+    let name = group.name();
+    let mut prefix = if groups.iter().filter(|g| g.name() == name).count() > 1 {
+        format!("{}/", group.key.display().to_string().trim_end_matches('/'))
+    } else {
+        format!("{name}/")
+    };
+    let rel = root.strip_prefix(&group.key).unwrap_or(root);
+    if group.roots.len() > 1 && !rel.as_os_str().is_empty() {
+        let parts: Vec<_> = rel.iter().map(|c| c.to_string_lossy()).collect();
+        prefix.push_str(&parts.join("/"));
+        prefix.push('/');
+    }
+    prefix
 }
 
 fn prefix_label(prefix: &str, label: &mut String) {
@@ -5635,7 +5716,7 @@ fn replace_rows(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use herdr_sidebar::viewnav::ViewHistory;
     use std::cell::RefCell;
@@ -5658,6 +5739,25 @@ mod tests {
             },
         ];
         assert_eq!(stack_label_prefix(&two, Path::new("/w/mono/apps")), "mono/");
+    }
+
+    #[test]
+    fn labels_disambiguate_roots_within_a_group_and_same_named_groups() {
+        let g = |key: &str, roots: &[&str]| stack::Group {
+            key: key.into(),
+            repo: true,
+            roots: roots.iter().map(PathBuf::from).collect(),
+        };
+        let groups = vec![
+            g("/w/mono", &["/w/mono/apps/web", "/w/mono/apps/api"]),
+            g("/x/app", &["/x/app"]),
+            g("/y/app", &["/y/app"]),
+        ];
+        let at = |root: &str| stack_label_prefix(&groups, Path::new(root));
+        assert_eq!(at("/w/mono/apps/web"), "mono/apps/web/");
+        assert_eq!(at("/w/mono/apps/api"), "mono/apps/api/");
+        assert_eq!(at("/x/app"), "/x/app/");
+        assert_eq!(at("/y/app"), "/y/app/");
     }
 
     #[test]
@@ -5716,7 +5816,7 @@ mod tests {
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// A fresh, empty directory unique to this test process and tag.
-    fn scratch_dir(tag: &str) -> PathBuf {
+    pub(crate) fn scratch_dir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "herdr-sidebar-{tag}-{}-{}",
             std::process::id(),
@@ -5797,7 +5897,7 @@ mod tests {
 
     /// Run `f` with the plugin state dir pointed at a fresh scratch dir and the
     /// icon theme pinned (so `App::new` skips the font probe), restoring both after.
-    fn with_scratch_state(f: impl FnOnce(&Path)) {
+    pub(crate) fn with_scratch_state(f: impl FnOnce(&Path)) {
         let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let state = scratch_dir("state");
         // HERDR_PANE_ID / HERDR_ENV are cleared and the socket pointed at a
@@ -6044,6 +6144,79 @@ mod tests {
         let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(40, 30)).unwrap();
         term.draw(|f| app.draw(f)).unwrap();
         (app, term, a, b)
+    }
+
+    #[test]
+    fn fresh_app_restores_layout_memo_for_the_same_groups() {
+        with_scratch_state(|_| {
+            let (a, b, c) = (
+                scratch_dir("memo-a"),
+                scratch_dir("memo-b"),
+                scratch_dir("memo-c"),
+            );
+            let g = |k: &PathBuf| stack::Group {
+                key: k.clone(),
+                repo: false,
+                roots: vec![k.clone()],
+            };
+            let fresh = || App::new(a.clone(), Rc::new(RefCell::new(ViewHistory::new())));
+            let mut app = fresh();
+            app.apply_groups(vec![g(&a), g(&b)]);
+            app.folded.insert(a.clone());
+            app.heights = Some(vec![1, 20]);
+            app.focus_region(1);
+            app.save_layout();
+
+            let mut app = fresh();
+            app.apply_groups(vec![g(&b), g(&a)]);
+            let keys: Vec<_> = app.regions.iter().map(|r| r.group.key.clone()).collect();
+            assert_eq!(keys, vec![a.clone(), b.clone()]);
+            assert_eq!(app.folded, BTreeSet::from([a.clone()]));
+            assert_eq!(app.heights, Some(vec![1, 20]));
+            assert_eq!(app.focused, 1);
+            app.save_layout();
+
+            let mut app = fresh();
+            app.apply_groups(vec![g(&a), g(&c)]);
+            assert!(app.folded.is_empty());
+            assert_eq!(app.heights, None);
+            assert_eq!(app.focused, 0);
+            for dir in [&a, &b, &c] {
+                let _ = std::fs::remove_dir_all(dir);
+            }
+        });
+    }
+
+    #[test]
+    fn unfocused_region_stays_unselected_after_sync() {
+        with_scratch_state(|_| {
+            let (mut app, _term, a, b) = two_group_app("sync-sel");
+            std::fs::write(a.join("one.txt"), "").unwrap();
+            std::fs::write(b.join("two.txt"), "").unwrap();
+            app.regions.iter_mut().for_each(Region::refresh);
+            app.regions.iter_mut().for_each(Region::rebuild);
+            let save = |root: &PathBuf, file: &str| {
+                sidebar::save_tree_state(
+                    root,
+                    &sidebar::TreeState {
+                        expanded: Vec::new(),
+                        selected: Some(root.join(file)),
+                    },
+                )
+            };
+            save(&a, "one.txt");
+            save(&b, "two.txt");
+            app.last_tree_sync = std::time::Instant::now() - TREE_SYNC_EVERY;
+            app.sync_shared_tree();
+            assert_eq!(app.focused, 0);
+            assert_eq!(app.regions[1].selected, None);
+            assert_eq!(
+                app.regions[0].selected_row().map(|r| r.path.clone()),
+                Some(a.join("one.txt"))
+            );
+            let _ = std::fs::remove_dir_all(&a);
+            let _ = std::fs::remove_dir_all(&b);
+        });
     }
 
     #[test]

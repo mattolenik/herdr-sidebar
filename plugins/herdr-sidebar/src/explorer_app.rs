@@ -2,7 +2,7 @@
 //! nested indentation, per-file-type icons, and a VS Code-like hide/show command
 //! (`b`) when the user wants the columns back.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
 use crossterm::event::{
@@ -180,6 +180,16 @@ struct Region {
     /// Row index under the mouse cursor, for the hover highlight.
     hovered: Option<usize>,
     body: BodyGeom,
+    /// Multi-root groups: roots whose root row is folded shut.
+    collapsed_roots: BTreeSet<PathBuf>,
+}
+
+/// A tree for `root` with its saved expansion.
+fn open_tree(root: &Path, state: &sidebar::TreeState, show_hidden: bool) -> Tree {
+    let mut tree = Tree::new(root.to_path_buf());
+    tree.show_hidden = show_hidden;
+    tree.set_expanded(state.expanded.clone());
+    tree
 }
 
 impl Region {
@@ -195,12 +205,7 @@ impl Region {
             .roots
             .iter()
             .zip(&saved)
-            .map(|(root, state)| {
-                let mut tree = Tree::new(root.clone());
-                tree.show_hidden = show_hidden;
-                tree.set_expanded(state.expanded.clone());
-                tree
-            })
+            .map(|(root, state)| open_tree(root, state, show_hidden))
             .collect();
         let mut region = Self {
             group,
@@ -211,6 +216,7 @@ impl Region {
             snap: false,
             hovered: None,
             body: BodyGeom::default(),
+            collapsed_roots: BTreeSet::new(),
         };
         region.rebuild();
         region.selected = saved
@@ -223,15 +229,94 @@ impl Region {
 
     /// Recompute visible rows, keeping the selection on the same path when it
     /// still exists (else the nearest valid index).
+    /// Multi-root groups get one depth-0 row per root (named relative to the
+    /// group key), its tree's rows following one level deeper unless folded.
     fn rebuild(&mut self) {
         self.hovered = None;
-        // ponytail: single-root rows; Task 6 adds root rows for multi-root groups.
-        rebuild_tree_rows(
-            &mut self.trees[0],
-            &mut self.rows,
-            &mut self.selected,
-            &mut self.scroll,
-        );
+        if self.trees.len() == 1 {
+            rebuild_tree_rows(
+                &mut self.trees[0],
+                &mut self.rows,
+                &mut self.selected,
+                &mut self.scroll,
+            );
+            return;
+        }
+        let mut fresh = Vec::new();
+        for (root, tree) in self.group.roots.iter().zip(&mut self.trees) {
+            let expanded = !self.collapsed_roots.contains(root);
+            let rel = root.strip_prefix(&self.group.key).unwrap_or(root);
+            let name: Vec<_> = rel.iter().map(|c| c.to_string_lossy()).collect();
+            fresh.push(Row {
+                path: root.clone(),
+                name: if name.is_empty() {
+                    tree.root_name()
+                } else {
+                    name.join("/")
+                },
+                is_dir: true,
+                is_symlink: false,
+                depth: 0,
+                expanded,
+            });
+            if expanded {
+                fresh.extend(tree.rows().into_iter().map(|mut row| {
+                    row.depth += 1;
+                    row
+                }));
+            }
+        }
+        replace_rows(&mut self.rows, fresh, &mut self.selected, &mut self.scroll);
+    }
+
+    /// A multi-root group's synthetic root row.
+    #[allow(dead_code)] // brief interface; no caller until root rows get their own menu
+    fn is_root_row(&self, index: usize) -> bool {
+        self.trees.len() > 1 && self.rows.get(index).is_some_and(|row| row.depth == 0)
+    }
+
+    /// Expand (`Some(true)`), collapse (`Some(false)`) or flip (`None`) the
+    /// directory at `path`; a root row folds its whole tree.
+    fn set_open(&mut self, path: &Path, open: Option<bool>) {
+        if self.trees.len() > 1 && self.group.roots.iter().any(|root| root == path) {
+            if open.unwrap_or(self.collapsed_roots.contains(path)) {
+                self.collapsed_roots.remove(path);
+            } else {
+                self.collapsed_roots.insert(path.to_path_buf());
+            }
+            return;
+        }
+        let tree = self.tree_mut(path);
+        match open {
+            Some(true) => tree.expand(path),
+            Some(false) => tree.collapse(path),
+            None => tree.toggle(path),
+        }
+    }
+
+    /// Take a new root list for the same group key, keeping the trees of
+    /// roots that survive.
+    fn set_roots(&mut self, group: stack::Group) {
+        if group.roots == self.group.roots {
+            self.group = group;
+            return;
+        }
+        let show_hidden = self.show_hidden();
+        let mut old = std::mem::take(&mut self.trees);
+        self.trees = group
+            .roots
+            .iter()
+            .map(
+                |root| match old.iter().position(|t| t.root_path() == *root) {
+                    Some(i) => old.swap_remove(i),
+                    None => open_tree(root, &sidebar::load_tree_state(root), show_hidden),
+                },
+            )
+            .collect();
+        self.collapsed_roots
+            .retain(|root| group.roots.contains(root));
+        self.group = group;
+        self.rebuild();
     }
 
     /// Index of the tree whose root is the longest prefix of `path`.
@@ -287,20 +372,55 @@ impl Region {
 
     /// Adopt another sidebar's expansion/selection for these roots.
     fn sync_shared(&mut self) -> bool {
-        // ponytail: single-root sync; Task 6 extends it to every root's rows.
-        let shared = sidebar::load_tree_state(&self.trees[0].root_path());
-        let changed = apply_shared_tree_state(
-            &mut self.trees[0],
-            &mut self.rows,
-            &mut self.selected,
-            &mut self.scroll,
-            shared,
-        );
+        let changed = if self.trees.len() == 1 {
+            let shared = sidebar::load_tree_state(&self.trees[0].root_path());
+            apply_shared_tree_state(
+                &mut self.trees[0],
+                &mut self.rows,
+                &mut self.selected,
+                &mut self.scroll,
+                shared,
+            )
+        } else {
+            self.sync_shared_multi()
+        };
         if changed {
             self.hovered = None;
             self.snap = self.selected.is_some();
         }
         changed
+    }
+
+    /// `apply_shared_tree_state` across every root: each tree adopts its own
+    /// saved expansion; the selection follows whichever root saved one.
+    fn sync_shared_multi(&mut self) -> bool {
+        let current = self.selected_row().map(|row| row.path.clone());
+        let mut expansion_changed = false;
+        let mut wanted = None;
+        for tree in &mut self.trees {
+            let root = tree.root_path();
+            let mut shared = sidebar::load_tree_state(&root);
+            shared.expanded.retain(|path| path.starts_with(&root));
+            shared.expanded.sort();
+            shared.expanded.dedup();
+            if tree.expanded_paths() != shared.expanded {
+                tree.set_expanded(shared.expanded);
+                expansion_changed = true;
+            }
+            wanted = wanted.or(shared.selected);
+        }
+        if expansion_changed {
+            self.rebuild();
+        }
+        let position = |path: &PathBuf| self.rows.iter().position(|row| &row.path == path);
+        let desired =
+            wanted.and_then(|path| position(&path).or_else(|| current.as_ref().and_then(position)));
+        let selection_changed =
+            current.as_ref() != desired.and_then(|i| self.rows.get(i)).map(|row| &row.path);
+        if selection_changed {
+            self.selected = desired;
+        }
+        expansion_changed || selection_changed
     }
 
     /// Apply queued filesystem events on every tree; true if any listing changed.
@@ -480,6 +600,9 @@ pub struct App {
     focused: usize,
     /// The directory this sidebar was spawned in.
     spawn_cwd: PathBuf,
+    /// Repository root owning each stack root (`None` = not in a repo), so a
+    /// stack sample runs `git rev-parse` only for roots it has not seen.
+    owner_cache: HashMap<PathBuf, Option<PathBuf>>,
     theme: IconTheme,
     pane_ctl: Option<PaneCtl>,
     /// Pane size from the last draw; sizing decisions and PageUp/PageDown
@@ -627,10 +750,13 @@ impl App {
         let other_exe = std::env::current_exe().ok();
         let sidebar_state = sidebar::load_state();
         set_color_theme(sidebar_state.color_theme);
+        let owner_cache =
+            HashMap::from([(spawn_cwd.clone(), owner.map(|git| git.root().to_path_buf()))]);
         let mut app = Self {
             regions,
             focused: 0,
             spawn_cwd,
+            owner_cache,
             theme,
             pane_ctl,
             last_width: sidebar_state.sidebar_width,
@@ -946,6 +1072,73 @@ impl App {
         if let Some(ctl) = &self.pane_ctl {
             ctl.report_tokens(MY_VIEW, self.merged());
         }
+        if matches!(self.overlay, None | Some(Overlay::ContentSearch { .. })) {
+            self.sample_stack();
+        }
+    }
+
+    /// Follow the tab's panes: one `pane.list` round trip, then group the
+    /// roots and diff them into `regions`.
+    fn sample_stack(&mut self) {
+        let Some(pane_id) = self.pane_ctl.as_ref().map(|ctl| ctl.pane_id.clone()) else {
+            return;
+        };
+        let Ok(json) = ipc::call_text("pane.list", serde_json::json!({})) else {
+            return;
+        };
+        let Some(mut roots) = stack::stack_roots(&json, &pane_id) else {
+            return;
+        };
+        if roots.is_empty() {
+            roots.push(self.spawn_cwd.clone());
+        }
+        self.owner_cache.retain(|root, _| roots.contains(root));
+        for root in &roots {
+            self.owner_cache
+                .entry(root.clone())
+                .or_insert_with(|| Git::owner_of(root).ok().map(|git| git.root().to_path_buf()));
+        }
+        let current: Vec<stack::Group> = self.regions.iter().map(|r| r.group.clone()).collect();
+        let cache = &self.owner_cache;
+        let groups =
+            stack::group_roots(&roots, |root| cache.get(root).cloned().flatten(), &current);
+        self.apply_groups(groups);
+    }
+
+    /// Keep regions whose group key survives (updating their roots), drop the
+    /// rest, create new ones; true when the group set or any root list changed.
+    fn apply_groups(&mut self, groups: Vec<stack::Group>) -> bool {
+        let unchanged = groups.len() == self.regions.len()
+            && groups.iter().zip(&self.regions).all(|(g, r)| *g == r.group);
+        if unchanged || groups.is_empty() {
+            return false;
+        }
+        let show_hidden = self.region().show_hidden();
+        let mut old = std::mem::take(&mut self.regions);
+        self.regions = groups
+            .into_iter()
+            .map(
+                |group| match old.iter().position(|r| r.group.key == group.key) {
+                    Some(i) => {
+                        let mut region = old.swap_remove(i);
+                        region.set_roots(group);
+                        region
+                    }
+                    None => {
+                        // tree.json's selection is restored only for the startup region.
+                        let mut region = Region::new(group, show_hidden);
+                        region.selected = None;
+                        region.snap = false;
+                        region
+                    }
+                },
+            )
+            .collect();
+        self.focused = self.focused.min(self.regions.len() - 1);
+        self.invalidate_quick_index();
+        self.rediscover_repos();
+        self.request_decorations(true);
+        true
     }
 
     fn poll_unified_close(&mut self) -> bool {
@@ -3223,7 +3416,7 @@ impl App {
         match result {
             Ok(created) => {
                 if let PromptKind::NewFile(dir) | PromptKind::NewFolder(dir) = &kind {
-                    self.region_mut().tree_mut(dir).expand(dir);
+                    self.region_mut().set_open(dir, Some(true));
                 }
                 self.refresh_tree();
                 if let Some(index) = self.region().rows.iter().position(|r| r.path == created) {
@@ -3347,7 +3540,7 @@ impl App {
             }
         } else {
             let path = row.path.clone();
-            self.region_mut().tree_mut(&path).expand(&path);
+            self.region_mut().set_open(&path, Some(true));
             self.rebuild();
         }
     }
@@ -3359,7 +3552,7 @@ impl App {
         };
         if row.is_dir && row.expanded {
             let path = row.path.clone();
-            self.region_mut().tree_mut(&path).collapse(&path);
+            self.region_mut().set_open(&path, Some(false));
             self.rebuild();
             return;
         }
@@ -3386,7 +3579,7 @@ impl App {
             self.open_preview(&path);
             return;
         }
-        self.region_mut().tree_mut(&path).toggle(&path);
+        self.region_mut().set_open(&path, None);
         self.rebuild();
     }
 
@@ -5020,8 +5213,20 @@ fn rebuild_tree_rows(
     selected: &mut Option<usize>,
     scroll: &mut usize,
 ) {
+    let fresh = tree.rows();
+    replace_rows(rows, fresh, selected, scroll);
+}
+
+/// Swap in `fresh` rows, keeping the selection on the same path when it still
+/// exists (else the nearest valid index).
+fn replace_rows(
+    rows: &mut Vec<Row>,
+    fresh: Vec<Row>,
+    selected: &mut Option<usize>,
+    scroll: &mut usize,
+) {
     let selected_path = selected.and_then(|index| rows.get(index).map(|row| row.path.clone()));
-    *rows = tree.rows();
+    *rows = fresh;
     if rows.is_empty() {
         *selected = None;
         *scroll = 0;
@@ -5058,34 +5263,159 @@ mod tests {
         dir
     }
 
-    #[test]
-    fn single_root_region_rows_match_the_tree() {
+    /// Run `f` with the plugin state dir pointed at a fresh scratch dir and the
+    /// icon theme pinned (so `App::new` skips the font probe), restoring both after.
+    fn with_scratch_state(f: impl FnOnce(&Path)) {
         let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let state = scratch_dir("single-root-state");
+        let state = scratch_dir("state");
+        let vars = ["HERDR_PLUGIN_STATE_DIR", "HERDR_SIDEBAR_ICONS"];
+        let saved: Vec<_> = vars.iter().map(std::env::var_os).collect();
         // SAFETY: env edits are serialized by ENV_LOCK within this module.
         unsafe {
-            std::env::set_var("HERDR_PLUGIN_STATE_DIR", &state);
-            std::env::set_var("HERDR_SIDEBAR_ICONS", "emoji");
+            std::env::set_var(vars[0], &state);
+            std::env::set_var(vars[1], "emoji");
         }
-        let dir = scratch_dir("single-root");
-        std::fs::write(dir.join("a.txt"), "").unwrap();
-        let group = stack::Group {
-            key: dir.clone(),
-            repo: false,
-            roots: vec![dir.clone()],
-        };
-        let region = Region::new(group, false);
-        assert_eq!(
-            region
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(&state)));
+        for (var, value) in vars.iter().zip(saved) {
+            // SAFETY: as above.
+            unsafe {
+                match value {
+                    Some(v) => std::env::set_var(var, v),
+                    None => std::env::remove_var(var),
+                }
+            }
+        }
+        let _ = std::fs::remove_dir_all(&state);
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
+    }
+
+    #[test]
+    fn single_root_region_rows_match_the_tree() {
+        with_scratch_state(|_| {
+            let dir = scratch_dir("single-root");
+            std::fs::write(dir.join("a.txt"), "").unwrap();
+            let group = stack::Group {
+                key: dir.clone(),
+                repo: false,
+                roots: vec![dir.clone()],
+            };
+            let region = Region::new(group, false);
+            assert_eq!(
+                region
+                    .rows
+                    .iter()
+                    .map(|r| r.name.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["a.txt"]
+            );
+            assert_eq!(region.tree_for(&dir.join("a.txt")), Some(0));
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
+
+    #[test]
+    fn multi_root_region_shows_root_rows_with_relative_names() {
+        with_scratch_state(|_| {
+            let base = scratch_dir("multi-root");
+            for sub in ["apps/web", "apps/api"] {
+                std::fs::create_dir_all(base.join(sub).join("src")).unwrap();
+            }
+            let group = stack::Group {
+                key: base.clone(),
+                repo: true,
+                roots: vec![base.join("apps/api"), base.join("apps/web")],
+            };
+            let region = Region::new(group, false);
+            let names: Vec<_> = region
                 .rows
                 .iter()
-                .map(|r| r.name.as_str())
-                .collect::<Vec<_>>(),
-            vec!["a.txt"]
-        );
-        assert_eq!(region.tree_for(&dir.join("a.txt")), Some(0));
-        let _ = std::fs::remove_dir_all(&dir);
-        let _ = std::fs::remove_dir_all(&state);
+                .map(|r| (r.name.as_str(), r.depth))
+                .collect();
+            assert_eq!(
+                names,
+                vec![("apps/api", 0), ("src", 1), ("apps/web", 0), ("src", 1)]
+            );
+            assert!(region.is_root_row(0) && !region.is_root_row(1));
+            assert_eq!(region.tree_for(&base.join("apps/web/src")), Some(1));
+            let _ = std::fs::remove_dir_all(&base);
+        });
+    }
+
+    #[test]
+    fn collapsing_a_root_row_hides_its_tree() {
+        with_scratch_state(|_| {
+            let base = scratch_dir("multi-root-fold");
+            for sub in ["a", "b"] {
+                std::fs::create_dir_all(base.join(sub).join("x")).unwrap();
+            }
+            let mut region = Region::new(
+                stack::Group {
+                    key: base.clone(),
+                    repo: false,
+                    roots: vec![base.join("a"), base.join("b")],
+                },
+                false,
+            );
+            region.collapsed_roots.insert(base.join("a"));
+            region.rebuild();
+            assert_eq!(
+                region
+                    .rows
+                    .iter()
+                    .map(|r| r.name.as_str())
+                    .collect::<Vec<_>>(),
+                vec!["a", "b", "x"]
+            );
+            assert!(!region.rows[0].expanded);
+            let _ = std::fs::remove_dir_all(&base);
+        });
+    }
+
+    #[test]
+    fn region_for_missing_directory_renders_empty() {
+        with_scratch_state(|_| {
+            let gone = scratch_dir("gone").join("nope");
+            let region = Region::new(
+                stack::Group {
+                    key: gone.clone(),
+                    repo: false,
+                    roots: vec![gone],
+                },
+                false,
+            );
+            assert!(region.rows.is_empty());
+        });
+    }
+
+    #[test]
+    fn stack_diff_reuses_surviving_regions() {
+        with_scratch_state(|_| {
+            let a = scratch_dir("diff-a");
+            let b = scratch_dir("diff-b");
+            let mut app = App::new(
+                a.clone(),
+                std::rc::Rc::new(std::cell::RefCell::new(
+                    herdr_sidebar::viewnav::ViewHistory::new(),
+                )),
+            );
+            app.region_mut().selected = Some(0);
+            let g = |k: &PathBuf| stack::Group {
+                key: k.clone(),
+                repo: false,
+                roots: vec![k.clone()],
+            };
+            assert!(app.apply_groups(vec![g(&a), g(&b)]));
+            assert_eq!(app.regions.len(), 2);
+            assert_eq!(app.regions[0].selected, Some(0)); // survivor untouched
+            assert!(!app.apply_groups(vec![g(&a), g(&b)])); // no change → false
+            assert!(app.apply_groups(vec![g(&b)]));
+            assert_eq!(app.regions[0].group.key, b);
+            assert_eq!(app.focused, 0);
+            let _ = std::fs::remove_dir_all(&a);
+            let _ = std::fs::remove_dir_all(&b);
+        });
     }
 
     #[test]

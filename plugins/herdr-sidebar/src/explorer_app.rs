@@ -270,7 +270,6 @@ impl Region {
     }
 
     /// A multi-root group's synthetic root row.
-    #[allow(dead_code)] // brief interface; no caller until root rows get their own menu
     fn is_root_row(&self, index: usize) -> bool {
         self.trees.len() > 1 && self.rows.get(index).is_some_and(|row| row.depth == 0)
     }
@@ -1764,6 +1763,16 @@ impl App {
         (x, y)
     }
 
+    /// `path` is a synthetic root row of the focused region.
+    fn is_root_target(&self, path: &Path) -> bool {
+        let region = self.region();
+        region
+            .rows
+            .iter()
+            .position(|row| row.path == path)
+            .is_some_and(|index| region.is_root_row(index))
+    }
+
     /// Build and show the menu popup for a resolved target.
     fn show_menu(&mut self, x: u16, y: u16, target: Option<(PathBuf, bool)>) {
         let in_repo = target
@@ -1777,11 +1786,26 @@ impl App {
                 .map(|r| r.name),
             _ => None,
         };
-        let entries = actions::menu_entries(
+        let mut entries = actions::menu_entries(
             target.as_ref().map(|(_, is_dir)| *is_dir),
             in_repo,
             program.as_deref(),
         );
+        if target
+            .as_ref()
+            .is_some_and(|(path, _)| self.is_root_target(path))
+        {
+            // A root row IS a pane's working directory: never rename/delete it.
+            entries.retain(|e| {
+                !matches!(
+                    e,
+                    MenuEntry::Action(MenuAction::Rename | MenuAction::Delete, _)
+                )
+            });
+            while matches!(entries.last(), Some(MenuEntry::Separator)) {
+                entries.pop();
+            }
+        }
         let selected = entries
             .iter()
             .position(|e| matches!(e, MenuEntry::Action(..)))
@@ -3345,6 +3369,11 @@ impl App {
                     }
                     Err(err) => format!("copy failed: {err}"),
                 });
+            }
+            MenuAction::Rename | MenuAction::Delete
+                if target.as_ref().is_some_and(|(p, _)| self.is_root_target(p)) =>
+            {
+                self.notice = Some("a stack root can't be renamed or deleted here".into());
             }
             MenuAction::Rename => {
                 let Some((path, _)) = target else { return };
@@ -5339,6 +5368,46 @@ mod tests {
             );
             assert!(region.is_root_row(0) && !region.is_root_row(1));
             assert_eq!(region.tree_for(&base.join("apps/web/src")), Some(1));
+            let _ = std::fs::remove_dir_all(&base);
+        });
+    }
+
+    #[test]
+    fn root_row_menu_offers_no_rename_or_delete() {
+        with_scratch_state(|_| {
+            let base = scratch_dir("root-menu");
+            for sub in ["a", "b"] {
+                std::fs::create_dir_all(base.join(sub)).unwrap();
+            }
+            let mut app = App::new(
+                base.join("a"),
+                std::rc::Rc::new(std::cell::RefCell::new(
+                    herdr_sidebar::viewnav::ViewHistory::new(),
+                )),
+            );
+            assert!(app.apply_groups(vec![stack::Group {
+                key: base.clone(),
+                repo: false,
+                roots: vec![base.join("a"), base.join("b")],
+            }]));
+            let actions_for = |app: &mut App, index: usize| {
+                app.region_mut().selected = Some(index);
+                app.open_menu_for_selection();
+                let Some(Overlay::Menu { entries, .. }) = app.overlay.take() else {
+                    panic!("menu did not open");
+                };
+                entries
+                    .into_iter()
+                    .filter_map(|e| match e {
+                        MenuEntry::Action(action, _) => Some(action),
+                        MenuEntry::Separator => None,
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let root = actions_for(&mut app, 0);
+            assert!(app.region().is_root_row(0));
+            assert!(!root.contains(&MenuAction::Rename) && !root.contains(&MenuAction::Delete));
+            assert!(root.contains(&MenuAction::NewFile) && root.contains(&MenuAction::CopyPath));
             let _ = std::fs::remove_dir_all(&base);
         });
     }

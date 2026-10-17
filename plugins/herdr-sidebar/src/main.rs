@@ -238,8 +238,13 @@ fn main() -> std::io::Result<()> {
     } else {
         None
     };
-    let (mut view, start_repo) =
-        startup_view(&persisted, pinned, initial_activity, spawn_owner, &group_keys);
+    let (mut view, mut start_repo) = startup_view(
+        &persisted,
+        pinned,
+        initial_activity,
+        spawn_owner,
+        &group_keys,
+    );
     // Mark the short interval before App::new applies its live identity. The
     // launcher also writes a live stamp after plugin.pane.open returns, so any
     // ordering between the two ends with App::new clearing this marker before
@@ -301,12 +306,23 @@ fn main() -> std::io::Result<()> {
                 std::mem::take(&mut search_on_open),
                 std::mem::take(&mut quick_open_on_open),
             ),
-            View::SourceControl => run_scm(
-                &mut terminal,
-                Rc::clone(&cwd_follower),
-                Rc::clone(&history),
-                start_repo.as_deref().unwrap_or(&spawn_cwd),
-            ),
+            View::SourceControl => {
+                // The startup repo first; later entries follow the repo the
+                // stack's ⎇ or view history wrote to `active_repo`.
+                let repo = start_repo.take().or_else(|| {
+                    let state = state::load_state();
+                    (pinned.is_none() && state.merged)
+                        .then_some(state.active_repo)
+                        .flatten()
+                        .filter(|repo| repo.is_dir())
+                });
+                run_scm(
+                    &mut terminal,
+                    Rc::clone(&cwd_follower),
+                    Rc::clone(&history),
+                    repo.as_deref().unwrap_or(&spawn_cwd),
+                )
+            }
         };
         match exit {
             Ok(Exit::Quit) => break Ok(()),

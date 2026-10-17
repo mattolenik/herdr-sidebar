@@ -38,6 +38,7 @@ use herdr_sidebar::ui::{
     title_action_spans, title_actions_visible, title_actions_width, truncate_to, within,
     wrap_footer_message, wrap_hints,
 };
+use herdr_sidebar::viewnav::ViewEntry;
 
 /// How many log lines the history-ish drawers fetch.
 const DRAWER_LIMIT: usize = 30;
@@ -807,7 +808,6 @@ struct ClickZones {
     activity_row: u16,
     explorer: (u16, u16),
     search: (u16, u16),
-    source_control: (u16, u16),
     /// The ⚙ button (activity bar in unified mode, header otherwise).
     gear: Rect,
     message: Rect,
@@ -1604,10 +1604,9 @@ impl App {
             return None;
         }
         self.flash = None;
-        // Tab history: Ctrl+- back, F7/F8 from the tab-back/forward actions.
+        // View then tab history: Ctrl+- back, F7/F8 from the tab-back/forward actions.
         if let Some(forward) = herdr_sidebar::tabnav::key_direction(&key) {
-            self.flash = herdr_sidebar::tabnav::step_notice(forward).map(|text| (text, false));
-            return None;
+            return self.history_step(forward);
         }
         if ((key.code == KeyCode::Char('p')
             && key.modifiers.contains(KeyModifiers::CONTROL)
@@ -1645,7 +1644,8 @@ impl App {
             return match c {
                 '1' => self.switch_to(View::Explorer),
                 '2' => self.open_search(false),
-                _ => self.switch_to(View::SourceControl),
+                // Already the git view: entering a repo is the stack's job.
+                _ => None,
             };
         }
         if self.overlay.is_some() {
@@ -1755,7 +1755,6 @@ impl App {
             KeyCode::Char('b') => self.hide(),
             KeyCode::Char('1') => return self.switch_to(View::Explorer),
             KeyCode::Char('2') => return self.open_search(false),
-            KeyCode::Char('3') => return self.switch_to(View::SourceControl),
             _ => {}
         }
         None
@@ -1767,10 +1766,9 @@ impl App {
         // hover title-bar buttons until the linger expires.
         self.last_mouse = Some(std::time::Instant::now());
         self.mouse_pos = Some((mouse.column, mouse.row));
-        // A mouse's side buttons step the tab history (xterm buttons 8/9).
+        // A mouse's side buttons step the view, then tab, history (xterm buttons 8/9).
         if let Some(forward) = herdr_sidebar::tabnav::mouse_direction(mouse.kind) {
-            self.flash = herdr_sidebar::tabnav::step_notice(forward).map(|text| (text, false));
-            return None;
+            return self.history_step(forward);
         }
         if herdr_sidebar::tabnav::is_side_release(mouse.kind) {
             return None;
@@ -1811,9 +1809,6 @@ impl App {
             }
             if hits_activity_button(z.search, z.activity_row, x, y) {
                 return self.open_search(false);
-            }
-            if hits_activity_button(z.source_control, z.activity_row, x, y) {
-                return self.switch_to(View::SourceControl);
             }
         }
         if hits(z.gear, x, y) {
@@ -3416,6 +3411,7 @@ impl App {
             state.active = view;
             state.search_active = false;
         });
+        self.history.borrow_mut().visit(ViewEntry::Stack);
         Some(Exit::Switch)
     }
 
@@ -3427,7 +3423,38 @@ impl App {
             state.active = View::Explorer;
             state.search_active = true;
         });
+        self.history.borrow_mut().visit(ViewEntry::Stack);
         Some(Exit::Search { focus_query })
+    }
+
+    /// Ctrl+- / F7 / F8 / mouse side buttons: step the view history, else tab history.
+    fn history_step(&mut self, forward: bool) -> Option<Exit> {
+        let step = {
+            let mut history = self.history.borrow_mut();
+            if forward {
+                history.forward().cloned()
+            } else {
+                history.back().cloned()
+            }
+        };
+        match step {
+            Some(ViewEntry::Stack) => {
+                self.sidebar_state = sidebar::update_state(|s| {
+                    s.active = View::Explorer;
+                    s.search_active = false;
+                });
+                Some(Exit::Switch)
+            }
+            Some(ViewEntry::Git(root)) if root == self.cwd => None,
+            Some(ViewEntry::Git(root)) => {
+                self.sidebar_state = sidebar::update_state(|s| s.active_repo = Some(root));
+                Some(Exit::Switch)
+            }
+            None => {
+                self.flash = herdr_sidebar::tabnav::step_notice(forward).map(|text| (text, false));
+                None
+            }
+        }
     }
 
     /// Close the other panel's standalone pane in our tab, if one is open.
@@ -4076,7 +4103,7 @@ impl App {
         let outer_top = area.y;
         let outer_bottom = area.y + 2;
         let area = Rect::new(area.x, area.y + 1, area.width, 1);
-        let (exp_icon, search_icon, git_icon) = activity_icons(self.theme);
+        let (exp_icon, search_icon, _) = activity_icons(self.theme);
         // Both FA glyphs (folder, code-fork) render two cells wide in the
         // non-Mono Nerd Font; reserve the second cell in each chip so the
         // highlights are equal-sized with centered icons.
@@ -4090,8 +4117,6 @@ impl App {
             Span::raw(format!(" {exp_icon}{slack} ")),
             Span::raw(" "),
             Span::raw(format!(" {search_icon}{slack} ")),
-            Span::raw(" "),
-            Span::raw(format!(" {git_icon}{slack} ")),
         ];
         // Hit zones from the actual span widths (emoji vs nerd-glyph widths differ).
         let mut x = area.x;
@@ -4104,24 +4129,15 @@ impl App {
         self.zones.activity_row = area.y;
         self.zones.explorer = bounds[1];
         self.zones.search = bounds[3];
-        self.zones.source_control = bounds[5];
         let hovered = |bounds| {
             self.mouse_pos
                 .is_some_and(|(x, y)| hits_activity_button(bounds, area.y, x, y))
         };
         let explorer_hovered = hovered(bounds[1]);
         let search_hovered = hovered(bounds[3]);
-        let git_hovered = hovered(bounds[5]);
+        // Neither chip is active: the git view is entered from a stack group.
         spans[1].style = activity_button_style(false, explorer_hovered);
         spans[3].style = activity_button_style(false, search_hovered);
-        spans[5].style = activity_button_style(true, git_hovered);
-        draw_activity_caps(
-            frame,
-            bounds[5],
-            outer_top,
-            outer_bottom,
-            palette().selection_bg,
-        );
         for (is_hovered, button_bounds) in
             [(explorer_hovered, bounds[1]), (search_hovered, bounds[3])]
         {
@@ -4165,8 +4181,10 @@ impl App {
         // A single repo titles the panel with its NAME, like VS Code's repo
         // rows (the sections inside are already Changes/Staged Changes);
         // several repos fall back to a neutral "Source Control".
-        let title = match self.active_repo() {
-            Some(repo) if self.repos.len() == 1 => repo.name.clone(),
+        // Unified, the view is one stack group's repo (the one entered, listed first).
+        let title = match (self.merged(), self.repos.first(), self.active_repo()) {
+            (true, Some(first), _) => format!("Source Control · {}", first.name),
+            (false, _, Some(repo)) if self.repos.len() == 1 => repo.name.clone(),
             _ => "Source Control".to_string(),
         };
         let left = Span::styled(format!(" ▾ {title}"), Style::default().bold());
@@ -4699,7 +4717,7 @@ impl App {
             ("q", "quit"),
         ];
         if self.merged() {
-            hints.extend([("1", "files"), ("2", "search"), ("3", "git")]);
+            hints.extend([("1", "files"), ("2", "search")]);
         }
         hints
     }

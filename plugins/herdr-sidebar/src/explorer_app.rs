@@ -36,6 +36,7 @@ use herdr_sidebar::ui::{
 };
 
 use herdr_sidebar::state::Exit;
+use herdr_sidebar::viewnav::ViewEntry;
 
 const MY_VIEW: View = View::Explorer;
 
@@ -688,7 +689,6 @@ pub struct App {
     last_preview: Option<(String, herdr_sidebar::viewer::PreviewTarget)>,
     /// Last heartbeat stamp, throttling the token refresh.
     last_beat: std::time::Instant,
-    #[allow(dead_code)] // read in Task 8
     history: std::rc::Rc<std::cell::RefCell<herdr_sidebar::viewnav::ViewHistory>>,
     /// Every repository the tree can see — the containing one plus child
     /// repos, exactly the set the Source Control view shows.
@@ -730,13 +730,12 @@ pub struct App {
 const DOUBLE_CLICK: std::time::Duration = std::time::Duration::from_millis(450);
 
 /// Activity-bar click zones from the last draw: the bar's row and the column
-/// ranges of the explorer / source-control icons.
+/// ranges of the explorer / search icons.
 #[derive(Clone, Copy)]
 struct ActivityZones {
     row: u16,
     explorer: (u16, u16),
     search: (u16, u16),
-    source_control: (u16, u16),
 }
 
 impl Default for ActivityZones {
@@ -746,7 +745,6 @@ impl Default for ActivityZones {
             row: u16::MAX,
             explorer: (0, 0),
             search: (0, 0),
-            source_control: (0, 0),
         }
     }
 }
@@ -1192,6 +1190,7 @@ impl App {
             .position(|r| r.group.key == focused_key)
             .unwrap_or_else(|| self.focused.min(self.regions.len() - 1));
         self.heights = None;
+        self.dragging = None;
         self.invalidate_quick_index();
         self.rediscover_repos();
         self.request_decorations(true);
@@ -1385,6 +1384,54 @@ impl App {
         Some(Exit::Switch)
     }
 
+    /// `3` / Ctrl+3 / F11 / the group's ⎇: enter the git view of `regions[index]`'s repo.
+    /// Non-repo group → notice "no repository in this group". Separated mode → None.
+    fn enter_git(&mut self, index: usize) -> Option<Exit> {
+        if !self.merged() {
+            return None;
+        }
+        let group = &self.regions.get(index)?.group;
+        if !group.repo {
+            self.notice = Some("no repository in this group".into());
+            return None;
+        }
+        let key = group.key.clone();
+        self.sidebar_state = sidebar::update_state(|s| {
+            s.active = View::SourceControl;
+            s.active_repo = Some(key.clone());
+            s.search_active = false;
+        });
+        self.history.borrow_mut().visit(ViewEntry::Git(key));
+        Some(Exit::Switch)
+    }
+
+    /// Ctrl+- / F7 / F8 / mouse side buttons: step the view history, else tab history.
+    fn history_step(&mut self, forward: bool) -> Option<Exit> {
+        let step = {
+            let mut history = self.history.borrow_mut();
+            if forward {
+                history.forward().cloned()
+            } else {
+                history.back().cloned()
+            }
+        };
+        match step {
+            Some(ViewEntry::Git(root)) => {
+                self.sidebar_state = sidebar::update_state(|s| {
+                    s.active = View::SourceControl;
+                    s.active_repo = Some(root);
+                    s.search_active = false;
+                });
+                Some(Exit::Switch)
+            }
+            Some(ViewEntry::Stack) => None,
+            None => {
+                self.notice = herdr_sidebar::tabnav::step_notice(forward);
+                None
+            }
+        }
+    }
+
     /// Close the other panel's standalone pane in our tab, if one is open.
     fn close_other_standalone_pane(&self) -> std::io::Result<bool> {
         let Some(ctl) = &self.pane_ctl else {
@@ -1483,10 +1530,9 @@ impl App {
             self.open_quick_open();
             return None;
         }
-        // Tab history: Ctrl+- back, F7/F8 from the tab-back/forward actions.
+        // View then tab history: Ctrl+- back, F7/F8 from the tab-back/forward actions.
         if let Some(forward) = herdr_sidebar::tabnav::key_direction(&key) {
-            self.notice = herdr_sidebar::tabnav::step_notice(forward);
-            return None;
+            return self.history_step(forward);
         }
         if matches!(key.code, KeyCode::Char('f' | 'F'))
             && key.modifiers.contains(KeyModifiers::CONTROL)
@@ -1545,7 +1591,7 @@ impl App {
                         self.open_content_search(false);
                         None
                     }
-                    _ => self.switch_to(View::SourceControl),
+                    _ => self.enter_git(self.focused),
                 };
             }
         }
@@ -1595,7 +1641,7 @@ impl App {
             KeyCode::Char('s') => self.open_settings(),
             KeyCode::Char('1') => return self.switch_to(View::Explorer),
             KeyCode::Char('2') => self.open_content_search(false),
-            KeyCode::Char('3') => return self.switch_to(View::SourceControl),
+            KeyCode::Char('3') => return self.enter_git(self.focused),
             KeyCode::Tab => self.focus_region((self.focused + 1) % self.regions.len()),
             KeyCode::BackTab => {
                 self.focus_region((self.focused + self.regions.len() - 1) % self.regions.len())
@@ -1644,10 +1690,9 @@ impl App {
         // hover title-bar buttons until the linger expires.
         self.last_mouse = Some(std::time::Instant::now());
         self.mouse_pos = Some((mouse.column, mouse.row));
-        // A mouse's side buttons step the tab history (xterm buttons 8/9).
+        // A mouse's side buttons step the view, then tab, history (xterm buttons 8/9).
         if let Some(forward) = herdr_sidebar::tabnav::mouse_direction(mouse.kind) {
-            self.notice = herdr_sidebar::tabnav::step_notice(forward);
-            return None;
+            return self.history_step(forward);
         }
         if herdr_sidebar::tabnav::is_side_release(mouse.kind) {
             return None;
@@ -1667,9 +1712,6 @@ impl App {
                 if hits_activity_button(zones.search, zones.row, mouse.column, mouse.row) {
                     self.open_content_search(false);
                     return None;
-                }
-                if hits_activity_button(zones.source_control, zones.row, mouse.column, mouse.row) {
-                    return self.switch_to(View::SourceControl);
                 }
             }
             let gear = self.gear;
@@ -1751,8 +1793,7 @@ impl App {
                         self.heights = Some(self.alloc.heights.clone());
                         return None;
                     }
-                    // Opening the group's Source Control is wired in Task 8.
-                    Some((_, GroupPart::Git)) => return None,
+                    Some((i, GroupPart::Git)) => return self.enter_git(i),
                     None => {}
                 }
                 if let Some(i) = self.region_at(mouse.row) {
@@ -4160,7 +4201,7 @@ impl App {
             ("q", "quit"),
         ];
         if self.merged() {
-            hints.extend([("1", "files"), ("2", "search"), ("3", "git")]);
+            hints.extend([("1", "files"), ("2", "search"), ("3", "repo git")]);
         }
         hints
     }
@@ -4213,7 +4254,7 @@ impl App {
         let outer_top = area.y;
         let outer_bottom = area.y + 2;
         let area = Rect::new(area.x, area.y + 1, area.width, 1);
-        let (exp_icon, search_icon, git_icon) = activity_icons(self.theme);
+        let (exp_icon, search_icon, _) = activity_icons(self.theme);
         let search_active = matches!(self.overlay, Some(Overlay::ContentSearch { .. }));
         // Both FA glyphs (folder, code-fork) render two cells wide in the
         // non-Mono Nerd Font; reserve the second cell in each chip so the
@@ -4228,8 +4269,6 @@ impl App {
             Span::raw(format!(" {exp_icon}{slack} ")),
             Span::raw(" "),
             Span::raw(format!(" {search_icon}{slack} ")),
-            Span::raw(" "),
-            Span::raw(format!(" {git_icon}{slack} ")),
         ];
         // Hit zones from the actual span widths (emoji vs nerd-glyph widths differ).
         let mut x = area.x;
@@ -4243,7 +4282,6 @@ impl App {
             row: area.y,
             explorer: bounds[1],
             search: bounds[3],
-            source_control: bounds[5],
         };
         let hovered = |bounds| {
             self.mouse_pos
@@ -4251,10 +4289,8 @@ impl App {
         };
         let explorer_hovered = hovered(bounds[1]);
         let search_hovered = hovered(bounds[3]);
-        let git_hovered = hovered(bounds[5]);
         spans[1].style = activity_button_style(!search_active, explorer_hovered);
         spans[3].style = activity_button_style(search_active, search_hovered);
-        spans[5].style = activity_button_style(false, git_hovered);
         let (chip_start, chip_end) = if search_active { bounds[3] } else { bounds[1] };
         draw_activity_caps(
             frame,
@@ -4266,7 +4302,6 @@ impl App {
         for (active, is_hovered, button_bounds) in [
             (!search_active, explorer_hovered, bounds[1]),
             (search_active, search_hovered, bounds[3]),
-            (false, git_hovered, bounds[5]),
         ] {
             if !active && is_hovered {
                 draw_activity_caps(
@@ -5509,6 +5544,9 @@ fn replace_rows(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use herdr_sidebar::viewnav::ViewHistory;
+    use std::cell::RefCell;
+    use std::rc::Rc;
 
     /// Serializes tests that edit process env (state dir, icon theme).
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -5523,6 +5561,74 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// `scratch_dir` with `git init` run in it.
+    fn scratch_repo(tag: &str) -> PathBuf {
+        let dir = scratch_dir(tag);
+        let ok = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&dir)
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok, "git init failed");
+        dir
+    }
+
+    #[test]
+    fn entering_a_repo_group_records_it_and_switches() {
+        with_scratch_state(|_| {
+            let repo = scratch_repo("enter-git");
+            let h = Rc::new(RefCell::new(ViewHistory::new()));
+            let mut app = App::new(repo.clone(), Rc::clone(&h));
+            app.sidebar_state.merged = true;
+            app.other_exe = Some(std::env::current_exe().unwrap());
+            assert_eq!(app.enter_git(0), Some(Exit::Switch));
+            assert_eq!(
+                h.borrow().current(),
+                &ViewEntry::Git(app.regions[0].group.key.clone())
+            );
+            assert_eq!(
+                sidebar::load_state().active_repo,
+                Some(app.regions[0].group.key.clone())
+            );
+        });
+    }
+
+    #[test]
+    fn entering_a_plain_folder_group_notices_instead() {
+        with_scratch_state(|_| {
+            let dir = scratch_dir("enter-plain");
+            let mut app = App::new(dir, Rc::new(RefCell::new(ViewHistory::new())));
+            app.sidebar_state.merged = true;
+            app.other_exe = Some(std::env::current_exe().unwrap());
+            assert_eq!(app.enter_git(0), None);
+            assert_eq!(app.notice.as_deref(), Some("no repository in this group"));
+        });
+    }
+
+    #[test]
+    fn back_from_the_stack_falls_through_to_tab_history() {
+        with_scratch_state(|_| {
+            let dir = scratch_dir("back-stack");
+            let mut app = App::new(dir, Rc::new(RefCell::new(ViewHistory::new())));
+            assert_eq!(app.history_step(false), None);
+            assert!(app.notice.is_some()); // tabnav's "no earlier tab"-style notice
+        });
+    }
+
+    #[test]
+    fn forward_reenters_the_git_view() {
+        with_scratch_state(|_| {
+            let h = Rc::new(RefCell::new(ViewHistory::new()));
+            h.borrow_mut().visit(ViewEntry::Git("/r".into()));
+            h.borrow_mut().back();
+            let mut app = App::new(scratch_dir("fwd"), Rc::clone(&h));
+            assert_eq!(app.history_step(true), Some(Exit::Switch));
+            assert_eq!(sidebar::load_state().active, View::SourceControl);
+            assert_eq!(sidebar::load_state().active_repo, Some("/r".into()));
+        });
     }
 
     /// Run `f` with the plugin state dir pointed at a fresh scratch dir and the

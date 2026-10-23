@@ -82,6 +82,37 @@ title = "Toggle source control"
 description = "Open a separate Source Control pane (focus it if open; close it if focused)."
 command = [".\\target\\release\\herdr-sidebar-ensure.exe", "--toggle-git"]
 
+# Link handler: a Ctrl-click on a terminal hyperlink to a Markdown file (the
+# file:// links Claude Code, Codex and OpenCode print for paths) opens it in
+# the default web browser instead of the file's editor association.
+[[actions]]
+id = "open-markdown-link"
+platforms = ["linux", "macos"]
+title = "Open Markdown link in browser"
+description = "Link handler target: open the clicked file:// Markdown link in the default web browser."
+command = ["./target/release/herdr-sidebar", "--open-link"]
+
+[[actions]]
+id = "open-markdown-link-windows"
+platforms = ["windows"]
+title = "Open Markdown link in browser"
+description = "Link handler target: open the clicked file:// Markdown link in the default web browser."
+command = [".\\target\\release\\herdr-sidebar-ensure.exe", "--open-link"]
+
+[[link_handlers]]
+id = "markdown-in-browser"
+platforms = ["linux", "macos"]
+title = "Open Markdown in browser"
+pattern = "(?i)^file://[^#?]*\\.(md|markdown)(:[0-9]+(:[0-9]+)?)?([#?].*)?$"
+action = "open-markdown-link"
+
+[[link_handlers]]
+id = "markdown-in-browser-windows"
+platforms = ["windows"]
+title = "Open Markdown in browser"
+pattern = "(?i)^file://[^#?]*\\.(md|markdown)(:[0-9]+(:[0-9]+)?)?([#?].*)?$"
+action = "open-markdown-link-windows"
+
 # Direct activities for host-level keybindings. Unlike the legacy toggles,
 # these always open/focus the sidebar and leave it on the requested view.
 [[actions]]

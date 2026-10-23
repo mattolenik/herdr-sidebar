@@ -20,6 +20,10 @@ fn main() {
             }
             return;
         }
+        Some("--open-link") => {
+            let _ = herdr_sidebar::actions::open_clicked_link();
+            return;
+        }
         Some(flag @ ("--tab-back" | "--tab-forward")) => {
             let _ = herdr_sidebar::tabnav::action(flag == "--tab-forward");
             return;

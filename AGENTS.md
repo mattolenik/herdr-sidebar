@@ -594,6 +594,17 @@ HACKING.md — budget time for that before promising a patched build.
   https handler on macOS, so it receives the `file://` URL. Whether the modified click reaches
   the pane at all is the terminal's call (Ghostty's `mouse-shift-capture`, herdr's own
   selection) — verify on the real stack before changing the chord.
+- **Markdown links printed by agents open in the browser through a herdr `[[link_handlers]]`
+  entry** (manifest: pattern on `file://…\.md`, action `open-markdown-link[-windows]` →
+  `herdr-sidebar --open-link` / the ensure sidecar). herdr routes a CTRL-click (the only
+  modifier herdr exposes, Command included) on an OSC 8 hyperlink or http(s) URL to the first
+  matching handler, with the URL in `HERDR_PLUGIN_CLICKED_URL` and `clicked_url` of
+  `HERDR_PLUGIN_CONTEXT_JSON`; `actions::link_path` drops fragment/query, decodes escapes and
+  strips a `:line[:col]` tail. Only works for real hyperlinks: a harness that prints bare
+  paths under `TERM_PROGRAM=herdr` gives herdr nothing to match (Ctrl-hover underlines what
+  herdr sees as a link). Needs `ui.mouse_capture = true` (herdr's default). The installed
+  0.9.4-dev binary already carries the manifest key (checked with `strings`); the plugin's
+  `min_herdr_version` stays 0.8.0 on purpose.
 - "Reveal in File Explorer" opens a selected directory itself; only files are revealed by
   opening their parent with the file selected. Applying file-style reveal semantics to folders
   lands one level too high and looks like the clicked tree row was ignored. Pass the row/menu's

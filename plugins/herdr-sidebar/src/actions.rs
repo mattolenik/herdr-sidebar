@@ -527,6 +527,58 @@ pub fn open_in_browser(path: &Path) -> io::Result<()> {
     }
 }
 
+/// The `--open-link` action behind the manifest's Markdown link handler:
+/// herdr routes a Ctrl-click on a matching terminal hyperlink (the `file://`
+/// links AI harnesses print for file paths) here with the URL in
+/// `HERDR_PLUGIN_CLICKED_URL` (and `clicked_url` in the context JSON), and
+/// the file opens in the default web browser.
+pub fn open_clicked_link() -> io::Result<()> {
+    let url = clicked_url().ok_or_else(|| io::Error::other("no clicked URL in the plugin context"))?;
+    let path = link_path(&url).ok_or_else(|| io::Error::other(format!("not a file link: {url}")))?;
+    open_in_browser(&path)
+}
+
+fn clicked_url() -> Option<String> {
+    std::env::var("HERDR_PLUGIN_CLICKED_URL")
+        .ok()
+        .filter(|url| !url.is_empty())
+        .or_else(|| {
+            let context = std::env::var("HERDR_PLUGIN_CONTEXT_JSON").ok()?;
+            let context: serde_json::Value = serde_json::from_str(&context).ok()?;
+            context.get("clicked_url")?.as_str().map(str::to_string)
+        })
+}
+
+/// The file behind a `file://` link: fragment and query dropped, percent
+/// escapes decoded, a harness's trailing `:line[:col]` removed, and on Windows
+/// the `/C:/…` form turned back into a drive path.
+pub fn link_path(url: &str) -> Option<std::path::PathBuf> {
+    let url = url.split(['#', '?']).next()?;
+    let path = crate::lsp::path_for(url)?;
+    let text = path.to_string_lossy();
+    let mut text = strip_line_suffix(&text);
+    if cfg!(windows)
+        && let Some(rest) = text.strip_prefix('/')
+        && rest.as_bytes().get(1) == Some(&b':')
+    {
+        text = rest;
+    }
+    Some(std::path::PathBuf::from(text))
+}
+
+/// `a.md:12` / `a.md:12:3` → `a.md`.
+fn strip_line_suffix(text: &str) -> &str {
+    let mut end = text.len();
+    for _ in 0..2 {
+        let trimmed = text[..end].trim_end_matches(|c: char| c.is_ascii_digit());
+        match trimmed.strip_suffix(':') {
+            Some(head) if trimmed.len() < end => end = head.len(),
+            _ => break,
+        }
+    }
+    &text[..end]
+}
+
 /// Bundle id of the `https` handler in LaunchServices' handler list, read
 /// through `plutil` (the plist is binary).
 #[cfg(target_os = "macos")]
@@ -965,6 +1017,18 @@ fn tab_create_ids(response: &str) -> Option<(String, String)> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_file_link_becomes_its_path_without_line_fragment_or_escapes() {
+        let p = |url: &str| super::link_path(url).map(|p| p.to_string_lossy().into_owned());
+        assert_eq!(p("file:///Users/m/docs/a%20b.md").as_deref(), Some("/Users/m/docs/a b.md"));
+        assert_eq!(p("file:///Users/m/x.md:12:3#L12").as_deref(), Some("/Users/m/x.md"));
+        assert_eq!(p("file:///Users/m/x.md?x=1").as_deref(), Some("/Users/m/x.md"));
+        assert_eq!(p("https://example.com/x.md"), None);
+        assert_eq!(super::strip_line_suffix("a.md:7"), "a.md");
+        assert_eq!(super::strip_line_suffix("a.md"), "a.md");
+        assert_eq!(super::strip_line_suffix("v1:2:3:4"), "v1:2");
+    }
+
     #[test]
     fn default_browser_is_the_https_handler_in_launch_services() {
         let handlers = serde_json::json!({"LSHandlers": [

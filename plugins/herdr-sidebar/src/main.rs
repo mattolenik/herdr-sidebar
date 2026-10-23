@@ -49,6 +49,7 @@ fn main() -> std::io::Result<()> {
             return herdr_sidebar::updates::run().map_err(std::io::Error::other);
         }
         Some("--refresh-sidebars") => return herdr_sidebar::updates::refresh(),
+        Some("--open-link") => return herdr_sidebar::actions::open_clicked_link(),
         Some("--tab-back") => return herdr_sidebar::tabnav::action(false),
         Some("--tab-forward") => return herdr_sidebar::tabnav::action(true),
         Some("--run-custom-editor") => return herdr_sidebar::actions::run_configured_editor(),

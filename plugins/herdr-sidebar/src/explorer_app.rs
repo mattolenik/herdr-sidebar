@@ -59,6 +59,21 @@ struct DecorationRefresh {
     repos: Vec<RepoDecorationRefresh>,
 }
 
+/// One background pass of the git calls a stack sample needs: the owning
+/// repository of each root the owner cache has not seen, and every repository
+/// visible from the sampled roots. Neither runs on the TUI thread — a pane
+/// that cds onto a slow mount would otherwise stall the sidebar for the
+/// duration of the `git rev-parse` calls.
+struct Discovery {
+    roots: Vec<PathBuf>,
+    owners: Vec<(PathBuf, Option<PathBuf>)>,
+    repos: Vec<Git>,
+    /// Group `roots` into regions when this lands (a stack sample); a plain
+    /// rediscovery over the current roots only replaces `repos`, so it never
+    /// consumes the one-shot layout memo a real sample is waiting to adopt.
+    regroup: bool,
+}
+
 fn ignored_scan_due(backoff_until: Option<std::time::Instant>, now: std::time::Instant) -> bool {
     backoff_until.is_none_or(|until| now >= until)
 }
@@ -672,6 +687,9 @@ pub struct App {
     /// Repository root owning each stack root (`None` = not in a repo), so a
     /// stack sample runs `git rev-parse` only for roots it has not seen.
     owner_cache: HashMap<PathBuf, Option<PathBuf>>,
+    /// The one in-flight discovery pass; a sample taken while it runs is
+    /// skipped and the next heartbeat catches up.
+    disc_rx: Option<std::sync::mpsc::Receiver<Discovery>>,
     theme: IconTheme,
     pane_ctl: Option<PaneCtl>,
     /// Pane size from the last draw; sizing decisions and PageUp/PageDown
@@ -832,6 +850,7 @@ impl App {
             spawn_cwd,
             layout_memo: LAYOUT_MEMO.with(|memo| memo.borrow_mut().take()),
             owner_cache,
+            disc_rx: None,
             theme,
             pane_ctl,
             last_width: sidebar_state.sidebar_width,
@@ -875,11 +894,13 @@ impl App {
             search_snap: false,
             pending_unified_width: None,
         };
-        app.rediscover_repos();
         app.apply_identity();
         // Sample now so the first draw shows the whole stack, not the spawn tree alone.
         app.sample_stack();
-        app.request_decorations(true);
+        if app.disc_rx.is_none() {
+            app.rediscover_repos();
+        }
+        app.await_discovery(std::time::Duration::from_millis(300));
         app
     }
 
@@ -983,6 +1004,7 @@ impl App {
         self.collect_git_sync();
         self.collect_lsp_check();
         self.start_content_search_if_due();
+        self.collect_discovery();
         self.collect_decorations();
         if self.last_deco.elapsed() < DECO_REFRESH {
             return;
@@ -1021,11 +1043,10 @@ impl App {
             return;
         }
         self.sidebar_state.git_deco = enabled;
-        self.rediscover_repos();
         if !enabled {
             self.deco = Decorations::empty();
         }
-        self.request_decorations(true);
+        self.rediscover_repos();
     }
 
     fn sync_shared_tree(&mut self) {
@@ -1164,21 +1185,97 @@ impl App {
             .is_some_and(|json| pane_focused_in(&json, pane_id))
     }
 
-    /// Rediscover the repositories under every root — at startup, or after an
-    /// explicit refresh that may have added or removed one.
+    /// Rediscover the repositories under every root — after an explicit
+    /// refresh or a settings change that may have added or removed one. Runs
+    /// on the discovery worker; decorations re-read once it lands.
     fn rediscover_repos(&mut self) {
-        self.deco_rx = None;
-        let mut repos: Vec<Git> = Vec::new();
-        if self.sidebar_state.git_deco || self.sidebar_state.show_git_footer {
-            for root in self.all_roots() {
-                for git in Git::discover_all(&root) {
-                    if !repos.iter().any(|r| r.root() == git.root()) {
-                        repos.push(git);
+        let roots = self.all_roots();
+        self.spawn_discovery(roots, false);
+    }
+
+    /// Resolve the owner of every root the cache has not seen and rediscover
+    /// the repositories under `roots`, off the TUI thread. Replaces any pass
+    /// still in flight (its result is dropped).
+    fn spawn_discovery(&mut self, roots: Vec<PathBuf>, regroup: bool) {
+        let misses: Vec<PathBuf> = roots
+            .iter()
+            .filter(|root| !self.owner_cache.contains_key(*root))
+            .cloned()
+            .collect();
+        let want_repos = self.sidebar_state.git_deco || self.sidebar_state.show_git_footer;
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let owners = misses
+                .into_iter()
+                .map(|root| {
+                    let owner = Git::owner_of(&root).ok().map(|git| git.root().to_path_buf());
+                    (root, owner)
+                })
+                .collect();
+            let mut repos: Vec<Git> = Vec::new();
+            if want_repos {
+                for root in &roots {
+                    for git in Git::discover_all(root) {
+                        if !repos.iter().any(|r| r.root() == git.root()) {
+                            repos.push(git);
+                        }
                     }
                 }
             }
+            let _ = tx.send(Discovery {
+                roots,
+                owners,
+                repos,
+                regroup,
+            });
+        });
+        self.disc_rx = Some(rx);
+    }
+
+    fn collect_discovery(&mut self) {
+        let Some(rx) = &self.disc_rx else { return };
+        match rx.try_recv() {
+            Ok(discovery) => {
+                self.disc_rx = None;
+                self.apply_discovery(discovery);
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => self.disc_rx = None,
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+        }
+    }
+
+    /// Block up to `timeout` for the in-flight discovery (startup only, so
+    /// the first frame shows the stack rather than the spawn tree alone); a
+    /// slow mount just lands on a later tick instead of stalling startup.
+    fn await_discovery(&mut self, timeout: std::time::Duration) {
+        let Some(rx) = &self.disc_rx else { return };
+        if let Ok(discovery) = rx.recv_timeout(timeout) {
+            self.disc_rx = None;
+            self.apply_discovery(discovery);
+        }
+    }
+
+    fn apply_discovery(&mut self, discovery: Discovery) {
+        let Discovery {
+            roots,
+            owners,
+            repos,
+            regroup,
+        } = discovery;
+        if regroup {
+            self.owner_cache.retain(|root, _| roots.contains(root));
+            self.owner_cache.extend(owners);
+            let current: Vec<stack::Group> =
+                self.regions.iter().map(|r| r.group.clone()).collect();
+            let cache = &self.owner_cache;
+            let groups =
+                stack::group_roots(&roots, |root| cache.get(root).cloned().flatten(), &current);
+            self.apply_groups(groups);
         }
         self.repos = repos;
+        // A status pass for the previous repo set must not land over this one.
+        self.deco_rx = None;
+        self.request_decorations(true);
     }
 
     /// The decoration letter for a row, if any (see [`Decorations::letter`]).
@@ -1203,8 +1300,9 @@ impl App {
         }
     }
 
-    /// Follow the tab's panes: one `pane.list` round trip, then group the
-    /// roots and diff them into `regions`.
+    /// Follow the tab's panes: one `pane.list` round trip, then hand the roots
+    /// to the discovery worker, which groups and diffs them into `regions`
+    /// when it lands.
     fn sample_stack(&mut self) {
         let Some(pane_id) = self.pane_ctl.as_ref().map(|ctl| ctl.pane_id.clone()) else {
             return;
@@ -1218,17 +1316,10 @@ impl App {
         if roots.is_empty() {
             roots.push(self.spawn_cwd.clone());
         }
-        self.owner_cache.retain(|root, _| roots.contains(root));
-        for root in &roots {
-            self.owner_cache
-                .entry(root.clone())
-                .or_insert_with(|| Git::owner_of(root).ok().map(|git| git.root().to_path_buf()));
+        if self.disc_rx.is_some() {
+            return;
         }
-        let current: Vec<stack::Group> = self.regions.iter().map(|r| r.group.clone()).collect();
-        let cache = &self.owner_cache;
-        let groups =
-            stack::group_roots(&roots, |root| cache.get(root).cloned().flatten(), &current);
-        self.apply_groups(groups);
+        self.spawn_discovery(roots, true);
     }
 
     /// Keep regions whose group key survives (updating their roots), drop the
@@ -1273,8 +1364,6 @@ impl App {
         self.dragging = None;
         self.restore_layout();
         self.invalidate_quick_index();
-        self.rediscover_repos();
-        self.request_decorations(true);
         true
     }
 
@@ -3482,14 +3571,12 @@ impl App {
                 self.sidebar_state =
                     sidebar::update_state(|state| state.git_deco = !state.git_deco);
                 self.rediscover_repos();
-                self.request_decorations(true);
             }
             Setting::GitFooter => {
                 self.sidebar_state = sidebar::update_state(|state| {
                     state.show_git_footer = !state.show_git_footer;
                 });
                 self.rediscover_repos();
-                self.request_decorations(true);
             }
         }
     }
@@ -3750,7 +3837,6 @@ impl App {
         self.region_mut().refresh();
         self.invalidate_quick_index();
         self.rediscover_repos();
-        self.request_decorations(true);
         self.rebuild();
     }
 
@@ -5838,6 +5924,38 @@ pub(crate) mod tests {
             .success();
         assert!(ok, "git init failed");
         dir
+    }
+
+    #[test]
+    fn discovery_lands_off_thread_and_groups_new_roots_by_owner() {
+        with_scratch_state(|_| {
+            let repo = scratch_repo("disc-repo");
+            let a = repo.join("a");
+            let b = repo.join("b");
+            let plain = scratch_dir("disc-plain");
+            std::fs::create_dir_all(&a).unwrap();
+            std::fs::create_dir_all(&b).unwrap();
+            let mut app = App::new(a.clone(), Rc::new(RefCell::new(ViewHistory::new())));
+            // Startup (no pane): rediscovery ran on the worker and was awaited.
+            assert!(app.disc_rx.is_none());
+            assert_eq!(app.repos.len(), 1);
+            // Nothing is grouped on the TUI thread: the sample is only queued.
+            app.spawn_discovery(vec![a.clone(), b.clone(), plain.clone()], true);
+            assert!(app.disc_rx.is_some());
+            assert_eq!(app.regions.len(), 1);
+            assert!(!app.owner_cache.contains_key(&b));
+            app.await_discovery(std::time::Duration::from_secs(10));
+            assert!(app.disc_rx.is_none());
+            assert_eq!(app.owner_cache.get(&plain), Some(&None));
+            assert!(app.owner_cache.get(&b).is_some_and(Option::is_some));
+            assert_eq!(app.regions.len(), 2);
+            assert_eq!(app.regions[0].group.roots, vec![a.clone(), b.clone()]);
+            assert!(app.regions[0].group.repo);
+            assert_eq!(app.regions[1].group.key, plain);
+            assert!(!app.regions[1].group.repo);
+            assert_eq!(app.repos.len(), 1);
+            assert!(app.deco_rx.is_some(), "landing requests a status pass");
+        });
     }
 
     #[test]

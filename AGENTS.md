@@ -866,6 +866,16 @@ HACKING.md — budget time for that before promising a patched build.
 - Roots fold (a nested dir collapses into the outer tree) and group by `Git::owner_of`,
   with the owner cached per root. Groups already shown keep their order; new groups follow,
   sorted by key path (`pane.list` order is never meaningful).
+- **No git call on the TUI thread for the stack.** A sample hands its roots to ONE
+  discovery worker (`spawn_discovery` → `Discovery`): it resolves `owner_of` for roots the
+  cache has not seen and runs `discover_all` over every root; `apply_discovery` groups and
+  diffs the regions when it lands, replaces `repos`, drops any in-flight status pass and
+  requests a fresh one. A sample taken while a pass is in flight is skipped (the next
+  heartbeat catches up), so a pane that cds onto a slow mount costs one worker thread, not
+  a stalled sidebar. `App::new` waits up to 300 ms for the startup pass so the first frame
+  still shows the whole stack. `rediscover_repos` (refresh, settings toggles) is the same
+  pass with `regroup = false`: it only replaces `repos`, and must not regroup because
+  `apply_groups` consumes the one-shot layout memo a real sample is waiting to adopt.
 - `stack::allocate` splits rows with a 3-row body minimum and auto-folds from the bottom;
   headers always stay visible. Dragged heights are validated against the COMPUTED fold
   pattern (manual ∪ auto), so a drag holds while another group is auto-folded. They reset

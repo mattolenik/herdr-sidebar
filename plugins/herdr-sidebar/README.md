@@ -153,7 +153,7 @@ Windows is not supported yet.
 Requires herdr 0.8 or newer. Source builds require Rust 1.89 or newer.
 
 ```
-herdr plugin install alexarthurs/herdr-sidebar/plugins/herdr-sidebar
+herdr plugin install mattolenik/herdr-sidebar/plugins/herdr-sidebar
 ```
 
 or from a local checkout:

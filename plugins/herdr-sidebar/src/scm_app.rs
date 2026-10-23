@@ -5821,8 +5821,8 @@ mod tests {
         );
         assert_eq!(pretty_worktree_line("(none)"), "(none)");
         assert_eq!(
-            pretty_remote_line("origin  https://github.com/alexarthurs/herdr-sidebar.git"),
-            "origin  alexarthurs/herdr-sidebar"
+            pretty_remote_line("origin  https://github.com/mattolenik/herdr-sidebar.git"),
+            "origin  mattolenik/herdr-sidebar"
         );
         assert_eq!(
             pretty_remote_line("up  git@github.com:me/repo.git"),

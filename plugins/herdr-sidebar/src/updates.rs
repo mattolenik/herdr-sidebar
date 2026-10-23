@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-const REPOSITORY: &str = "alexarthurs/herdr-sidebar/plugins/herdr-sidebar";
+const REPOSITORY: &str = "mattolenik/herdr-sidebar/plugins/herdr-sidebar";
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// How long a status message stays relevant in Settings.
@@ -94,7 +94,7 @@ fn plugin() -> Result<Value, String> {
 
 fn managed(plugin: &Value) -> bool {
     plugin["source"]["kind"] == "github"
-        && plugin["source"]["owner"] == "alexarthurs"
+        && plugin["source"]["owner"] == "mattolenik"
         && plugin["source"]["repo"] == "herdr-sidebar"
         && plugin["source"]["subdir"] == "plugins/herdr-sidebar"
 }
@@ -162,7 +162,7 @@ fn latest() -> Result<String, String> {
         "1048576",
         "--user-agent",
         "herdr-sidebar",
-        "https://api.github.com/repos/alexarthurs/herdr-sidebar/releases/latest",
+        "https://api.github.com/repos/mattolenik/herdr-sidebar/releases/latest",
     ]))
     .output()
     .map_err(|error| format!("Update check needs curl: {error}"))?;
@@ -552,7 +552,7 @@ mod tests {
 
     #[test]
     fn only_official_managed_installs_can_update() {
-        let mut plugin = json!({"source":{"kind":"github","owner":"alexarthurs","repo":"herdr-sidebar","subdir":"plugins/herdr-sidebar"}});
+        let mut plugin = json!({"source":{"kind":"github","owner":"mattolenik","repo":"herdr-sidebar","subdir":"plugins/herdr-sidebar"}});
         assert!(managed(&plugin));
         plugin["source"]["kind"] = json!("local");
         assert!(!managed(&plugin));
@@ -663,7 +663,7 @@ mod tests {
                 self.versions[0]
             };
             let mut plugin = self.source.clone().unwrap_or_else(|| {
-                json!({"source":{"kind":"github","owner":"alexarthurs",
+                json!({"source":{"kind":"github","owner":"mattolenik",
                        "repo":"herdr-sidebar","subdir":"plugins/herdr-sidebar"}})
             });
             plugin["version"] = json!(version);

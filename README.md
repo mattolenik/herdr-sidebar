@@ -12,7 +12,7 @@ previews that open as editor tabs — ephemeral until you double-click to pin on
 <img alt="Rust" src="https://img.shields.io/badge/Rust-self--contained_crate-orange?logo=rust&logoColor=white">
 <img alt="herdr" src="https://img.shields.io/badge/herdr-%E2%89%A5%200.8-5865a3">
 <img alt="Platforms" src="https://img.shields.io/badge/Windows%20%C2%B7%20macOS%20%C2%B7%20Linux-supported-2ea44f">
-<img alt="CI" src="https://github.com/alexarthurs/herdr-sidebar/actions/workflows/ci.yml/badge.svg">
+<img alt="CI" src="https://github.com/mattolenik/herdr-sidebar/actions/workflows/ci.yml/badge.svg">
 <img alt="License" src="https://img.shields.io/badge/license-MIT-blue">
 
 <br><br>
@@ -25,7 +25,7 @@ If you've ever alt-tabbed out of your terminal just to *look* at the tree, the d
 what's staged, this closes that loop.
 
 ```sh
-herdr plugin install alexarthurs/herdr-sidebar/plugins/herdr-sidebar
+herdr plugin install mattolenik/herdr-sidebar/plugins/herdr-sidebar
 ```
 
 Tagged releases use SHA-256-verified binaries on supported platforms and fall back to a
@@ -175,7 +175,7 @@ command = "herdr plugin action invoke quick-open --plugin herdr-sidebar"
 A Nerd Font is recommended for material icons; the emoji theme works everywhere.
 
 ```sh
-herdr plugin install alexarthurs/herdr-sidebar/plugins/herdr-sidebar
+herdr plugin install mattolenik/herdr-sidebar/plugins/herdr-sidebar
 ```
 
 Local checkout:

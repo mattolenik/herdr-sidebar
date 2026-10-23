@@ -585,18 +585,20 @@ HACKING.md — budget time for that before promising a patched build.
   (explorer routinely returns 1 on success), so only the SPAWN is reported. Directories are
   deliberately excluded — their association IS the file manager, which "Reveal in File
   Explorer" already covers.
-- **Shift+Ctrl+click on a `.md`/`.markdown` tree row opens it in the default WEB BROWSER**
-  (`actions::open_in_browser`), not the file association: macOS reads the `https` handler's
-  bundle id from LaunchServices' plist via `plutil` and runs `open -b <bundle> <file URL>`;
-  Windows resolves the `https` ProgId's `shell\open\command` through `reg query` and runs
-  that exe with the path; Linux tries `$BROWSER`, then `xdg-settings get default-web-browser`
-  + `gtk-launch`. Every miss falls back to `open_external`. A URL router like Finicky IS the
-  https handler on macOS, so it receives the `file://` URL. Whether the modified click reaches
-  the pane at all is the terminal's call (Ghostty's `mouse-shift-capture`, herdr's own
-  selection) — verify on the real stack before changing the chord.
+- **Ctrl+Alt+click (Ctrl+Option on macOS) on a `.md`/`.markdown` tree row opens it in the
+  default WEB BROWSER** (`actions::open_in_browser`), not the file association: macOS reads
+  the `https` handler's bundle id from LaunchServices' plist via `plutil` and runs
+  `open -b <bundle> <file URL>`; Windows resolves the `https` ProgId's `shell\open\command`
+  through `reg query` and runs that exe with the path; Linux tries `$BROWSER`, then
+  `xdg-settings get default-web-browser` + `gtk-launch`. Every miss falls back to
+  `open_external`. A URL router like Finicky IS the https handler on macOS, so it receives
+  the `file://` URL. The chord is Ctrl+ALT, never Shift: Ghostty (default
+  `mouse-shift-capture = false`) keeps Shift+click for its own selection and herdr does not
+  request it, while Alt and Ctrl ride the standard mouse report; Cmd has no mouse-report bit
+  at all. KDE-style Alt+drag window moving can still eat it on some Linux desktops.
 - **`open-markdown-link[-windows]` (`herdr-sidebar --open-link` / the ensure sidecar) is a
   link-handler TARGET, deliberately not declared as a `[[link_handlers]]` entry.** herdr routes
-  a CTRL-click (the only modifier it exposes; Shift is never forwarded to a handler) on an
+  a CTRL-click (Ctrl+Alt counts too: the check is `contains(CONTROL)`) on an
   OSC 8 hyperlink or http(s) URL to the FIRST matching handler across plugins sorted by
   plugin id (`find_plugin_link_handler`), so a handler here would shadow the maintainer's
   `local.md-leaf` plugin (Ctrl-click → leaf split). The action reads the URL from
@@ -604,7 +606,11 @@ HACKING.md — budget time for that before promising a patched build.
   `actions::link_path` drops fragment/query, decodes escapes and strips a `:line[:col]` tail.
   Claude Code only emits those links under herdr with `FORCE_HYPERLINK=1`; Codex links
   http(s) only (the maintainer's convention is `http://md.localhost/<abs path>`, rewritten by
-  Finicky). Needs `ui.mouse_capture = true`.
+  Finicky). Needs `ui.mouse_capture = true`. The maintainer's herdr fork is gaining
+  `HERDR_PLUGIN_CLICK_MODIFIERS` (comma-joined `shift,alt,ctrl` subset, plus
+  `click_modifiers` in the context JSON) so `md-leaf`'s script can branch: `alt` present →
+  `herdr-sidebar --open-link`, else leaf. Stock herdr never sets it, and the script treats
+  a missing value as plain leaf.
 - "Reveal in File Explorer" opens a selected directory itself; only files are revealed by
   opening their parent with the file selected. Applying file-style reveal semantics to folders
   lands one level too high and looks like the clicked tree row was ignored. Pass the row/menu's

@@ -2008,11 +2008,13 @@ impl App {
                     }
                 } else if mouse
                     .modifiers
-                    .contains(KeyModifiers::CONTROL | KeyModifiers::SHIFT)
+                    .contains(KeyModifiers::CONTROL | KeyModifiers::ALT)
                     && is_markdown(&path)
                 {
-                    // Shift+Ctrl+click: a Markdown file in the default web
-                    // browser (its OS association is usually an editor).
+                    // Ctrl+Alt+click (Ctrl+Option on macOS): a Markdown file
+                    // in the default web browser (its OS association is
+                    // usually an editor). Not Shift: terminals keep Shift+click
+                    // for their own selection and never forward it.
                     if !double {
                         self.notice = Some(match actions::open_in_browser(&path) {
                             Ok(()) => format!("opened {} in the browser", row_name(&path)),

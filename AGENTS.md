@@ -585,6 +585,15 @@ HACKING.md — budget time for that before promising a patched build.
   (explorer routinely returns 1 on success), so only the SPAWN is reported. Directories are
   deliberately excluded — their association IS the file manager, which "Reveal in File
   Explorer" already covers.
+- **Shift+Ctrl+click on a `.md`/`.markdown` tree row opens it in the default WEB BROWSER**
+  (`actions::open_in_browser`), not the file association: macOS reads the `https` handler's
+  bundle id from LaunchServices' plist via `plutil` and runs `open -b <bundle> <file URL>`;
+  Windows resolves the `https` ProgId's `shell\open\command` through `reg query` and runs
+  that exe with the path; Linux tries `$BROWSER`, then `xdg-settings get default-web-browser`
+  + `gtk-launch`. Every miss falls back to `open_external`. A URL router like Finicky IS the
+  https handler on macOS, so it receives the `file://` URL. Whether the modified click reaches
+  the pane at all is the terminal's call (Ghostty's `mouse-shift-capture`, herdr's own
+  selection) — verify on the real stack before changing the chord.
 - "Reveal in File Explorer" opens a selected directory itself; only files are revealed by
   opening their parent with the file selected. Applying file-style reveal semantics to folders
   lands one level too high and looks like the clicked tree row was ignored. Pass the row/menu's

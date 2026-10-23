@@ -473,14 +473,140 @@ pub fn open_external(path: &Path) -> io::Result<()> {
     let program = "open";
     #[cfg(all(unix, not(target_os = "macos")))]
     let program = "xdg-open";
+    detached(program, &[path.as_os_str()])
+}
 
+/// Spawn a GUI program with no stdio; only the spawn is checked.
+fn detached(program: impl AsRef<std::ffi::OsStr>, args: &[&std::ffi::OsStr]) -> io::Result<()> {
     std::process::Command::new(program)
-        .arg(path)
+        .args(args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
         .map(|_| ())
+}
+
+/// Open a file in the DEFAULT WEB BROWSER, not the file type's association:
+/// a Markdown file's association is an editor, but Shift+Ctrl+click wants it
+/// shown by whatever the browser (or its Markdown extension) makes of it.
+/// The browser is resolved the way the OS resolves an `https` link; when
+/// that lookup fails the plain association (`open_external`) is the fallback.
+pub fn open_in_browser(path: &Path) -> io::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        // LaunchServices remembers the https handler's bundle id; `open -b`
+        // hands the file URL to that app whatever it associates `.md` with.
+        let Some(bundle) = macos_default_browser() else {
+            return open_external(path);
+        };
+        let url = crate::lsp::uri_for(path);
+        detached("open", &["-b".as_ref(), bundle.as_ref(), url.as_ref()])
+    }
+    #[cfg(windows)]
+    {
+        // Browsers take a plain path; a `file://` URL would need the drive
+        // letter and backslashes rewritten.
+        match windows_default_browser() {
+            Some(exe) => detached(exe, &[path.as_os_str()]),
+            None => open_external(path),
+        }
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let url = crate::lsp::uri_for(path);
+        if let Some(browser) = std::env::var_os("BROWSER").filter(|b| !b.is_empty()) {
+            return detached(browser, &[url.as_ref()]);
+        }
+        if let Some(desktop) = linux_default_browser()
+            && detached("gtk-launch", &[desktop.as_ref(), url.as_ref()]).is_ok()
+        {
+            return Ok(());
+        }
+        open_external(path)
+    }
+}
+
+/// Bundle id of the `https` handler in LaunchServices' handler list, read
+/// through `plutil` (the plist is binary).
+#[cfg(target_os = "macos")]
+fn macos_default_browser() -> Option<String> {
+    let plist = std::env::var_os("HOME").map(std::path::PathBuf::from)?.join(
+        "Library/Preferences/com.apple.LaunchServices/com.apple.launchservices.secure.plist",
+    );
+    let out = std::process::Command::new("plutil")
+        .args(["-convert", "json", "-o", "-"])
+        .arg(plist)
+        .output()
+        .ok()?;
+    let handlers: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
+    browser_from_handlers(&handlers)
+}
+
+#[cfg(any(test, target_os = "macos"))]
+fn browser_from_handlers(handlers: &serde_json::Value) -> Option<String> {
+    let list = handlers.get("LSHandlers")?.as_array()?;
+    ["https", "http"].iter().find_map(|scheme| {
+        list.iter()
+            .filter(|h| h.get("LSHandlerURLScheme").and_then(|v| v.as_str()) == Some(scheme))
+            .find_map(|h| h.get("LSHandlerRoleAll")?.as_str().map(str::to_string))
+            .filter(|bundle| bundle != "-")
+    })
+}
+
+/// The executable behind the user's `https` ProgId, from the registry.
+#[cfg(windows)]
+fn windows_default_browser() -> Option<std::path::PathBuf> {
+    use std::os::windows::process::CommandExt;
+    let query = |key: &str, value: &[&str]| -> Option<String> {
+        let out = std::process::Command::new("reg")
+            .arg("query")
+            .arg(key)
+            .args(value)
+            .creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW)
+            .output()
+            .ok()?;
+        reg_sz_value(&String::from_utf8_lossy(&out.stdout))
+    };
+    let prog_id = query(
+        r"HKCU\Software\Microsoft\Windows\Shell\Associations\UrlAssociations\https\UserChoice",
+        &["/v", "ProgId"],
+    )?;
+    let command = query(&format!(r"HKCR\{prog_id}\shell\open\command"), &["/ve"])?;
+    exe_from_command(&command).map(std::path::PathBuf::from)
+}
+
+/// The data of the first `REG_SZ` line in `reg query` output.
+#[cfg(any(test, windows))]
+fn reg_sz_value(output: &str) -> Option<String> {
+    output.lines().find_map(|line| {
+        let (_, value) = line.split_once("REG_SZ")?;
+        let value = value.trim();
+        (!value.is_empty()).then(|| value.to_string())
+    })
+}
+
+/// The program of a shell `open` command: the quoted first token, else the
+/// first whitespace-delimited one (`"C:\x\chrome.exe" --single-argument %1`).
+#[cfg(any(test, windows))]
+fn exe_from_command(command: &str) -> Option<String> {
+    let command = command.trim();
+    let exe = match command.strip_prefix('"') {
+        Some(rest) => rest.split('"').next()?,
+        None => command.split_whitespace().next()?,
+    };
+    (!exe.is_empty()).then(|| exe.to_string())
+}
+
+/// `firefox.desktop`-style id of the default browser, for `gtk-launch`.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn linux_default_browser() -> Option<String> {
+    let out = std::process::Command::new("xdg-settings")
+        .args(["get", "default-web-browser"])
+        .output()
+        .ok()?;
+    let desktop = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    desktop.ends_with(".desktop").then_some(desktop)
 }
 
 const EDITOR_COMMAND_ENV: &str = "HERDR_SIDEBAR_EDITOR";
@@ -839,6 +965,37 @@ fn tab_create_ids(response: &str) -> Option<(String, String)> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn default_browser_is_the_https_handler_in_launch_services() {
+        let handlers = serde_json::json!({"LSHandlers": [
+            {"LSHandlerURLScheme": "http", "LSHandlerRoleAll": "-"},
+            {"LSHandlerURLScheme": "https", "LSHandlerRoleAll": "com.google.chrome"},
+        ]});
+        assert_eq!(
+            super::browser_from_handlers(&handlers).as_deref(),
+            Some("com.google.chrome")
+        );
+        assert_eq!(
+            super::browser_from_handlers(&serde_json::json!({"LSHandlers": []})),
+            None
+        );
+    }
+
+    #[test]
+    fn browser_exe_comes_from_the_registry_open_command() {
+        let out = "\r\nHKEY_CLASSES_ROOT\\ChromeHTML\\shell\\open\\command\r\n    (Default)    REG_SZ    \"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe\" --single-argument %1\r\n";
+        let command = super::reg_sz_value(out).unwrap();
+        assert_eq!(
+            super::exe_from_command(&command).as_deref(),
+            Some(r"C:\Program Files\Google\Chrome\Application\chrome.exe")
+        );
+        assert_eq!(
+            super::exe_from_command("firefox.exe -osint -url %1").as_deref(),
+            Some("firefox.exe")
+        );
+        assert_eq!(super::exe_from_command("   "), None);
+    }
+
     use super::*;
 
     fn tmp(tag: &str) -> PathBuf {

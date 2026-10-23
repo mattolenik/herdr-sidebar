@@ -74,6 +74,19 @@ struct Discovery {
     regroup: bool,
 }
 
+/// `.md` / `.markdown`, case-insensitively.
+fn is_markdown(path: &Path) -> bool {
+    path.extension().is_some_and(|ext| {
+        ext.eq_ignore_ascii_case("md") || ext.eq_ignore_ascii_case("markdown")
+    })
+}
+
+fn row_name(path: &Path) -> String {
+    path.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string())
+}
+
 fn ignored_scan_due(backoff_until: Option<std::time::Instant>, now: std::time::Instant) -> bool {
     backoff_until.is_none_or(|until| now >= until)
 }
@@ -1992,6 +2005,19 @@ impl App {
                     // undo the first; explicit chevron clicks always toggle.
                     if folder_click_toggles(on_chevron, double) {
                         self.toggle();
+                    }
+                } else if mouse
+                    .modifiers
+                    .contains(KeyModifiers::CONTROL | KeyModifiers::SHIFT)
+                    && is_markdown(&path)
+                {
+                    // Shift+Ctrl+click: a Markdown file in the default web
+                    // browser (its OS association is usually an editor).
+                    if !double {
+                        self.notice = Some(match actions::open_in_browser(&path) {
+                            Ok(()) => format!("opened {} in the browser", row_name(&path)),
+                            Err(e) => format!("browser failed: {e}"),
+                        });
                     }
                 } else if self.sidebar_state.custom_editor_on_click
                     && let Some(command) = self.editor_for(&path)

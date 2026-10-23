@@ -69,6 +69,7 @@ The activity bar switches Explorer and Search instantly in one process; each rep
   search supports case, whole-word, regex, and include/exclude filters.
 - Stage files or folders from the tree without crossing nested-repository boundaries.
 - Opt into a terminal editor for mouse clicks, while Enter keeps the built-in preview.
+  Shift+Ctrl+click a Markdown file to open it in your default web browser.
 - Per-filetype previewers (`*.md` → `dawn -P`, then `leaf --inline`: the first one on `PATH`
   renders inside the preview pane) and editors (`*.md` → `dawn`, then `nvim`, in their own tab),
   globally or per project.

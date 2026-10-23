@@ -1,3 +1,8 @@
+> [!NOTE]
+> This is a standalone fork of [alexarthurs/herdr-sidebar](https://github.com/alexarthurs/herdr-sidebar)
+> by [Alex Arthurs](https://github.com/alexarthurs), who wrote the original plugin. All credit
+> for the foundation goes to them; this fork adds stacked per-pane trees and related features on top.
+
 <div align="center">
 
 # Herdr Sidebar

@@ -221,7 +221,12 @@ executed by Bash on Linux/macOS and mixed or CRLF endings fail before the launch
   `env -u NO_COLOR -u HERDR_SOCKET_PATH -u HERDR_PANE_ID -u HERDR_TAB_ID -u HERDR_WORKSPACE_ID
   -u HERDR_ENV -u HERDR_BIN_PATH nohup script -q /dev/null /bin/zsh -c 'stty rows 50 cols 200;
   exec herdr --session hs-test' &`. `herdr session list --json` gives its `socket_path`; export
-  it as `HERDR_SOCKET_PATH` and every `herdr tab/pane …` command targets that session. Plugin
+  it as `HERDR_SOCKET_PATH` and every `herdr tab/pane …` command targets that session. When
+  the agent shell's stdin is a SOCKET (Claude Code's Bash tool, some turns), `script` dies
+  with `tcgetattr/ioctl: Operation not supported on socket` and the session silently never
+  starts: launch it from a Python `pty.fork()` instead (double-fork, `TIOCSWINSZ` 50×200,
+  exec `herdr --session hs-test`, drain the master fd to a log) and poll
+  `herdr session list --json` for `running`. Plugin
   registration is global, so the linked checkout's hooks dock sidebars there too; the plugin's
   state dir (`state.json`, `preview-programs.toml`) is also shared, so settings edits made for a
   test still reach the real session. `herdr session stop hs-test` ends it.
@@ -606,11 +611,12 @@ HACKING.md — budget time for that before promising a patched build.
   `actions::link_path` drops fragment/query, decodes escapes and strips a `:line[:col]` tail.
   Claude Code only emits those links under herdr with `FORCE_HYPERLINK=1`; Codex links
   http(s) only (the maintainer's convention is `http://md.localhost/<abs path>`, rewritten by
-  Finicky). Needs `ui.mouse_capture = true`. The maintainer's herdr fork is gaining
-  `HERDR_PLUGIN_CLICK_MODIFIERS` (comma-joined `shift,alt,ctrl` subset, plus
-  `click_modifiers` in the context JSON) so `md-leaf`'s script can branch: `alt` present →
-  `herdr-sidebar --open-link`, else leaf. Stock herdr never sets it, and the script treats
-  a missing value as plain leaf.
+  Finicky). Needs `ui.mouse_capture = true`. The maintainer's herdr fork (8e8f63bb,
+  2026-10-23) exports `HERDR_PLUGIN_CLICK_MODIFIERS` (comma-joined `shift,alt,ctrl` subset,
+  plus `click_modifiers` in the context JSON; `pane.link.activate` takes `modifiers`) so
+  `md-leaf`'s script branches: `alt` present → `herdr-sidebar --open-link`, else leaf.
+  Verified in hs-test through `pane.link.activate` with and without `alt`. Stock herdr never
+  sets it, and the script treats a missing value as plain leaf.
 - "Reveal in File Explorer" opens a selected directory itself; only files are revealed by
   opening their parent with the file selected. Applying file-style reveal semantics to folders
   lands one level too high and looks like the clicked tree row was ignored. Pass the row/menu's

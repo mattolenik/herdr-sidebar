@@ -1,6 +1,6 @@
 [package]
 name = "herdr-sidebar"
-version = "0.15.0"
+version = "0.15.1"
 edition = "2024"
 rust-version = "1.89"
 description = "VS Code-style sidebar for herdr: file explorer + source control in one pane"
@@ -48,7 +48,7 @@ regex = "1"
 notify = "8.2.0"
 # Per-filetype preview program rules (`programs.rs`): preview-programs.toml
 # in the state dir and an optional .herdr-sidebar.toml at the Explorer root.
-toml = "1.1.6"
+toml = "1.1.7"
 
 # Raw euid() for scoping private runtime directories (rundir.rs) to the
 # owning user; already present transitively, so this adds no new download.

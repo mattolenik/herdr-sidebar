@@ -32,6 +32,11 @@ cargo test
 cargo clippy -- -D warnings
 ```
 
+CI uses the LATEST stable toolchain (`dtolnay/rust-toolchain@stable`), so a stale local
+`stable` can pass clippy while CI fails on a newly deprecated API (v0.15.1: `fetch_update` →
+`try_update`, which is also newer than our `rust-version = 1.89` MSRV — rewrite instead of
+renaming). Run `rustup update stable` (or `cargo +<latest> clippy`) before tagging a release.
+
 `plugins/herdr-sidebar/scripts/.gitattributes` pins every shell script to LF. The
 repository has Windows contributors and `core.autocrlf` is common, but these files are
 executed by Bash on Linux/macOS and mixed or CRLF endings fail before the launcher runs.
@@ -77,6 +82,15 @@ executed by Bash on Linux/macOS and mixed or CRLF endings fail before the launch
   single-quoted here-string: `git commit -m @'…"quoted text"…'@` splits the message at the
   embedded `"` into multiple pathspec args (bit an agent live). Write multi-line/quoted
   commit messages to a temp file and use `git commit -F <file>` instead.
+- **herdr started from PowerShell 7 poisons `powershell` children's module path** (issue #96,
+  reproduced locally): herdr passes pwsh's `PSModulePath` unchanged to the Windows PowerShell 5.1
+  that runs our build/redeploy scripts. 5.1 then autoloads PS7's CoreCLR modules first, which
+  claim but cannot provide cmdlets such as `Get-FileHash`/`Select-String`, so the installer
+  reported a "checksum" failure and fell back to a source build. A PowerShell parent fixes the
+  path up itself, so only a NATIVE parent (herdr, or Git Bash in tests) reproduces it. Every
+  Windows script now resets `PSModulePath` to 5.1's own three module directories as its first
+  statement, and hashing uses .NET (`Get-HsSha256`). `test-fetch-or-build.ps1` keeps a decoy
+  `Microsoft.PowerShell.Utility` module on the path as a regression; it fails without the reset.
 - **PS 5.1 prepends a UTF-8 BOM when piping into a native process's stdin** (`$json | my.exe`
   delivers `EF BB BF{...}`; verified live by both plugins). serde_json rejects a BOM before
   `{`, so anything parsing herdr JSON from stdin must strip a leading `\u{feff}` first (see
@@ -961,7 +975,10 @@ HACKING.md — budget time for that before promising a patched build.
 
 - **Multi-repo**: `Git::discover_all` lists the repo containing the cwd plus child repos two
   levels down (`.git` dir or file), skipping `target`/`node_modules`/`.claude` (the agent
-  worktrees under `.claude/worktrees` would otherwise show up as repos). With >1 repo the
+  worktrees under `.claude/worktrees` would otherwise show up as repos). The scan NEVER follows
+  directory symlinks (`DirEntry::file_type()`, issue #87): from `~`, a link into a cloud mount
+  (OneDrive's File Provider trash on macOS) blocked `stat` forever and the sidebar never drew a
+  frame. With >1 repo the
   layout mirrors VS Code's: each repo section carries its OWN inline message box (3-line
   bordered list row) and ✓ Commit button, and the repo header row shows `⎇branch*` (star =
   dirty) plus clickable ⟳ sync / ✓ commit icons in the fixed last-6 columns. List rows now
@@ -988,7 +1005,9 @@ HACKING.md — budget time for that before promising a patched build.
   and never force, stash, discard, or otherwise mutate work to make the switch succeed.
 - Periodic Source Control status/drawer refresh backs off while its pane is unfocused, just
   like Explorer decorations. Suggestion/sync worker results are still collected first so a
-  hidden pane never strands completed background work.
+  hidden pane never strands completed background work. A pane launched with
+  `HERDR_SIDEBAR_BACKGROUND_REFRESH=1` (read once at startup, `state::BACKGROUND_REFRESH_ENV`)
+  skips only that focus guard, for passive monitor panes; Explorer is unaffected.
 - Hotkey hints render as keycap chips (`wrap_hints` takes `(key, label)` pairs, shared in
   `ui.rs`). They live in the ⚙ Settings modal; the FOOTER copy is opt-in via the
   "Footer hotkeys" setting (persisted as `hotkeys` in the state file, default hidden —
@@ -1185,6 +1204,18 @@ It replaced the original pane-ID-keyed park/restore implementation; the optional
   The refresh runs on a worker thread so a slow Git process cannot starve the viewer heartbeat;
   unchanged output is left in place so a mouse selection is not erased every two seconds.
   Staged rows show `--cached`; untracked files render via `diff --no-index NUL <file>`.
+  Plain file previews ride the same 2s tick but stat first: they reload only when the file's
+  modified time or size changed, and media previews are always replaced on reload. The stat runs
+  on the refresh WORKER, never the event loop: on a stalled SMB/cloud drive `metadata()` can block
+  forever, and on the loop it froze input, heartbeat and takeover restore. The baseline is the
+  stamp `load()` takes BEFORE reading (`Doc::stamp`), so a save that lands before the first poll
+  is not silently adopted as "unchanged"; an identical reload (a `touch`) still adopts the new
+  stamp or it would reload every tick. Every fresh document load bumps `LOAD_GENERATION`; a
+  refresh started under an older generation is dropped rather than awaited (a stuck worker for
+  file A must not block refreshes of B) and never applied (A→B→A, leaving edit mode). Dropping a
+  receiver cannot cancel a thread blocked in the kernel, so at most `MAX_REFRESH_IN_FLIGHT` (2)
+  refresh workers may exist; new refreshes pause while both are stuck, and a refresh unanswered
+  for 30s is abandoned so the same document can retry within that cap.
 
 ### Long-line wrapping in the preview (`src/wrap.rs`)
 
@@ -1217,7 +1248,30 @@ It replaced the original pane-ID-keyed park/restore implementation; the optional
 - The line-number gutter numbers the FIRST row of a source line and indents
   continuations to the same column, like an editor.
 - Read-only previews still support terminal-native interaction despite mouse capture: click/drag
-  selects rendered text, Shift+click extends it, and Ctrl/Cmd+C copies it. Selection preserves
+  selects rendered text, Shift+click extends it, and Ctrl/Cmd+C copies it. Releasing a drag
+  also copies, because mouse capture stops herdr from doing its own copy-on-select — but only
+  while herdr's `[ui] copy_on_select` is on (default). The viewer re-reads herdr's config on each
+  release (`HERDR_CONFIG_PATH`, then `XDG_CONFIG_HOME`, then on Windows `%APPDATA%`,
+  `%USERPROFILE%\AppData\Roaming`, `$HOME/.config`, elsewhere `~/.config`, matching herdr 0.9's
+  `config/io.rs`) and parses it with the `toml` crate after stripping BOMs, like herdr: a
+  line-based reader missed `[ ui ]`, `["ui"]`, dotted keys, inline tables and a leading BOM, and
+  silently kept copying. Like herdr's live loader, an unreadable or half-edited file keeps the
+  LAST GOOD value (a missing file means defaults), so saving config.toml mid-edit cannot briefly
+  re-enable copying. ALL preview copies — release AND Ctrl/Cmd+C — run on ONE `ReleaseCopier`
+  worker queue, so an older release can never land after a newer explicit copy; a newer release
+  replaces any release still waiting (explicit copies are never dropped), so a stalled clipboard
+  cannot grow a backlog. OSC 52 is handed back and written by the event loop, which owns stdout —
+  an escape sequence from another thread could land in the middle of a frame — and the worker
+  waits for that write before its next copy, so a later native copy cannot be overwritten by it.
+  Entering edit mode drops waiting drag copies (editor copy/cut stay synchronous). A
+  wrongly-typed `copy_on_select` (`"false"`) is a schema error that keeps the last good value,
+  as in herdr. Clipboard helpers (`actions::copy_with`) count as success only when EVERY input
+  byte was delivered AND the helper exited 0, within one 5s deadline covering both: a helper
+  that exits 0 without reading its input did not copy, and the editor's cut deletes text on
+  success with no undo. Windows PowerShell helpers (`Get-Clipboard`) run without an inherited
+  `PSModulePath` for the issue #96 reason. Known gap: a drag copy already IN FLIGHT can still
+  land after a synchronous editor copy, and closing the viewer does not wait for a queued copy.
+  Selection preserves
   syntax/diff styling on screen, omits file line-number gutters, and does not insert newlines at
   visual wrap boundaries.
 - Preview return focus is durable pane metadata (`hs-preview-origin-tab`), not
